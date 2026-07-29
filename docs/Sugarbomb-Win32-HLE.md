@@ -40,9 +40,17 @@ Fallout:
 
 At the end of the diagnostic window the main thread is sleeping on its normal
 timer path while the worker threads are parked on waits. This is a headless
-compatibility milestone: the guest is executing a sustained startup/update
-state, but D3D9, audio, and video are still facades rather than host-backed
-output, so it is not yet a playable build.
+compatibility milestone for the engine itself. The next renderer checkpoint
+adds a real native Windows window owned by the 64-bit process. Fallout's
+32-bit guest HWND remains an integer in guest memory, while the corresponding
+native `HWND` remains private to the host. A verified 1920x1080 guest D3D9
+`Present` reaches that window.
+
+The current host window displays the synthetic backbuffer and an identifying
+status overlay. Guest draw calls are not translated to the host GPU yet, so
+the captured frame is black rather than the game's rendered menu. Audio and
+video also remain facades. This is visible output and a proof of the handle
+boundary, not yet a playable build.
 
 The runtime currently builds:
 
@@ -156,11 +164,13 @@ dependency order and validate each group with small guest fixtures:
 2. **NVSE bootstrap:** DLL exports, import binding, CRT entry points, plugin
    enumeration, `DllMain`, and NVSE messaging/interfaces.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
-   message-loop behavior. The current window/input layer is sufficient for
-   startup but does not yet create interactive host output.
+   message-loop behavior. The guest/native HWND bridge and host message pump
+   now create visible output; input messages are not yet translated back into
+   the guest queue.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
-   Sugarbomb's renderer. The guest COM/resource model is in place; host
-   rendering and the remaining D3DX texture/shader helpers are next.
+   Sugarbomb's renderer. The guest COM/resource model and native presentation
+   window are in place; 64-bit host D3D9 resources/draw translation and the
+   remaining D3DX texture/shader helpers are next.
 5. **Audio/video:** DirectSound, WinMM, DirectShow, and Bink integration. The
    current facades preserve guest contracts and timing but do not decode or
    emit media yet.
@@ -191,6 +201,7 @@ variables. They do not change the guest ABI:
 ```powershell
 $env:SUGARBOMB_MAX_RUN_SLICES = '2600000'
 $env:SUGARBOMB_MAX_RUN_MILLISECONDS = '20000'
+$env:SUGARBOMB_NO_HOST_WINDOW = '1' # optional for unattended runs
 ```
 
 When either diagnostic budget expires, Sugarbomb prints every guest thread's
@@ -212,7 +223,9 @@ Studio 2022.
 This is an executable compatibility-layer checkpoint, not a playable build.
 Fallout now survives the previously missing kernel-object, guest-thread,
 USER32, D3D9, audio, DirectShow, Bink, and startup-order singleton boundaries.
-The next major work is to turn the headless D3D9/USER32 facade into host-backed
-window and rendering output, finish D3DX texture/shader helpers, persist the
-remaining virtual-file operations, and load `nvse_1_4.dll` plus NVSE plugins in
-the same guest process.
+The 64-bit host now owns a real window and presents Fallout's synthetic
+backbuffer without exposing native pointers to the 32-bit guest. The next major
+work is to translate D3D9 resources, shaders, state, and draws to the host GPU,
+finish D3DX texture/shader helpers, translate input, persist the remaining
+virtual-file operations, and load `nvse_1_4.dll` plus NVSE plugins in the same
+guest process.

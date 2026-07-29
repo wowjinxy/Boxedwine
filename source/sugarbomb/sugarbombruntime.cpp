@@ -11,6 +11,7 @@
 #include "knativethread.h"
 #include "pe32loader.h"
 #include "sugarbombbridge.h"
+#include "sugarbombhostwindow.h"
 #include "sugarbombruntime.h"
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #ifdef BOXEDWINE_HOST_EXCEPTIONS
 void platformInitExceptionHandling();
@@ -355,6 +357,98 @@ private:
         Direct3DResourceKind kind = Direct3DResourceKind::Texture;
         U32 index = 0;
     };
+
+    bool ensureDirect3DSurfaceStorage(Direct3DSurface& surface) {
+        U64 storageSize64 =
+            static_cast<U64>(surface.width) * surface.height * sizeof(U32);
+        if (!storageSize64 || storageSize64 > 0x10000000) {
+            return false;
+        }
+        if (!surface.storageAddress) {
+            surface.storageAddress = allocateGuestHeap(
+                static_cast<U32>(storageSize64),
+                true);
+        }
+        return surface.storageAddress != 0;
+    }
+
+    void clearDirect3DSurface(Direct3DSurface& surface, U32 color) {
+        if (!ensureDirect3DSurfaceStorage(surface)) {
+            return;
+        }
+        const std::size_t pixelCount =
+            static_cast<std::size_t>(surface.width) * surface.height;
+        direct3DClearPixels.assign(pixelCount, color);
+        memory->memcpy(
+            surface.storageAddress,
+            direct3DClearPixels.data(),
+            static_cast<U32>(pixelCount * sizeof(U32)));
+        direct3DLastClearColor = color;
+    }
+
+    void syncHostWindow(const GuestWindow& guestWindow) {
+        hostWindow.syncGuestWindow(
+            guestWindow.handle,
+            guestWindow.title,
+            guestWindow.x,
+            guestWindow.y,
+            guestWindow.width,
+            guestWindow.height,
+            guestWindow.visible);
+    }
+
+    void destroyHostWindowForGuest(U32 guestHandle) {
+        hostWindow.destroyGuestWindow(guestHandle);
+    }
+
+    void pumpHostMessages() {
+        if (!hostWindow.pumpMessages()) {
+            runtimeStopping = true;
+        }
+    }
+
+    void presentHostBackBuffer() {
+        auto guestWindow = guestWindows.find(activeWindow);
+        if (guestWindow == guestWindows.end()) {
+            return;
+        }
+        syncHostWindow(guestWindow->second);
+        U32 surfaceAddress = ensureDirect3DBackBuffer();
+        auto found = direct3DSurfaces.find(surfaceAddress);
+        if (found == direct3DSurfaces.end()) {
+            return;
+        }
+        Direct3DSurface& surface = found->second;
+        const U64 byteCount64 =
+            static_cast<U64>(surface.width) * surface.height * sizeof(U32);
+        if (!byteCount64 || byteCount64 > 0x10000000) {
+            return;
+        }
+        const U32 byteCount = static_cast<U32>(byteCount64);
+        hostPresentPixels.resize(byteCount / sizeof(U32));
+        if (surface.storageAddress &&
+            memory->canRead(surface.storageAddress, byteCount)) {
+            memory->memcpy(
+                hostPresentPixels.data(),
+                surface.storageAddress,
+                byteCount);
+        } else {
+            std::fill(
+                hostPresentPixels.begin(),
+                hostPresentPixels.end(),
+                direct3DLastClearColor);
+        }
+        hostWindow.present(
+            hostPresentPixels.data(),
+            surface.width,
+            surface.height);
+        pumpHostMessages();
+    }
+
+    void shutdownHostWindow() {
+        hostWindow.shutdown();
+        hostPresentPixels.clear();
+    }
 
     bool initialize() {
         std::vector<U8> bytes;
@@ -1212,6 +1306,9 @@ private:
         std::size_t cursor = 0;
         bool wallClockBudgetExhausted = false;
         while (!runtimeStopping && runSlices < runSliceLimit) {
+            if ((runSlices & 0x7ff) == 0) {
+                pumpHostMessages();
+            }
             if (KSystem::getMicroCounter() >= runDeadline) {
                 wallClockBudgetExhausted = true;
                 break;
@@ -1313,6 +1410,7 @@ private:
     }
 
     void cleanup() {
+        shutdownHostWindow();
         if (process) {
             KThread::setCurrentThread(nullptr);
             for (auto& state : guestThreads) {
@@ -2449,6 +2547,7 @@ private:
         if (message && session->memory->canWrite(message, 28)) {
             session->memory->memset(message, 0, 28);
         }
+        session->pumpHostMessages();
         cpu->reg[0].u32 = 0;
     }
 
@@ -4614,16 +4713,43 @@ private:
         return objectAddress;
     }
 
-    U32 ensureDirect3DRenderTarget(bool depthStencil) {
-        U32& surface = depthStencil
-            ? direct3DDepthStencilSurface
-            : direct3DRenderTargetSurface;
+    U32 ensureDirect3DBackBuffer() {
+        U32& surface = direct3DBackBufferSurface;
         if (!surface) {
             surface = createDirect3DSurface(
-                configuredDisplayDimension("iSize W", 1280),
-                configuredDisplayDimension("iSize H", 720),
-                depthStencil ? 75 : 22,
-                depthStencil ? 2 : 1);
+                direct3DBackBufferWidth
+                    ? direct3DBackBufferWidth
+                    : configuredDisplayDimension("iSize W", 1280),
+                direct3DBackBufferHeight
+                    ? direct3DBackBufferHeight
+                    : configuredDisplayDimension("iSize H", 720),
+                direct3DBackBufferFormat
+                    ? direct3DBackBufferFormat
+                    : 22,
+                1);
+        }
+        if (!direct3DRenderTargetSurface) {
+            direct3DRenderTargetSurface = surface;
+        }
+        return surface;
+    }
+
+    U32 ensureDirect3DRenderTarget(bool depthStencil) {
+        if (!depthStencil) {
+            ensureDirect3DBackBuffer();
+            return direct3DRenderTargetSurface;
+        }
+        U32& surface = direct3DDepthStencilSurface;
+        if (!surface) {
+            surface = createDirect3DSurface(
+                direct3DBackBufferWidth
+                    ? direct3DBackBufferWidth
+                    : configuredDisplayDimension("iSize W", 1280),
+                direct3DBackBufferHeight
+                    ? direct3DBackBufferHeight
+                    : configuredDisplayDimension("iSize H", 720),
+                75,
+                2);
         }
         return surface;
     }
@@ -4703,6 +4829,38 @@ private:
         return end != value.c_str() && parsed && parsed <= 16384
             ? static_cast<U32>(parsed)
             : fallback;
+    }
+
+    void applyDirect3DPresentationParameters(
+        U32 parameters,
+        U32 focusWindow = 0) {
+        U32 width = configuredDisplayDimension("iSize W", 1280);
+        U32 height = configuredDisplayDimension("iSize H", 720);
+        U32 format = 22;
+        U32 deviceWindow = focusWindow;
+        if (parameters && memory->canRead(parameters, 36)) {
+            width = memory->readd(parameters);
+            height = memory->readd(parameters + 4);
+            format = memory->readd(parameters + 8);
+            U32 configuredWindow = memory->readd(parameters + 28);
+            if (configuredWindow) {
+                deviceWindow = configuredWindow;
+            }
+        }
+        direct3DBackBufferWidth =
+            width ? width : configuredDisplayDimension("iSize W", 1280);
+        direct3DBackBufferHeight =
+            height ? height : configuredDisplayDimension("iSize H", 720);
+        direct3DBackBufferFormat = format ? format : 22;
+        if (guestWindows.count(deviceWindow)) {
+            activeWindow = deviceWindow;
+        }
+        auto window = guestWindows.find(activeWindow);
+        if (window != guestWindows.end()) {
+            window->second.width = static_cast<S32>(direct3DBackBufferWidth);
+            window->second.height = static_cast<S32>(direct3DBackBufferHeight);
+            syncHostWindow(window->second);
+        }
     }
 
     void writeDirect3DDisplayMode(U32 destination) {
@@ -4888,12 +5046,18 @@ private:
                     cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                     return;
                 }
+                applyDirect3DPresentationParameters(
+                    argument(cpu, 5),
+                    argument(cpu, 3));
                 U32 device = createDirect3DObject(Direct3DObjectKind::Device);
                 memory->writed(resultAddress, device);
                 printf(
-                    "Sugarbomb D3D9: CreateDevice(adapter=%u, behavior=0x%08X) -> 0x%08X\n",
+                    "Sugarbomb D3D9: CreateDevice(adapter=%u, "
+                    "behavior=0x%08X, backbuffer=%ux%u) -> 0x%08X\n",
                     argument(cpu, 1),
                     argument(cpu, 4),
+                    direct3DBackBufferWidth,
+                    direct3DBackBufferHeight,
                     device);
                 cpu->reg[0].u32 = device ? D3D_OK : 0x8007000e;
                 return;
@@ -4907,7 +5071,6 @@ private:
         switch (method.index) {
         case 3: // TestCooperativeLevel
         case 5: // EvictManagedResources
-        case 16: // Reset
         case 20: // SetDialogBoxMode
         case 30: // UpdateSurface
         case 31: // UpdateTexture
@@ -4915,11 +5078,9 @@ private:
         case 33: // GetFrontBufferData
         case 34: // StretchRect
         case 35: // ColorFill
-        case 37: // SetRenderTarget
         case 39: // SetDepthStencilSurface
         case 41: // BeginScene
         case 42: // EndScene
-        case 43: // Clear
         case 44: // SetTransform
         case 46: // MultiplyTransform
         case 47: // SetViewport
@@ -4961,9 +5122,52 @@ private:
         case 117: // DeletePatch
             cpu->reg[0].u32 = D3D_OK;
             return;
-        case 17: // Present
+        case 16: { // Reset
+            applyDirect3DPresentationParameters(argument(cpu, 1));
+            auto backBuffer =
+                direct3DSurfaces.find(direct3DBackBufferSurface);
+            if (backBuffer != direct3DSurfaces.end()) {
+                backBuffer->second.width = direct3DBackBufferWidth;
+                backBuffer->second.height = direct3DBackBufferHeight;
+                backBuffer->second.format = direct3DBackBufferFormat;
+                backBuffer->second.storageAddress = 0;
+            }
+            auto depthStencil =
+                direct3DSurfaces.find(direct3DDepthStencilSurface);
+            if (depthStencil != direct3DSurfaces.end()) {
+                depthStencil->second.width = direct3DBackBufferWidth;
+                depthStencil->second.height = direct3DBackBufferHeight;
+                depthStencil->second.storageAddress = 0;
+            }
             cpu->reg[0].u32 = D3D_OK;
             return;
+        }
+        case 17: // Present
+            presentHostBackBuffer();
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 37: { // SetRenderTarget
+            if (argument(cpu, 1) == 0 &&
+                direct3DSurfaces.count(argument(cpu, 2))) {
+                direct3DRenderTargetSurface = argument(cpu, 2);
+            }
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
+        case 43: { // Clear
+            constexpr U32 D3DCLEAR_TARGET = 0x00000001;
+            if (argument(cpu, 3) & D3DCLEAR_TARGET) {
+                U32 renderTarget = ensureDirect3DRenderTarget(false);
+                auto surface = direct3DSurfaces.find(renderTarget);
+                if (surface != direct3DSurfaces.end()) {
+                    clearDirect3DSurface(
+                        surface->second,
+                        argument(cpu, 4));
+                }
+            }
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
         case 4: // GetAvailableTextureMem
             cpu->reg[0].u32 = 512 * 1024 * 1024;
             return;
@@ -5128,7 +5332,10 @@ private:
                 cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                 return;
             }
-            U32 surface = ensureDirect3DRenderTarget(method.index == 40);
+            U32 surface =
+                method.index == 18
+                    ? ensureDirect3DBackBuffer()
+                    : ensureDirect3DRenderTarget(method.index == 40);
             if (surface) {
                 ++direct3DSurfaces[surface].references;
                 memory->writed(surface + 4, direct3DSurfaces[surface].references);
@@ -8497,6 +8704,7 @@ private:
         U32 handle = window.handle;
         guestWindows[handle] = window;
         activeWindow = handle;
+        syncHostWindow(guestWindows[handle]);
         printf(
             "Sugarbomb Win32 USER32: CreateWindowExA(%s, %s, %dx%d) -> 0x%08X\n",
             window.className.c_str(),
@@ -8513,6 +8721,7 @@ private:
             setLastError(1400); // ERROR_INVALID_WINDOW_HANDLE
             return false;
         }
+        destroyHostWindowForGuest(handle);
         guestWindows.erase(found);
         if (activeWindow == handle) {
             activeWindow = 0;
@@ -8528,6 +8737,7 @@ private:
         }
         bool wasVisible = found->second.visible;
         found->second.visible = command != 0;
+        syncHostWindow(found->second);
         return wasVisible;
     }
 
@@ -8570,6 +8780,7 @@ private:
         if (flags & 0x0080) { // SWP_HIDEWINDOW
             found->second.visible = false;
         }
+        syncHostWindow(found->second);
         return true;
     }
 
@@ -8592,6 +8803,7 @@ private:
             return false;
         }
         found->second.title = textAddress ? readAnsi(textAddress) : "";
+        syncHostWindow(found->second);
         return true;
     }
 
@@ -9732,10 +9944,17 @@ private:
     U32 direct3DSurfaceVtableAddress = 0;
     U32 direct3DInterfaceAddress = 0;
     U32 direct3DDeviceAddress = 0;
+    U32 direct3DBackBufferSurface = 0;
     U32 direct3DRenderTargetSurface = 0;
     U32 direct3DDepthStencilSurface = 0;
+    U32 direct3DBackBufferWidth = 0;
+    U32 direct3DBackBufferHeight = 0;
+    U32 direct3DBackBufferFormat = 22;
+    U32 direct3DLastClearColor = 0xff000000;
     U32 direct3DVertexProfileAddress = 0;
     U32 direct3DPixelProfileAddress = 0;
+    SugarbombHostWindow hostWindow;
+    std::vector<U32> hostPresentPixels;
     U32 nextHeapHandle = PROCESS_HEAP_HANDLE + 1;
     U32 nextHeapAddress = GUEST_HEAP_BASE;
     U32 nextVirtualAddress = GUEST_VIRTUAL_BASE;
@@ -9779,6 +9998,7 @@ private:
     std::vector<U32> direct3DVtable;
     std::vector<U32> direct3DDeviceVtable;
     std::unordered_map<U32, Direct3DSurface> direct3DSurfaces;
+    std::vector<U32> direct3DClearPixels;
     std::unordered_map<U32, U32> direct3DSurfaceMethods;
     std::vector<U32> direct3DSurfaceVtable;
     std::unordered_map<U32, Direct3DResource> direct3DResources;
