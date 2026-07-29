@@ -306,6 +306,14 @@ bool SugarbombHostWindow::pumpMessages() {
 #endif
 }
 
+std::uintptr_t SugarbombHostWindow::nativeHandle() const {
+#ifdef _WIN32
+    return reinterpret_cast<std::uintptr_t>(impl->window);
+#else
+    return 0;
+#endif
+}
+
 void SugarbombHostWindow::present(
     const std::uint32_t* pixels,
     std::uint32_t width,

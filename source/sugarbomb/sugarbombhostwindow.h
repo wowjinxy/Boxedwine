@@ -33,6 +33,7 @@ public:
         bool visible);
     void destroyGuestWindow(std::uint32_t guestHandle);
     bool pumpMessages();
+    std::uintptr_t nativeHandle() const;
     void present(
         const std::uint32_t* pixels,
         std::uint32_t width,

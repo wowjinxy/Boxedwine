@@ -11,6 +11,7 @@
 #include "knativethread.h"
 #include "pe32loader.h"
 #include "sugarbombbridge.h"
+#include "sugarbombhostd3d9.h"
 #include "sugarbombhostwindow.h"
 #include "sugarbombruntime.h"
 
@@ -274,6 +275,7 @@ private:
         U32 interfaceAddresses[static_cast<U32>(DirectShowInterfaceKind::Count)] = {};
         double durationSeconds = 180.0;
         double currentPositionSeconds = 0.0;
+        U64 runStartedMicroseconds = 0;
         S32 volume = 0;
         U32 filterState = 0;
     };
@@ -327,6 +329,11 @@ private:
         U32 multiSampleType = 0;
         U32 multiSampleQuality = 0;
         U32 storageAddress = 0;
+        U32 parentResource = 0;
+        U32 parentFace = 0;
+        U32 parentLevel = 0;
+        U32 lockPitch = 0;
+        U32 lockRows = 0;
     };
 
     enum class Direct3DResourceKind : U32 {
@@ -351,6 +358,12 @@ private:
         U32 pool = 0;
         U32 length = 0;
         U32 storageAddress = 0;
+        U32 lockOffset = 0;
+        U32 lockSize = 0;
+        U32 lockFace = 0;
+        U32 lockLevel = 0;
+        U32 lockPitch = 0;
+        U32 lockRows = 0;
     };
 
     struct Direct3DResourceMethod {
@@ -358,9 +371,72 @@ private:
         U32 index = 0;
     };
 
+    void direct3DStorageLayout(
+        U32 format,
+        U32 width,
+        U32 height,
+        U32& pitch,
+        U32& rows) const {
+        constexpr U32 D3DFMT_DXT1 = 0x31545844;
+        constexpr U32 D3DFMT_DXT2 = 0x32545844;
+        constexpr U32 D3DFMT_DXT3 = 0x33545844;
+        constexpr U32 D3DFMT_DXT4 = 0x34545844;
+        constexpr U32 D3DFMT_DXT5 = 0x35545844;
+        if (format == D3DFMT_DXT1 ||
+            format == D3DFMT_DXT2 ||
+            format == D3DFMT_DXT3 ||
+            format == D3DFMT_DXT4 ||
+            format == D3DFMT_DXT5) {
+            pitch = std::max<U32>(1, (width + 3) / 4) *
+                (format == D3DFMT_DXT1 ? 8 : 16);
+            rows = std::max<U32>(1, (height + 3) / 4);
+            return;
+        }
+        U32 bytesPerPixel = 4;
+        switch (format) {
+        case 20: // D3DFMT_R8G8B8
+            bytesPerPixel = 3;
+            break;
+        case 23: // D3DFMT_R5G6B5
+        case 24: // D3DFMT_X1R5G5B5
+        case 25: // D3DFMT_A1R5G5B5
+        case 26: // D3DFMT_A4R4G4B4
+        case 29: // D3DFMT_A8R3G3B2
+        case 30: // D3DFMT_X4R4G4B4
+        case 51: // D3DFMT_A8L8
+        case 60: // D3DFMT_V8U8
+            bytesPerPixel = 2;
+            break;
+        case 27: // D3DFMT_R3G3B2
+        case 28: // D3DFMT_A8
+        case 41: // D3DFMT_P8
+        case 50: // D3DFMT_L8
+        case 52: // D3DFMT_A4L4
+            bytesPerPixel = 1;
+            break;
+        case 36: // D3DFMT_A16B16G16R16
+        case 113: // D3DFMT_A16B16G16R16F
+            bytesPerPixel = 8;
+            break;
+        case 116: // D3DFMT_A32B32G32R32F
+            bytesPerPixel = 16;
+            break;
+        default:
+            break;
+        }
+        pitch = width * bytesPerPixel;
+        rows = height;
+    }
+
     bool ensureDirect3DSurfaceStorage(Direct3DSurface& surface) {
+        direct3DStorageLayout(
+            surface.format,
+            surface.width,
+            surface.height,
+            surface.lockPitch,
+            surface.lockRows);
         U64 storageSize64 =
-            static_cast<U64>(surface.width) * surface.height * sizeof(U32);
+            static_cast<U64>(surface.lockPitch) * surface.lockRows;
         if (!storageSize64 || storageSize64 > 0x10000000) {
             return false;
         }
@@ -378,6 +454,15 @@ private:
         }
         const std::size_t pixelCount =
             static_cast<std::size_t>(surface.width) * surface.height;
+        if (surface.lockPitch != surface.width * sizeof(U32) ||
+            surface.lockRows != surface.height) {
+            memory->memset(
+                surface.storageAddress,
+                static_cast<U8>(color),
+                surface.lockPitch * surface.lockRows);
+            direct3DLastClearColor = color;
+            return;
+        }
         direct3DClearPixels.assign(pixelCount, color);
         memory->memcpy(
             surface.storageAddress,
@@ -413,6 +498,33 @@ private:
             return;
         }
         syncHostWindow(guestWindow->second);
+        if (hostDirect3D.ready()) {
+            ++guestPresentCount;
+            const char* capturePath =
+                std::getenv("SUGARBOMB_CAPTURE_FRAME");
+            U32 captureAfterPresents = 1;
+            if (const char* configured =
+                    std::getenv("SUGARBOMB_CAPTURE_AFTER_PRESENTS")) {
+                char* end = nullptr;
+                unsigned long value = std::strtoul(
+                    configured,
+                    &end,
+                    10);
+                if (end != configured && value <= 0xffffffffUL) {
+                    captureAfterPresents = static_cast<U32>(value);
+                }
+            }
+            if (!hostFrameCaptured &&
+                capturePath &&
+                *capturePath &&
+                guestPresentCount >= captureAfterPresents) {
+                hostFrameCaptured =
+                    hostDirect3D.captureRenderTarget(capturePath);
+            }
+            hostDirect3D.present();
+            pumpHostMessages();
+            return;
+        }
         U32 surfaceAddress = ensureDirect3DBackBuffer();
         auto found = direct3DSurfaces.find(surfaceAddress);
         if (found == direct3DSurfaces.end()) {
@@ -446,6 +558,17 @@ private:
     }
 
     void shutdownHostWindow() {
+        const char* finalCapturePath =
+            std::getenv("SUGARBOMB_CAPTURE_FINAL_FRAME");
+        if (finalCapturePath && *finalCapturePath) {
+            hostDirect3D.captureRenderTarget(finalCapturePath);
+        }
+        const char* finalBackBufferPath =
+            std::getenv("SUGARBOMB_CAPTURE_FINAL_BACKBUFFER");
+        if (finalBackBufferPath && *finalBackBufferPath) {
+            hostDirect3D.captureBackBuffer(finalBackBufferPath);
+        }
+        hostDirect3D.shutdown();
         hostWindow.shutdown();
         hostPresentPixels.clear();
     }
@@ -1379,6 +1502,7 @@ private:
                     static_cast<U32>(state->waitKind),
                     state->suspendCount,
                     state->completed ? 1 : 0);
+                printGuestWaitDetails(*state);
             }
             std::vector<std::pair<std::string, U32>> busiestApis(
                 nativeApiCounts.begin(),
@@ -1398,6 +1522,30 @@ private:
                     "    %10u  %s\n",
                     busiestApis[index].second,
                     busiestApis[index].first.c_str());
+            }
+            static const char* graphicsMilestones[] = {
+                "D3D9!IDirect3DDevice9::BeginScene",
+                "D3D9!IDirect3DDevice9::EndScene",
+                "D3D9!IDirect3DDevice9::Present",
+                "D3D9!IDirect3DDevice9::Clear",
+                "D3D9!IDirect3DDevice9::SetRenderTarget",
+                "D3D9!IDirect3DDevice9::DrawPrimitive",
+                "D3D9!IDirect3DDevice9::DrawIndexedPrimitive",
+                "D3D9!IDirect3DDevice9::StretchRect",
+                "D3D9!IDirect3DDevice9::UpdateSurface",
+                "D3D9!IDirect3DDevice9::UpdateTexture",
+                "D3DX9!D3DXLoadSurfaceFromSurface",
+                "D3DX9!D3DXCreateTextureFromFileInMemory",
+                "D3DX9!D3DXCreateCubeTextureFromFileInMemory",
+            };
+            fprintf(stderr, "  graphics API milestones:\n");
+            for (const char* milestone : graphicsMilestones) {
+                auto count = nativeApiCounts.find(milestone);
+                fprintf(
+                    stderr,
+                    "    %10u  %s\n",
+                    count == nativeApiCounts.end() ? 0 : count->second,
+                    milestone);
             }
             return false;
         }
@@ -1767,7 +1915,7 @@ private:
                 callback = callbackD3DXGetPixelShaderProfile;
                 stackCleanupBytes = 4;
             } else if (symbol == "D3DXLoadSurfaceFromSurface") {
-                callback = callbackD3DXReturnSuccess;
+                callback = callbackD3DXLoadSurfaceFromSurface;
                 stackCleanupBytes = 32;
             } else if (symbol == "D3DXSaveTextureToFileA") {
                 callback = callbackD3DXReturnNotImplemented;
@@ -1791,12 +1939,15 @@ private:
                 callback = callbackD3DXReturnNotImplemented;
                 stackCleanupBytes = 8;
             } else if (symbol == "D3DXGetImageInfoFromFileInMemory") {
-                callback = callbackD3DXReturnNotImplemented;
+                callback = callbackD3DXGetImageInfoFromFileInMemory;
                 stackCleanupBytes = 12;
-            } else if (
-                symbol == "D3DXCreateTextureFromFileInMemory" ||
-                symbol == "D3DXCreateCubeTextureFromFileInMemory" ||
-                symbol == "D3DXCreateVolumeTextureFromFileInMemory") {
+            } else if (symbol == "D3DXCreateTextureFromFileInMemory") {
+                callback = callbackD3DXCreateTextureFromFileInMemory;
+                stackCleanupBytes = 16;
+            } else if (symbol == "D3DXCreateCubeTextureFromFileInMemory") {
+                callback = callbackD3DXCreateCubeTextureFromFileInMemory;
+                stackCleanupBytes = 16;
+            } else if (symbol == "D3DXCreateVolumeTextureFromFileInMemory") {
                 callback = callbackD3DXReturnNotImplemented;
                 stackCleanupBytes = 16;
             }
@@ -3330,6 +3481,25 @@ private:
         return value;
     }
 
+    static double directShowPosition(const DirectShowGraph& graph) {
+        double position = graph.currentPositionSeconds;
+        if (graph.filterState == 2 && graph.runStartedMicroseconds) {
+            U64 now = KSystem::getMicroCounter();
+            if (now >= graph.runStartedMicroseconds) {
+                position +=
+                    static_cast<double>(
+                        now - graph.runStartedMicroseconds) /
+                    1000000.0;
+            }
+        }
+        return std::min(position, graph.durationSeconds);
+    }
+
+    static void pauseDirectShowGraph(DirectShowGraph& graph) {
+        graph.currentPositionSeconds = directShowPosition(graph);
+        graph.runStartedMicroseconds = 0;
+    }
+
     void dispatchDirectShowComMethod(
         CPU* cpu,
         const DirectShowComMethod& method) {
@@ -3444,15 +3614,21 @@ private:
         if (method.kind == DirectShowInterfaceKind::MediaControl) {
             switch (method.index) {
             case 7: // Run
+                if (graph.filterState != 2) {
+                    graph.runStartedMicroseconds =
+                        KSystem::getMicroCounter();
+                }
                 graph.filterState = 2;
                 cpu->reg[0].u32 = S_OK;
                 return;
             case 8: // Pause
+                pauseDirectShowGraph(graph);
                 graph.filterState = 1;
                 cpu->reg[0].u32 = S_OK;
                 return;
             case 9: // Stop
             case 15: // StopWhenReady
+                pauseDirectShowGraph(graph);
                 graph.filterState = 0;
                 cpu->reg[0].u32 = S_OK;
                 return;
@@ -3494,6 +3670,10 @@ private:
                 return;
             case 8: // put_CurrentPosition
                 graph.currentPositionSeconds = argumentDouble(cpu, 1);
+                if (graph.filterState == 2) {
+                    graph.runStartedMicroseconds =
+                        KSystem::getMicroCounter();
+                }
                 cpu->reg[0].u32 = S_OK;
                 return;
             case 9: // get_CurrentPosition
@@ -3503,7 +3683,7 @@ private:
                     writeGuestDouble(
                         this,
                         argument(cpu, 1),
-                        graph.currentPositionSeconds);
+                        directShowPosition(graph));
                     cpu->reg[0].u32 = S_OK;
                 }
                 return;
@@ -4727,6 +4907,7 @@ private:
                     ? direct3DBackBufferFormat
                     : 22,
                 1);
+            hostDirect3D.registerBackBuffer(surface);
         }
         if (!direct3DRenderTargetSurface) {
             direct3DRenderTargetSurface = surface;
@@ -4750,6 +4931,18 @@ private:
                     : configuredDisplayDimension("iSize H", 720),
                 75,
                 2);
+            auto created = direct3DSurfaces.find(surface);
+            if (created != direct3DSurfaces.end()) {
+                hostDirect3D.createSurface(
+                    surface,
+                    created->second.width,
+                    created->second.height,
+                    created->second.format,
+                    created->second.usage,
+                    created->second.pool,
+                    created->second.multiSampleType,
+                    created->second.multiSampleQuality);
+            }
         }
         return surface;
     }
@@ -4789,6 +4982,27 @@ private:
         direct3DResources[objectAddress] = resource;
         memory->writed(objectAddress, vtable->second);
         memory->writed(objectAddress + 4, 1);
+        if ((kind == Direct3DResourceKind::Texture ||
+             kind == Direct3DResourceKind::CubeTexture) &&
+            resourceType != 4) {
+            hostDirect3D.createTexture(
+                objectAddress,
+                resource.width,
+                resource.height,
+                resource.levels,
+                resource.usage,
+                resource.format,
+                resource.pool,
+                kind == Direct3DResourceKind::CubeTexture);
+        } else if (kind == Direct3DResourceKind::Buffer) {
+            hostDirect3D.createBuffer(
+                objectAddress,
+                resource.length,
+                resource.usage,
+                resource.format,
+                resource.pool,
+                resourceType == 7);
+        }
         return objectAddress;
     }
 
@@ -5049,6 +5263,16 @@ private:
                 applyDirect3DPresentationParameters(
                     argument(cpu, 5),
                     argument(cpu, 3));
+                if (!hostDirect3D.ready() &&
+                    !hostDirect3D.initialize(
+                        hostWindow.nativeHandle(),
+                        direct3DBackBufferWidth,
+                        direct3DBackBufferHeight)) {
+                    fprintf(
+                        stderr,
+                        "Sugarbomb host D3D9: native device unavailable; "
+                        "continuing with the software presentation fallback\n");
+                }
                 U32 device = createDirect3DObject(Direct3DObjectKind::Device);
                 memory->writed(resultAddress, device);
                 printf(
@@ -5072,58 +5296,120 @@ private:
         case 3: // TestCooperativeLevel
         case 5: // EvictManagedResources
         case 20: // SetDialogBoxMode
-        case 30: // UpdateSurface
-        case 31: // UpdateTexture
-        case 32: // GetRenderTargetData
         case 33: // GetFrontBufferData
-        case 34: // StretchRect
-        case 35: // ColorFill
-        case 39: // SetDepthStencilSurface
-        case 41: // BeginScene
-        case 42: // EndScene
-        case 44: // SetTransform
         case 46: // MultiplyTransform
-        case 47: // SetViewport
         case 49: // SetMaterial
         case 51: // SetLight
         case 53: // LightEnable
         case 55: // SetClipPlane
-        case 57: // SetRenderState
         case 60: // BeginStateBlock
         case 62: // SetClipStatus
-        case 65: // SetTexture
-        case 67: // SetTextureStageState
-        case 69: // SetSamplerState
         case 71: // SetPaletteEntries
         case 73: // SetCurrentTexturePalette
-        case 75: // SetScissorRect
         case 77: // SetSoftwareVertexProcessing
         case 79: // SetNPatchMode
-        case 81: // DrawPrimitive
-        case 82: // DrawIndexedPrimitive
         case 83: // DrawPrimitiveUP
         case 84: // DrawIndexedPrimitiveUP
         case 85: // ProcessVertices
-        case 87: // SetVertexDeclaration
-        case 89: // SetFVF
-        case 92: // SetVertexShader
-        case 94: // SetVertexShaderConstantF
-        case 96: // SetVertexShaderConstantI
-        case 98: // SetVertexShaderConstantB
-        case 100: // SetStreamSource
-        case 102: // SetStreamSourceFreq
-        case 104: // SetIndices
-        case 107: // SetPixelShader
-        case 109: // SetPixelShaderConstantF
-        case 111: // SetPixelShaderConstantI
-        case 113: // SetPixelShaderConstantB
         case 115: // DrawRectPatch
         case 116: // DrawTriPatch
         case 117: // DeletePatch
             cpu->reg[0].u32 = D3D_OK;
             return;
+        case 30: { // UpdateSurface
+            U8 sourceRectangle[16] = {};
+            U8 destinationPoint[8] = {};
+            const void* sourceRectangleValue = nullptr;
+            const void* destinationPointValue = nullptr;
+            if (argument(cpu, 2) &&
+                memory->canRead(argument(cpu, 2), 16)) {
+                memory->memcpy(
+                    sourceRectangle,
+                    argument(cpu, 2),
+                    sizeof(sourceRectangle));
+                sourceRectangleValue = sourceRectangle;
+            }
+            if (argument(cpu, 4) &&
+                memory->canRead(argument(cpu, 4), 8)) {
+                memory->memcpy(
+                    destinationPoint,
+                    argument(cpu, 4),
+                    sizeof(destinationPoint));
+                destinationPointValue = destinationPoint;
+            }
+            hostDirect3D.updateSurface(
+                argument(cpu, 1),
+                sourceRectangleValue,
+                argument(cpu, 3),
+                destinationPointValue);
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
+        case 31: // UpdateTexture
+            hostDirect3D.updateTexture(
+                argument(cpu, 1),
+                argument(cpu, 2));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 32: // GetRenderTargetData
+            hostDirect3D.getRenderTargetData(
+                argument(cpu, 1),
+                argument(cpu, 2));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 34: { // StretchRect
+            U8 sourceRectangle[16] = {};
+            U8 destinationRectangle[16] = {};
+            const void* sourceRectangleValue = nullptr;
+            const void* destinationRectangleValue = nullptr;
+            if (argument(cpu, 2) &&
+                memory->canRead(argument(cpu, 2), 16)) {
+                memory->memcpy(
+                    sourceRectangle,
+                    argument(cpu, 2),
+                    sizeof(sourceRectangle));
+                sourceRectangleValue = sourceRectangle;
+            }
+            if (argument(cpu, 4) &&
+                memory->canRead(argument(cpu, 4), 16)) {
+                memory->memcpy(
+                    destinationRectangle,
+                    argument(cpu, 4),
+                    sizeof(destinationRectangle));
+                destinationRectangleValue = destinationRectangle;
+            }
+            hostDirect3D.stretchRect(
+                argument(cpu, 1),
+                sourceRectangleValue,
+                argument(cpu, 3),
+                destinationRectangleValue,
+                argument(cpu, 5));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
+        case 35: { // ColorFill
+            U8 rectangle[16] = {};
+            const void* rectangleValue = nullptr;
+            if (argument(cpu, 2) &&
+                memory->canRead(argument(cpu, 2), 16)) {
+                memory->memcpy(
+                    rectangle,
+                    argument(cpu, 2),
+                    sizeof(rectangle));
+                rectangleValue = rectangle;
+            }
+            hostDirect3D.colorFill(
+                argument(cpu, 1),
+                rectangleValue,
+                argument(cpu, 3));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
         case 16: { // Reset
             applyDirect3DPresentationParameters(argument(cpu, 1));
+            hostDirect3D.reset(
+                direct3DBackBufferWidth,
+                direct3DBackBufferHeight);
             auto backBuffer =
                 direct3DSurfaces.find(direct3DBackBufferSurface);
             if (backBuffer != direct3DSurfaces.end()) {
@@ -5146,11 +5432,221 @@ private:
             presentHostBackBuffer();
             cpu->reg[0].u32 = D3D_OK;
             return;
+        case 39: // SetDepthStencilSurface
+            hostDirect3D.setDepthStencilSurface(argument(cpu, 1));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 41: // BeginScene
+            hostDirect3D.beginScene();
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 42: // EndScene
+            hostDirect3D.endScene();
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 44: { // SetTransform
+            U32 matrixAddress = argument(cpu, 2);
+            if (matrixAddress && memory->canRead(matrixAddress, 64)) {
+                float matrix[16] = {};
+                memory->memcpy(matrix, matrixAddress, sizeof(matrix));
+                hostDirect3D.setTransform(
+                    argument(cpu, 1),
+                    matrix);
+            }
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
+        case 47: { // SetViewport
+            U32 viewportAddress = argument(cpu, 1);
+            if (viewportAddress && memory->canRead(viewportAddress, 24)) {
+                U8 viewport[24] = {};
+                memory->memcpy(
+                    viewport,
+                    viewportAddress,
+                    sizeof(viewport));
+                hostDirect3D.setViewport(viewport);
+            }
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
+        case 57: // SetRenderState
+            hostDirect3D.setRenderState(
+                argument(cpu, 1),
+                argument(cpu, 2));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 65: // SetTexture
+            hostDirect3D.setTexture(
+                argument(cpu, 1),
+                argument(cpu, 2));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 67: // SetTextureStageState
+            hostDirect3D.setTextureStageState(
+                argument(cpu, 1),
+                argument(cpu, 2),
+                argument(cpu, 3));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 69: // SetSamplerState
+            hostDirect3D.setSamplerState(
+                argument(cpu, 1),
+                argument(cpu, 2),
+                argument(cpu, 3));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 75: { // SetScissorRect
+            U32 rectangleAddress = argument(cpu, 1);
+            if (rectangleAddress && memory->canRead(rectangleAddress, 16)) {
+                U8 rectangle[16] = {};
+                memory->memcpy(
+                    rectangle,
+                    rectangleAddress,
+                    sizeof(rectangle));
+                hostDirect3D.setScissorRect(rectangle);
+            }
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
+        case 81: // DrawPrimitive
+            hostDirect3D.drawPrimitive(
+                argument(cpu, 1),
+                argument(cpu, 2),
+                argument(cpu, 3));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 82: // DrawIndexedPrimitive
+            hostDirect3D.drawIndexedPrimitive(
+                argument(cpu, 1),
+                static_cast<S32>(argument(cpu, 2)),
+                argument(cpu, 3),
+                argument(cpu, 4),
+                argument(cpu, 5),
+                argument(cpu, 6));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 87: // SetVertexDeclaration
+            hostDirect3D.setVertexDeclaration(argument(cpu, 1));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 89: // SetFVF
+            hostDirect3D.setFvf(argument(cpu, 1));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 92: // SetVertexShader
+            hostDirect3D.setVertexShader(argument(cpu, 1));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 94: // SetVertexShaderConstantF
+        case 96: // SetVertexShaderConstantI
+        case 98: { // SetVertexShaderConstantB
+            U32 startRegister = argument(cpu, 1);
+            U32 valuesAddress = argument(cpu, 2);
+            U32 count = argument(cpu, 3);
+            U32 componentCount = method.index == 98 ? 1 : 4;
+            U64 byteCount64 =
+                static_cast<U64>(count) * componentCount * sizeof(U32);
+            if (valuesAddress &&
+                byteCount64 <= 0x10000 &&
+                memory->canRead(
+                    valuesAddress,
+                    static_cast<U32>(byteCount64))) {
+                std::vector<U32> values(
+                    static_cast<std::size_t>(count) * componentCount);
+                memory->memcpy(
+                    values.data(),
+                    valuesAddress,
+                    static_cast<U32>(byteCount64));
+                if (method.index == 94) {
+                    hostDirect3D.setVertexShaderConstantF(
+                        startRegister,
+                        reinterpret_cast<const float*>(values.data()),
+                        count);
+                } else if (method.index == 96) {
+                    hostDirect3D.setVertexShaderConstantI(
+                        startRegister,
+                        reinterpret_cast<const S32*>(values.data()),
+                        count);
+                } else {
+                    hostDirect3D.setVertexShaderConstantB(
+                        startRegister,
+                        reinterpret_cast<const S32*>(values.data()),
+                        count);
+                }
+            }
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
+        case 100: // SetStreamSource
+            hostDirect3D.setStreamSource(
+                argument(cpu, 1),
+                argument(cpu, 2),
+                argument(cpu, 3),
+                argument(cpu, 4));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 102: // SetStreamSourceFreq
+            hostDirect3D.setStreamSourceFrequency(
+                argument(cpu, 1),
+                argument(cpu, 2));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 104: // SetIndices
+            hostDirect3D.setIndices(argument(cpu, 1));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 107: // SetPixelShader
+            hostDirect3D.setPixelShader(argument(cpu, 1));
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        case 109: // SetPixelShaderConstantF
+        case 111: // SetPixelShaderConstantI
+        case 113: { // SetPixelShaderConstantB
+            U32 startRegister = argument(cpu, 1);
+            U32 valuesAddress = argument(cpu, 2);
+            U32 count = argument(cpu, 3);
+            U32 componentCount = method.index == 113 ? 1 : 4;
+            U64 byteCount64 =
+                static_cast<U64>(count) * componentCount * sizeof(U32);
+            if (valuesAddress &&
+                byteCount64 <= 0x10000 &&
+                memory->canRead(
+                    valuesAddress,
+                    static_cast<U32>(byteCount64))) {
+                std::vector<U32> values(
+                    static_cast<std::size_t>(count) * componentCount);
+                memory->memcpy(
+                    values.data(),
+                    valuesAddress,
+                    static_cast<U32>(byteCount64));
+                if (method.index == 109) {
+                    hostDirect3D.setPixelShaderConstantF(
+                        startRegister,
+                        reinterpret_cast<const float*>(values.data()),
+                        count);
+                } else if (method.index == 111) {
+                    hostDirect3D.setPixelShaderConstantI(
+                        startRegister,
+                        reinterpret_cast<const S32*>(values.data()),
+                        count);
+                } else {
+                    hostDirect3D.setPixelShaderConstantB(
+                        startRegister,
+                        reinterpret_cast<const S32*>(values.data()),
+                        count);
+                }
+            }
+            cpu->reg[0].u32 = D3D_OK;
+            return;
+        }
         case 37: { // SetRenderTarget
             if (argument(cpu, 1) == 0 &&
                 direct3DSurfaces.count(argument(cpu, 2))) {
                 direct3DRenderTargetSurface = argument(cpu, 2);
             }
+            hostDirect3D.setRenderTarget(
+                argument(cpu, 1),
+                argument(cpu, 2));
             cpu->reg[0].u32 = D3D_OK;
             return;
         }
@@ -5165,6 +5661,31 @@ private:
                         argument(cpu, 4));
                 }
             }
+            std::vector<U8> rectangles;
+            U32 rectangleCount = argument(cpu, 1);
+            U32 rectangleAddress = argument(cpu, 2);
+            if (rectangleCount &&
+                rectangleCount <= 4096 &&
+                rectangleAddress &&
+                memory->canRead(rectangleAddress, rectangleCount * 16)) {
+                rectangles.resize(rectangleCount * 16);
+                memory->memcpy(
+                    rectangles.data(),
+                    rectangleAddress,
+                    static_cast<U32>(rectangles.size()));
+            } else {
+                rectangleCount = 0;
+            }
+            U32 depthBits = argument(cpu, 5);
+            float depth = 1.0f;
+            memcpy(&depth, &depthBits, sizeof(depth));
+            hostDirect3D.clear(
+                rectangleCount,
+                rectangles.empty() ? nullptr : rectangles.data(),
+                argument(cpu, 3),
+                argument(cpu, 4),
+                depth,
+                argument(cpu, 6));
             cpu->reg[0].u32 = D3D_OK;
             return;
         }
@@ -5283,28 +5804,74 @@ private:
             return;
         }
         case 86: { // CreateVertexDeclaration
+            U32 elementsAddress = argument(cpu, 1);
             U32 resultAddress = argument(cpu, 2);
-            if (!resultAddress) {
+            if (!elementsAddress || !resultAddress) {
                 cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                 return;
             }
             U32 resource = createDirect3DResource(
                 Direct3DResourceKind::Declaration,
                 0);
+            std::vector<U8> elements;
+            for (U32 index = 0; index < 64; ++index) {
+                U32 elementAddress = elementsAddress + index * 8;
+                if (!memory->canRead(elementAddress, 8)) {
+                    break;
+                }
+                std::size_t offset = elements.size();
+                elements.resize(offset + 8);
+                memory->memcpy(
+                    elements.data() + offset,
+                    elementAddress,
+                    8);
+                if (memory->readw(elementAddress) == 0x00ff &&
+                    memory->readb(elementAddress + 4) == 17) {
+                    break;
+                }
+            }
+            if (resource && !elements.empty()) {
+                hostDirect3D.createVertexDeclaration(
+                    resource,
+                    elements.data(),
+                    elements.size());
+            }
             memory->writed(resultAddress, resource);
             cpu->reg[0].u32 = resource ? D3D_OK : 0x8007000e;
             return;
         }
         case 91: // CreateVertexShader
         case 106: { // CreatePixelShader
+            U32 bytecodeAddress = argument(cpu, 1);
             U32 resultAddress = argument(cpu, 2);
-            if (!resultAddress) {
+            if (!bytecodeAddress || !resultAddress) {
                 cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                 return;
             }
             U32 resource = createDirect3DResource(
                 Direct3DResourceKind::Shader,
                 method.index == 91 ? 1 : 2);
+            std::vector<U32> bytecode;
+            for (U32 index = 0; index < 65536; ++index) {
+                U32 tokenAddress = bytecodeAddress + index * 4;
+                if (!memory->canRead(tokenAddress, 4)) {
+                    break;
+                }
+                U32 token = memory->readd(tokenAddress);
+                bytecode.push_back(token);
+                if (token == 0x0000ffff) {
+                    break;
+                }
+            }
+            if (resource &&
+                !bytecode.empty() &&
+                bytecode.back() == 0x0000ffff) {
+                hostDirect3D.createShader(
+                    resource,
+                    method.index == 106,
+                    bytecode.data(),
+                    bytecode.size());
+            }
             memory->writed(resultAddress, resource);
             cpu->reg[0].u32 = resource ? D3D_OK : 0x8007000e;
             return;
@@ -5364,6 +5931,18 @@ private:
                 method.index == 36 ? argument(cpu, 4) : 0,
                 method.index == 36 ? 0 : argument(cpu, 4),
                 method.index == 36 ? 0 : argument(cpu, 5));
+            auto created = direct3DSurfaces.find(surface);
+            if (created != direct3DSurfaces.end()) {
+                hostDirect3D.createSurface(
+                    surface,
+                    created->second.width,
+                    created->second.height,
+                    created->second.format,
+                    created->second.usage,
+                    created->second.pool,
+                    created->second.multiSampleType,
+                    created->second.multiSampleQuality);
+            }
             memory->writed(resultAddress, surface);
             cpu->reg[0].u32 = surface ? D3D_OK : 0x8007000e;
             return;
@@ -5484,6 +6063,9 @@ private:
                 --surface.references;
             }
             memory->writed(objectAddress + 4, surface.references);
+            if (!surface.references) {
+                hostDirect3D.releaseResource(objectAddress);
+            }
             cpu->reg[0].u32 = surface.references;
             return;
         case 3: { // GetDevice
@@ -5554,16 +6136,7 @@ private:
                 cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                 return;
             }
-            U64 storageSize64 =
-                static_cast<U64>(surface.width) * surface.height * 4;
-            if (!surface.storageAddress &&
-                storageSize64 &&
-                storageSize64 <= 0x10000000) {
-                surface.storageAddress = allocateGuestHeap(
-                    static_cast<U32>(storageSize64),
-                    true);
-            }
-            if (!surface.storageAddress) {
+            if (!ensureDirect3DSurfaceStorage(surface)) {
                 cpu->reg[0].u32 = 0x8007000e;
                 return;
             }
@@ -5573,17 +6146,49 @@ private:
                 U32 left = memory->readd(rectangle);
                 U32 top = memory->readd(rectangle + 4);
                 if (left < surface.width && top < surface.height) {
-                    bits += (top * surface.width + left) * 4;
+                    U32 bytesPerPixel =
+                        surface.width
+                            ? surface.lockPitch / surface.width
+                            : 0;
+                    bits += top * surface.lockPitch +
+                        left * bytesPerPixel;
                 }
             }
-            memory->writed(lockedRect, surface.width * 4);
+            memory->writed(lockedRect, surface.lockPitch);
             memory->writed(lockedRect + 4, bits);
             cpu->reg[0].u32 = D3D_OK;
             return;
         }
-        case 14: // UnlockRect
+        case 14: { // UnlockRect
+            U32 byteCount = surface.lockPitch * surface.lockRows;
+            if (surface.storageAddress &&
+                byteCount &&
+                memory->canRead(surface.storageAddress, byteCount)) {
+                std::vector<U8> upload(byteCount);
+                memory->memcpy(
+                    upload.data(),
+                    surface.storageAddress,
+                    byteCount);
+                if (surface.parentResource) {
+                    hostDirect3D.uploadTexture(
+                        surface.parentResource,
+                        surface.parentFace,
+                        surface.parentLevel,
+                        upload.data(),
+                        surface.lockPitch,
+                        surface.lockRows);
+                } else {
+                    hostDirect3D.uploadSurface(
+                        objectAddress,
+                        upload.data(),
+                        surface.lockPitch,
+                        surface.width,
+                        surface.lockRows);
+                }
+            }
             cpu->reg[0].u32 = D3D_OK;
             return;
+        }
         case 15: // GetDC
             if (argument(cpu, 1)) {
                 memory->writed(argument(cpu, 1), 0);
@@ -5638,6 +6243,9 @@ private:
                 --resource.references;
             }
             memory->writed(objectAddress + 4, resource.references);
+            if (!resource.references) {
+                hostDirect3D.releaseResource(objectAddress);
+            }
             cpu->reg[0].u32 = resource.references;
             return;
         case 3: { // GetDevice
@@ -5734,6 +6342,20 @@ private:
                     resource.format,
                     resource.usage,
                     resource.pool);
+                auto created = direct3DSurfaces.find(surface);
+                if (created != direct3DSurfaces.end()) {
+                    created->second.parentResource = objectAddress;
+                    created->second.parentFace =
+                        resource.kind == Direct3DResourceKind::CubeTexture
+                            ? argument(cpu, 1)
+                            : 0;
+                    created->second.parentLevel = level;
+                    hostDirect3D.aliasTextureSurface(
+                        surface,
+                        objectAddress,
+                        created->second.parentFace,
+                        level);
+                }
                 memory->writed(resultAddress, surface);
                 cpu->reg[0].u32 = surface ? D3D_OK : 0x8007000e;
                 return;
@@ -5750,8 +6372,22 @@ private:
                 }
                 U32 width = std::max<U32>(1, resource.width >> level);
                 U32 height = std::max<U32>(1, resource.height >> level);
+                U32 basePitch = 0;
+                U32 baseRows = 0;
+                direct3DStorageLayout(
+                    resource.format,
+                    resource.width,
+                    resource.height,
+                    basePitch,
+                    baseRows);
+                direct3DStorageLayout(
+                    resource.format,
+                    width,
+                    height,
+                    resource.lockPitch,
+                    resource.lockRows);
                 U64 storageSize64 =
-                    static_cast<U64>(resource.width) * resource.height * 4;
+                    static_cast<U64>(basePitch) * baseRows;
                 if (!resource.storageAddress &&
                     storageSize64 &&
                     storageSize64 <= 0x10000000) {
@@ -5768,15 +6404,41 @@ private:
                     U32 left = memory->readd(rectangle);
                     U32 top = memory->readd(rectangle + 4);
                     if (left < width && top < height) {
-                        bits += (top * width + left) * 4;
+                        U32 bytesPerPixel =
+                            width ? resource.lockPitch / width : 0;
+                        bits += top * resource.lockPitch +
+                            left * bytesPerPixel;
                     }
                 }
-                memory->writed(lockedRect, width * 4);
+                resource.lockFace =
+                    cube ? argument(cpu, 1) : 0;
+                resource.lockLevel = level;
+                memory->writed(lockedRect, resource.lockPitch);
                 memory->writed(lockedRect + 4, bits);
                 cpu->reg[0].u32 = D3D_OK;
                 return;
             }
-            case 20: // UnlockRect
+            case 20: { // UnlockRect
+                U32 byteCount = resource.lockPitch * resource.lockRows;
+                if (resource.storageAddress &&
+                    byteCount &&
+                    memory->canRead(resource.storageAddress, byteCount)) {
+                    std::vector<U8> upload(byteCount);
+                    memory->memcpy(
+                        upload.data(),
+                        resource.storageAddress,
+                        byteCount);
+                    hostDirect3D.uploadTexture(
+                        objectAddress,
+                        resource.lockFace,
+                        resource.lockLevel,
+                        upload.data(),
+                        resource.lockPitch,
+                        resource.lockRows);
+                }
+                cpu->reg[0].u32 = D3D_OK;
+                return;
+            }
             case 21: // AddDirtyRect
                 cpu->reg[0].u32 = D3D_OK;
                 return;
@@ -5801,6 +6463,8 @@ private:
                 if (!resource.storageAddress) {
                     resource.storageAddress = allocateGuestHeap(capacity, true);
                 }
+                resource.lockOffset = offset;
+                resource.lockSize = size ? size : capacity - offset;
                 memory->writed(
                     resultAddress,
                     resource.storageAddress
@@ -5810,9 +6474,26 @@ private:
                     resource.storageAddress ? D3D_OK : 0x8007000e;
                 return;
             }
-            case 12: // Unlock
+            case 12: { // Unlock
+                if (resource.storageAddress &&
+                    resource.lockSize &&
+                    memory->canRead(
+                        resource.storageAddress + resource.lockOffset,
+                        resource.lockSize)) {
+                    std::vector<U8> upload(resource.lockSize);
+                    memory->memcpy(
+                        upload.data(),
+                        resource.storageAddress + resource.lockOffset,
+                        resource.lockSize);
+                    hostDirect3D.uploadBuffer(
+                        objectAddress,
+                        upload.data(),
+                        resource.lockOffset,
+                        resource.lockSize);
+                }
                 cpu->reg[0].u32 = D3D_OK;
                 return;
+            }
             case 13: { // GetDesc
                 U32 description = argument(cpu, 1);
                 if (!description) {
@@ -6443,6 +7124,44 @@ private:
         }
     }
 
+    static void callbackD3DXLoadSurfaceFromSurface(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "D3DX9!D3DXLoadSurfaceFromSurface");
+        if (!session) {
+            return;
+        }
+        U8 destinationRectangle[16] = {};
+        U8 sourceRectangle[16] = {};
+        const void* destinationRectangleValue = nullptr;
+        const void* sourceRectangleValue = nullptr;
+        if (argument(cpu, 2) &&
+            session->memory->canRead(argument(cpu, 2), 16)) {
+            session->memory->memcpy(
+                destinationRectangle,
+                argument(cpu, 2),
+                sizeof(destinationRectangle));
+            destinationRectangleValue = destinationRectangle;
+        }
+        if (argument(cpu, 5) &&
+            session->memory->canRead(argument(cpu, 5), 16)) {
+            session->memory->memcpy(
+                sourceRectangle,
+                argument(cpu, 5),
+                sizeof(sourceRectangle));
+            sourceRectangleValue = sourceRectangle;
+        }
+        cpu->reg[0].u32 =
+            session->hostDirect3D.loadSurfaceFromSurface(
+                argument(cpu, 0),
+                destinationRectangleValue,
+                argument(cpu, 3),
+                sourceRectangleValue,
+                argument(cpu, 6),
+                argument(cpu, 7))
+            ? 0
+            : 0x80004005;
+    }
+
     static void callbackD3DXReturnSuccess(CPU* cpu) {
         if (current(cpu, "D3DX9!CompatibilitySuccess")) {
             cpu->reg[0].u32 = 0;
@@ -6452,6 +7171,130 @@ private:
     static void callbackD3DXReturnNotImplemented(CPU* cpu) {
         if (current(cpu, "D3DX9!NotImplemented")) {
             cpu->reg[0].u32 = 0x80004001;
+        }
+    }
+
+    bool copyDirect3DImageBytes(
+        U32 guestAddress,
+        U32 byteCount,
+        std::vector<U8>& bytes) {
+        constexpr U32 MAX_IMAGE_BYTES = 256 * 1024 * 1024;
+        if (!guestAddress ||
+            !byteCount ||
+            byteCount > MAX_IMAGE_BYTES ||
+            !memory->canRead(guestAddress, byteCount)) {
+            return false;
+        }
+        bytes.resize(byteCount);
+        memory->memcpy(bytes.data(), guestAddress, byteCount);
+        return true;
+    }
+
+    static void callbackD3DXGetImageInfoFromFileInMemory(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "D3DX9!D3DXGetImageInfoFromFileInMemory");
+        if (!session) {
+            return;
+        }
+        constexpr U32 E_FAIL = 0x80004005;
+        U32 dataAddress = argument(cpu, 0);
+        U32 byteCount = argument(cpu, 1);
+        U32 outputAddress = argument(cpu, 2);
+        if (!outputAddress ||
+            !session->memory->canWrite(outputAddress, 28)) {
+            cpu->reg[0].u32 = E_FAIL;
+            return;
+        }
+        std::vector<U8> bytes;
+        SugarbombHostD3DImageInfo info;
+        if (!session->copyDirect3DImageBytes(
+                dataAddress,
+                byteCount,
+                bytes) ||
+            !session->hostDirect3D.getImageInfoFromMemory(
+                bytes.data(),
+                byteCount,
+                info)) {
+            cpu->reg[0].u32 = E_FAIL;
+            return;
+        }
+        session->memory->writed(outputAddress + 0, info.width);
+        session->memory->writed(outputAddress + 4, info.height);
+        session->memory->writed(outputAddress + 8, info.depth);
+        session->memory->writed(outputAddress + 12, info.mipLevels);
+        session->memory->writed(outputAddress + 16, info.format);
+        session->memory->writed(outputAddress + 20, info.resourceType);
+        session->memory->writed(outputAddress + 24, info.fileFormat);
+        cpu->reg[0].u32 = 0;
+    }
+
+    U32 createDirect3DTextureFromMemory(
+        U32 dataAddress,
+        U32 byteCount,
+        U32 outputAddress,
+        bool cube) {
+        constexpr U32 E_FAIL = 0x80004005;
+        constexpr U32 E_POINTER = 0x80004003;
+        if (!outputAddress || !memory->canWrite(outputAddress, 4)) {
+            return E_POINTER;
+        }
+        memory->writed(outputAddress, 0);
+        std::vector<U8> bytes;
+        SugarbombHostD3DImageInfo info;
+        if (!copyDirect3DImageBytes(dataAddress, byteCount, bytes) ||
+            !hostDirect3D.getImageInfoFromMemory(
+                bytes.data(),
+                byteCount,
+                info)) {
+            return E_FAIL;
+        }
+        U32 resource = createDirect3DResource(
+            cube
+                ? Direct3DResourceKind::CubeTexture
+                : Direct3DResourceKind::Texture,
+            cube ? 5 : 3,
+            info.width,
+            info.height,
+            info.mipLevels,
+            info.format,
+            0,
+            1);
+        if (!resource ||
+            !hostDirect3D.createTextureFromMemory(
+                resource,
+                bytes.data(),
+                byteCount,
+                cube)) {
+            if (resource) {
+                hostDirect3D.releaseResource(resource);
+            }
+            return E_FAIL;
+        }
+        memory->writed(outputAddress, resource);
+        return 0;
+    }
+
+    static void callbackD3DXCreateTextureFromFileInMemory(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "D3DX9!D3DXCreateTextureFromFileInMemory");
+        if (session) {
+            cpu->reg[0].u32 = session->createDirect3DTextureFromMemory(
+                argument(cpu, 1),
+                argument(cpu, 2),
+                argument(cpu, 3),
+                false);
+        }
+    }
+
+    static void callbackD3DXCreateCubeTextureFromFileInMemory(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "D3DX9!D3DXCreateCubeTextureFromFileInMemory");
+        if (session) {
+            cpu->reg[0].u32 = session->createDirect3DTextureFromMemory(
+                argument(cpu, 1),
+                argument(cpu, 2),
+                argument(cpu, 3),
+                true);
         }
     }
 
@@ -9340,6 +10183,61 @@ private:
         return false;
     }
 
+    void printGuestWaitDetails(const GuestThreadState& state) const {
+        if (state.waitKind == GuestWaitKind::Sleep) {
+            U64 now = KSystem::getMicroCounter();
+            fprintf(
+                stderr,
+                "      sleep deadline=%llu now=%llu remaining_ms=%lld\n",
+                static_cast<unsigned long long>(state.waitDeadline),
+                static_cast<unsigned long long>(now),
+                state.waitDeadline == std::numeric_limits<U64>::max()
+                    ? -1LL
+                    : static_cast<long long>(
+                        state.waitDeadline > now
+                            ? (state.waitDeadline - now) / 1000
+                            : 0));
+            return;
+        }
+        if (state.waitKind != GuestWaitKind::KernelObjects) {
+            return;
+        }
+        static const char* typeNames[] = {
+            "semaphore",
+            "event",
+            "mutex",
+            "thread",
+        };
+        fprintf(
+            stderr,
+            "      waitAll=%u deadline=%llu handles:",
+            state.waitAll ? 1 : 0,
+            static_cast<unsigned long long>(state.waitDeadline));
+        for (U32 handle : state.waitHandles) {
+            auto object = kernelObjects.find(handle);
+            if (object == kernelObjects.end()) {
+                fprintf(stderr, " 0x%08X(invalid)", handle);
+                continue;
+            }
+            const KernelObject& value = object->second;
+            fprintf(
+                stderr,
+                " 0x%08X(%s,signaled=%u,count=%d,tid=%u%s%s)",
+                handle,
+                typeNames[static_cast<U32>(value.type)],
+                kernelObjectIsSignaled(
+                    value,
+                    state.thread ? state.thread->id : 0)
+                    ? 1
+                    : 0,
+                value.count,
+                value.threadId,
+                value.name.empty() ? "" : ",name=",
+                value.name.empty() ? "" : value.name.c_str());
+        }
+        fprintf(stderr, "\n");
+    }
+
     void acquireKernelObject(KernelObject& object, U32 threadId) {
         switch (object.type) {
         case KernelObjectType::Semaphore:
@@ -9953,8 +10851,11 @@ private:
     U32 direct3DLastClearColor = 0xff000000;
     U32 direct3DVertexProfileAddress = 0;
     U32 direct3DPixelProfileAddress = 0;
+    SugarbombHostD3D9 hostDirect3D;
     SugarbombHostWindow hostWindow;
     std::vector<U32> hostPresentPixels;
+    bool hostFrameCaptured = false;
+    U32 guestPresentCount = 0;
     U32 nextHeapHandle = PROCESS_HEAP_HANDLE + 1;
     U32 nextHeapAddress = GUEST_HEAP_BASE;
     U32 nextVirtualAddress = GUEST_VIRTUAL_BASE;

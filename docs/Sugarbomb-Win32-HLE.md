@@ -23,14 +23,19 @@ Sugarbomb owns that loading step, so the deployed path does not run
 
 The Windows x64 host now enters the original FalloutNV 1.4.0.525 executable at
 `0x00ECC4DB` without Wine and continues through engine startup. A 20-second
-diagnostic run executes 17,325,714 guest CPU slices and 10,004,586 bridged
-native calls without an unresolved import or guest page fault. During that run
-Fallout:
+diagnostic run executes about 17.2 million guest CPU slices and 9.9 million
+bridged native calls without an unresolved import or guest page fault. During
+that run Fallout:
 
 - opens the base BSA archives and enumerates installed ESM/NAM content;
-- registers both game windows and creates a synthetic D3D9 device;
+- registers both game windows and creates a real D3D9 device owned by the
+  64-bit host;
 - creates textures, cube textures, render targets, depth surfaces, shaders,
-  declarations, vertex/index buffers, and completes a full draw/present frame;
+  declarations, and vertex/index buffers while retaining 32-bit guest COM
+  identities;
+- decodes 96 texture images through the native x64 D3DX9 runtime, completes
+  roughly 600 translated indexed draws, and runs about 300 complete
+  `BeginScene`/`EndScene`/`Present` cycles;
 - initializes DirectInput 8, XInput, DirectSound 8, WinMM, and COM;
 - constructs a DirectShow filter graph for `MainTitle.mp3`, renders its source
   filter, queries media position, sets volume, runs, and pauses playback;
@@ -39,18 +44,21 @@ Fallout:
   worker threads using guest-visible kernel synchronization objects.
 
 At the end of the diagnostic window the main thread is sleeping on its normal
-timer path while the worker threads are parked on waits. This is a headless
-compatibility milestone for the engine itself. The next renderer checkpoint
-adds a real native Windows window owned by the 64-bit process. Fallout's
-32-bit guest HWND remains an integer in guest memory, while the corresponding
-native `HWND` remains private to the host. A verified 1920x1080 guest D3D9
-`Present` reaches that window.
+frame-timer path while worker threads are parked on kernel-object waits.
+Fallout's 32-bit guest `HWND` remains an integer in guest memory, while its
+corresponding native `HWND` and every native D3D pointer remain private to the
+64-bit host.
 
-The current host window displays the synthetic backbuffer and an identifying
-status overlay. Guest draw calls are not translated to the host GPU yet, so
-the captured frame is black rather than the game's rendered menu. Audio and
-video also remain facades. This is visible output and a proof of the handle
-boundary, not yet a playable build.
+The renderer checkpoint is no longer synthetic. Sugarbomb translates
+Fallout's render targets, surfaces, textures, texture locks, vertex/index
+buffers, declarations, shader bytecode, constants, render/sampler state, and
+draw calls to a native x64 `IDirect3DDevice9`. It also forwards the surface-copy
+operations used by the engine and can capture the active render target or
+swap-chain backbuffer for deterministic diagnostics. A verified 1920x1080
+backbuffer capture contains Fallout's fully rendered Obsidian Entertainment
+startup splash. Audio output, video decoding, guest input messages, and enough
+remaining Win32 behavior to reach an interactive menu are still incomplete, so
+this is not yet a playable build.
 
 The runtime currently builds:
 
@@ -168,9 +176,11 @@ dependency order and validate each group with small guest fixtures:
    now create visible output; input messages are not yet translated back into
    the guest queue.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
-   Sugarbomb's renderer. The guest COM/resource model and native presentation
-   window are in place; 64-bit host D3D9 resources/draw translation and the
-   remaining D3DX texture/shader helpers are next.
+   Sugarbomb's renderer. The guest COM/resource model, native presentation
+   window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
+   and surface-copy paths are in place. Remaining work includes less common
+   resource methods, volume textures, D3DX shader helpers, reset/lost-device
+   edge cases, and frame-by-frame validation beyond the startup splash.
 5. **Audio/video:** DirectSound, WinMM, DirectShow, and Bink integration. The
    current facades preserve guest contracts and timing but do not decode or
    emit media yet.
@@ -195,17 +205,23 @@ From the repository root:
 .\project\msvc\BoxedWine\x64\Release\BoxedWine.exe --sugarbomb-run 'D:\path\to\FalloutNV.exe'
 ```
 
-For deterministic diagnostics, the runtime accepts two optional environment
+For deterministic diagnostics, the runtime accepts optional environment
 variables. They do not change the guest ABI:
 
 ```powershell
 $env:SUGARBOMB_MAX_RUN_SLICES = '2600000'
 $env:SUGARBOMB_MAX_RUN_MILLISECONDS = '20000'
 $env:SUGARBOMB_NO_HOST_WINDOW = '1' # optional for unattended runs
+$env:SUGARBOMB_CAPTURE_FRAME = 'D:\captures\fallout-present.png'
+$env:SUGARBOMB_CAPTURE_AFTER_PRESENTS = '100'
+$env:SUGARBOMB_CAPTURE_FINAL_FRAME = 'D:\captures\fallout-final-target.png'
+$env:SUGARBOMB_CAPTURE_FINAL_BACKBUFFER = 'D:\captures\fallout-final-backbuffer.png'
 ```
 
 When either diagnostic budget expires, Sugarbomb prints every guest thread's
-state/EIP and the busiest bridged APIs.
+state/EIP, kernel-wait details, the busiest bridged APIs, and selected graphics
+milestones. Renderer captures are written by the native D3DX9 path and therefore
+do not depend on desktop focus or screen-compositor capture behavior.
 
 The Visual Studio project currently targets the newer v145 toolset upstream.
 The build helper explicitly selects the installed v143 toolset from Visual
@@ -223,9 +239,10 @@ Studio 2022.
 This is an executable compatibility-layer checkpoint, not a playable build.
 Fallout now survives the previously missing kernel-object, guest-thread,
 USER32, D3D9, audio, DirectShow, Bink, and startup-order singleton boundaries.
-The 64-bit host now owns a real window and presents Fallout's synthetic
-backbuffer without exposing native pointers to the 32-bit guest. The next major
-work is to translate D3D9 resources, shaders, state, and draws to the host GPU,
-finish D3DX texture/shader helpers, translate input, persist the remaining
+The 64-bit host owns the window and real D3D9 objects, translates Fallout's
+32-bit graphics workload, and produces a correctly textured startup splash
+without exposing native pointers to the guest. The next major work is to
+translate the guest USER32 message/input queue, finish the remaining D3D9/D3DX
+and media behaviors needed to reach the interactive menu, persist remaining
 virtual-file operations, and load `nvse_1_4.dll` plus NVSE plugins in the same
 guest process.
