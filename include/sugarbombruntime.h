@@ -7,12 +7,12 @@
  *  (at your option) any later version.
  */
 
-#ifndef __TEST_PE32_LOADER_H__
-#define __TEST_PE32_LOADER_H__
+#ifndef __SUGARBOMB_RUNTIME_H__
+#define __SUGARBOMB_RUNTIME_H__
 
-void testPe32LoaderRejectsInvalidImage();
-void testPe32LoaderMapsAndExecutesImage();
-void testSugarbombThunkArena();
-void testSugarbombNativeBridge();
+class SugarbombRuntime {
+public:
+    static int run(const char* imagePath);
+};
 
 #endif

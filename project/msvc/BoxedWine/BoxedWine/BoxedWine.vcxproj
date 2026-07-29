@@ -915,6 +915,7 @@
     <ClInclude Include="..\..\..\..\include\log.h" />
     <ClInclude Include="..\..\..\..\include\meminfo.h" />
     <ClInclude Include="..\..\..\..\include\pe32loader.h" />
+    <ClInclude Include="..\..\..\..\include\sugarbombruntime.h" />
     <ClInclude Include="..\..\..\..\include\pixelformat.h" />
     <ClInclude Include="..\..\..\..\include\platform.h" />
     <ClInclude Include="..\..\..\..\include\platformOpenGL.h" />
@@ -3823,6 +3824,7 @@
     <ClCompile Include="..\..\..\..\source\sdl\startupArgs.cpp" />
     <ClCompile Include="..\..\..\..\source\sugarbomb\pe32loader.cpp" />
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombbridge.cpp" />
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombruntime.cpp" />
     <ClCompile Include="..\..\..\..\source\test\testMain.cpp" />
     <ClCompile Include="..\..\..\..\source\test\sugarbomb\testPe32Loader.cpp" />
     <ClCompile Include="..\..\..\..\source\test\cpu\testAdc.cpp" />

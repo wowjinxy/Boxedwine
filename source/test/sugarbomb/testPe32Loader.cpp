@@ -24,6 +24,7 @@ constexpr U32 TEST_ENTRY_RVA = 0x00001000;
 constexpr U32 TEST_ENTRY_RESULT = 0x12345678;
 constexpr U32 TEST_BRIDGE_RESULT = 0x53425547;
 constexpr U32 TEST_IMPORT_ADDRESS = 0x70001000;
+constexpr U32 TEST_THUNK_BASE = 0x60000000;
 
 void writeU16(std::vector<U8>& bytes, size_t offset, U16 value) {
     bytes[offset] = static_cast<U8>(value);
@@ -73,6 +74,8 @@ std::vector<U8> createTestPe32() {
     writeU32(bytes, optional + 108, 0x28);
     writeU32(bytes, optional + 136, 0x20a0);
     writeU32(bytes, optional + 140, 12);
+    writeU32(bytes, optional + 168, 0x2080);
+    writeU32(bytes, optional + 172, 24);
 
     const size_t textSection = optional + 0xe0;
     writeString(bytes, textSection, ".text");
@@ -155,6 +158,8 @@ void testPe32LoaderMapsAndExecutesImage() {
         inspected.entryPoint() != TEST_IMAGE_BASE + TEST_ENTRY_RVA ||
         inspected.sections.size() != 2 ||
         inspected.imports.size() != 1 ||
+        inspected.tlsDirectoryRva != 0x2080 ||
+        inspected.tlsDirectorySize != 24 ||
         inspected.imports[0].name != "KERNEL32.dll" ||
         inspected.imports[0].symbols.size() != 1 ||
         inspected.imports[0].symbols[0].name != "ExitProcess") {
@@ -208,6 +213,48 @@ void testPe32LoaderMapsAndExecutesImage() {
         context.memory->readd(TEST_RELOCATED_BASE + 0x1008) != TEST_RELOCATED_BASE + 0x2000) {
         testFail("PE32 HIGHLOW relocation was not applied correctly");
     }
+}
+
+void testSugarbombThunkArena() {
+    SugarbombBridge::clearForTests();
+    TestContext& context = testContext();
+    SugarbombThunkArena arena;
+    std::string error;
+    if (!arena.initialize(context.thread, TEST_THUNK_BASE, K_PAGE_SIZE, error)) {
+        testFail("Sugarbomb thunk arena initialization failed: %s", error.c_str());
+        return;
+    }
+
+    U32 callbackIndex = SugarbombBridge::registerCallback(
+        "KERNEL32.dll",
+        "ThunkArenaTest",
+        testBridgeCallback);
+    U32 thunkAddress = 0;
+    if (!arena.createThunk(callbackIndex, 8, thunkAddress, error) ||
+        thunkAddress != TEST_THUNK_BASE ||
+        arena.thunkCount() != 1 ||
+        context.memory->readb(thunkAddress) != 0x68 ||
+        context.memory->readd(thunkAddress + 1) != callbackIndex ||
+        context.memory->readb(thunkAddress + 5) != 0xcd ||
+        context.memory->readb(thunkAddress + 6) != 0x9c ||
+        context.memory->readb(thunkAddress + 10) != 0xc2 ||
+        context.memory->readw(thunkAddress + 11) != 8) {
+        testFail("Sugarbomb stdcall thunk bytes were generated incorrectly");
+    }
+
+    std::string module;
+    std::string symbol;
+    if (!SugarbombBridge::callbackName(callbackIndex, module, symbol) ||
+        module != "KERNEL32.dll" ||
+        symbol != "ThunkArenaTest") {
+        testFail("Sugarbomb callback registry did not retain the import name");
+    }
+    if (!arena.finalize(error) || context.memory->canWrite(TEST_THUNK_BASE, 1)) {
+        testFail("Sugarbomb thunk arena did not become read/execute-only: %s", error.c_str());
+    }
+
+    context.memory->unmap(TEST_THUNK_BASE, K_PAGE_SIZE);
+    SugarbombBridge::clearForTests();
 }
 
 void testSugarbombNativeBridge() {

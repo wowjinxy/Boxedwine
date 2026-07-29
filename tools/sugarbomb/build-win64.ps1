@@ -33,7 +33,7 @@ if ($RunFocusedTests) {
     if ($Configuration -ne 'Test') {
         throw '-RunFocusedTests requires -Configuration Test.'
     }
-    & $executable 0 3 1
+    & $executable 0 4 1
     if ($LASTEXITCODE -ne 0) {
         throw "Focused Sugarbomb tests failed with exit code $LASTEXITCODE."
     }

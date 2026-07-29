@@ -21,8 +21,28 @@ Sugarbomb owns that loading step, so the deployed path does not run
 
 ## Verified milestone
 
-The Windows x64 host builds with Visual Studio 2022 and runs a synthetic PE32
-image directly in its emulated 32-bit address space. Focused tests verify:
+The Windows x64 host now enters the original FalloutNV 1.4.0.525 executable at
+`0x00ECC4DB` without Wine. The current deterministic trace reaches
+`KERNEL32!CreateSemaphoreA` from game code at `0x0065952F` after 152,232 CPU
+slices and 76,167 bridged Win32 calls. Before that boundary, Fallout completes
+the MSVC CRT bootstrap and initializes its own large memory arenas.
+
+The runtime currently builds:
+
+- an 8 MiB 32-bit guest stack;
+- a minimal Windows PEB, TEB, process-parameters block, and `FS` TLS segment;
+- the executable's static PE TLS slot and 708-byte `.tls` template;
+- dynamic TLS slots, process/CRT heaps, and logical `VirtualAlloc` reservations;
+- a read/execute-only import-thunk arena at `0x60000000`;
+- initial Kernel32 timing, process, heap, locale, console, exception, atomic,
+  critical-section, memory-status, and virtual-memory services.
+
+Large `MEM_RESERVE` calls remain logical until committed, so Fallout can see its
+normal 32-bit address layout without forcing the 64-bit host to back every
+reserved guest page. In the verified trace it reserves 200 MiB and 64 MiB
+arenas, then commits only the ranges it touches.
+
+Focused tests verify:
 
 - invalid PE images are rejected;
 - PE32 headers, sections, imports, and protection flags are parsed;
@@ -31,6 +51,9 @@ image directly in its emulated 32-bit address space. Focused tests verify:
   final section protections are applied;
 - `IMAGE_REL_BASED_HIGHLOW` relocations allow DLLs with colliding preferred
   bases to be mapped elsewhere;
+- PE TLS-directory metadata is retained for loader initialization;
+- stdcall import thunks contain the correct callback and stack-cleanup operands,
+  preserve their module/symbol diagnostics, and become read/execute-only;
 - an x86 guest can call a registered 64-bit C++ function through `INT 9Ch`.
 
 The PE inspector also parses the primary executable and its optional extension
@@ -75,8 +98,13 @@ host pointer.
 
 `INT 9Ch` follows the callback convention BoxedWine already uses for OpenGL,
 Vulkan, and X11 traps. The callback index is at the top of the guest stack.
-The next layer will generate import stubs with the appropriate `stdcall`,
-`cdecl`, or COM cleanup behavior and patch their addresses into each PE IAT.
+Sugarbomb generates 16-byte guest stubs with the appropriate `stdcall` cleanup
+and patches their addresses into the PE IAT. Unsupported calls stop at a named
+`module!symbol` boundary instead of jumping through an unresolved host pointer.
+
+On Windows x64 JIT builds, the direct runtime also installs BoxedWine's vectored
+host-exception handler. Guest page faults are therefore translated back into
+the emulated CPU instead of escaping as native access violations.
 
 ## Why the NVSE loader executable is unnecessary
 
@@ -97,9 +125,10 @@ loader remains useful as documentation and a behavioral oracle.
 PE loading is the foundation, not the whole Windows contract. Implement APIs in
 dependency order and validate each group with small guest fixtures:
 
-1. **Process core:** PEB/TEB, TLS, virtual memory, heap, thread/event/critical
-   section primitives, timing, exceptions, module lookup, files, paths, and
-   Unicode conversion.
+1. **Process core:** PEB/TEB, static and dynamic TLS, virtual memory, heap,
+   timing, exceptions, module lookup, console handles, Unicode conversion, and
+   single-thread critical sections are sufficient for the current trace. Kernel
+   semaphore/event/mutex handles and guest thread scheduling are next.
 2. **NVSE bootstrap:** DLL exports, import binding, CRT entry points, plugin
    enumeration, `DllMain`, and NVSE messaging/interfaces.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
@@ -120,11 +149,12 @@ From the repository root:
 
 ```powershell
 .\tools\sugarbomb\build-win64.ps1 -Configuration Test
-.\project\msvc\BoxedWine\x64\Test\BoxedWine.exe 0 3 1
+.\project\msvc\BoxedWine\x64\Test\BoxedWine.exe 0 4 1
 
 .\tools\sugarbomb\build-win64.ps1 -Configuration Release
 .\tools\sugarbomb\inspect-pe32.ps1 'D:\path\to\FalloutNV.exe'
 .\tools\sugarbomb\inspect-pe32.ps1 'D:\path\to\FalloutNV.exe' -Imports
+.\project\msvc\BoxedWine\x64\Release\BoxedWine.exe --sugarbomb-run 'D:\path\to\FalloutNV.exe'
 ```
 
 The Visual Studio project currently targets the newer v145 toolset upstream.
@@ -137,3 +167,12 @@ Studio 2022.
 - Passing native pointers through 32-bit guest fields.
 - Reproducing every Windows version quirk before the game needs it.
 - Depending on a Wine filesystem or a separate Wine process.
+
+## Current boundary
+
+This is an executable compatibility-layer checkpoint, not a playable build.
+The next missing contract is `CreateSemaphoreA`, followed by the rest of the
+kernel object and guest-thread model. Filesystem-backed handles, DLL loading,
+USER32/D3D9, audio, and NVSE module initialization remain ahead. Several current
+services intentionally implement the single-threaded behavior needed by the
+trace; their state models must be upgraded before enabling guest `CreateThread`.

@@ -436,6 +436,10 @@ bool Pe32Loader::inspect(const std::vector<U8>& bytes, Pe32ImageInfo& info, std:
         readU32(bytes, optionalHeaderOffset + 136, info.baseRelocationDirectoryRva);
         readU32(bytes, optionalHeaderOffset + 140, info.baseRelocationDirectorySize);
     }
+    if (numberOfDataDirectories > 9 && optionalHeaderSize >= 176) {
+        readU32(bytes, optionalHeaderOffset + 168, info.tlsDirectoryRva);
+        readU32(bytes, optionalHeaderOffset + 172, info.tlsDirectorySize);
+    }
 
     size_t sectionTableOffset = optionalHeaderOffset + optionalHeaderSize;
     if (!hasRange(sectionTableOffset, static_cast<size_t>(sectionCount) * 40, bytes.size())) {

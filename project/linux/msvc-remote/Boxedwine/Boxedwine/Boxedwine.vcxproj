@@ -1356,6 +1356,7 @@
     <ClCompile Include="..\..\..\..\..\source\sdl\startupArgs.cpp" />
     <ClCompile Include="..\..\..\..\..\source\sugarbomb\pe32loader.cpp" />
     <ClCompile Include="..\..\..\..\..\source\sugarbomb\sugarbombbridge.cpp" />
+    <ClCompile Include="..\..\..\..\..\source\sugarbomb\sugarbombruntime.cpp" />
     <ClCompile Include="..\..\..\..\..\source\testOld\testCPU.cpp" />
     <ClCompile Include="..\..\..\..\..\source\testOld\testFPU.cpp" />
     <ClCompile Include="..\..\..\..\..\source\testOld\testMMX.cpp" />
@@ -1656,6 +1657,7 @@
     <ClInclude Include="..\..\..\..\..\include\syscpumaxfreq.h" />
     <ClInclude Include="..\..\..\..\..\include\syscpuonline.h" />
     <ClInclude Include="..\..\..\..\..\include\sugarbombbridge.h" />
+    <ClInclude Include="..\..\..\..\..\include\sugarbombruntime.h" />
     <ClInclude Include="..\..\..\..\..\include\syscpuscalingcurfreq.h" />
     <ClInclude Include="..\..\..\..\..\include\syscpuscalingmaxfreq.h" />
     <ClInclude Include="..\..\..\..\..\include\uptime.h" />

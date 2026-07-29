@@ -76,6 +76,9 @@
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombbridge.cpp">
       <Filter>source\sugarbomb</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombruntime.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\..\..\source\kernel\devs\devdsp.cpp">
       <Filter>source\kernel\devs</Filter>
     </ClCompile>
@@ -1234,6 +1237,9 @@
       <Filter>include</Filter>
     </ClInclude>
     <ClInclude Include="..\..\..\..\include\sugarbombbridge.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\..\include\sugarbombruntime.h">
       <Filter>include</Filter>
     </ClInclude>
     <ClInclude Include="..\..\..\..\include\log.h">

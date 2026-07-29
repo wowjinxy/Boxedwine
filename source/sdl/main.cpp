@@ -26,6 +26,7 @@
 #endif
 #include "knativesystem.h"
 #include "pe32loader.h"
+#include "sugarbombruntime.h"
 
 #ifdef BOXEDWINE_MSVC
 #include <Windows.h>
@@ -40,6 +41,10 @@ void writeSource();
 #endif
 
 int boxedmain(int argc, const char **argv) {
+    if (argc == 3 && strcmp(argv[1], "--sugarbomb-run") == 0) {
+        return SugarbombRuntime::run(argv[2]);
+    }
+
     const bool inspectSugarbombPe = argc == 3 && (
         strcmp(argv[1], "--sugarbomb-pe-info") == 0 ||
         strcmp(argv[1], "--sugarbomb-pe-imports") == 0);
@@ -88,6 +93,9 @@ int boxedmain(int argc, const char **argv) {
         printf("Base relocations: RVA=0x%08X SIZE=0x%08X\n",
             info.baseRelocationDirectoryRva,
             info.baseRelocationDirectorySize);
+        printf("TLS directory: RVA=0x%08X SIZE=0x%08X\n",
+            info.tlsDirectoryRva,
+            info.tlsDirectorySize);
         return 0;
     }
 

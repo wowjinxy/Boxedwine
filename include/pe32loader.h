@@ -52,6 +52,8 @@ struct Pe32ImageInfo {
     U32 importDirectorySize = 0;
     U32 baseRelocationDirectoryRva = 0;
     U32 baseRelocationDirectorySize = 0;
+    U32 tlsDirectoryRva = 0;
+    U32 tlsDirectorySize = 0;
     std::vector<Pe32SectionInfo> sections;
     std::vector<Pe32ImportModule> imports;
 

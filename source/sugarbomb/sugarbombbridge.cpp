@@ -12,6 +12,8 @@
 
 namespace {
 
+constexpr U32 THUNK_SIZE = 16;
+
 struct SugarbombCallbackEntry {
     std::string module;
     std::string name;
@@ -35,20 +37,45 @@ U32 SugarbombBridge::registerCallback(const std::string& module, const std::stri
 
 bool SugarbombBridge::dispatch(CPU* cpu, U32 index) {
     SugarbombNativeCallback callback = nullptr;
+    std::string module;
+    std::string name;
     {
         std::lock_guard<std::mutex> lock(callbacksMutex);
         if (index < callbacks.size()) {
             callback = callbacks[index].callback;
+            module = callbacks[index].module;
+            name = callbacks[index].name;
         }
     }
     if (!callback) {
         if (cpu) {
             cpu->reg[0].u32 = 0xc0000139; // STATUS_ENTRYPOINT_NOT_FOUND
+            cpu->thread->terminating = true;
         }
-        kwarn_fmt("Sugarbomb native callback %u is not registered", index);
+        if (!module.empty() || !name.empty()) {
+            kwarn_fmt(
+                "Sugarbomb stopped at unresolved Win32 import %s!%s (callback %u)",
+                module.c_str(),
+                name.c_str(),
+                index);
+        } else {
+            kwarn_fmt("Sugarbomb native callback %u is not registered", index);
+        }
         return false;
     }
     callback(cpu);
+    return true;
+}
+
+bool SugarbombBridge::callbackName(U32 index, std::string& module, std::string& name) {
+    std::lock_guard<std::mutex> lock(callbacksMutex);
+    if (index >= callbacks.size()) {
+        module.clear();
+        name.clear();
+        return false;
+    }
+    module = callbacks[index].module;
+    name = callbacks[index].name;
     return true;
 }
 
@@ -66,4 +93,94 @@ void SugarbombBridge::clearForTests() {
 
 void callSugarbomb(CPU* cpu, U32 index) {
     SugarbombBridge::dispatch(cpu, index);
+}
+
+bool SugarbombThunkArena::initialize(KThread* thread, U32 base, U32 size, std::string& error) {
+    if (!thread || !thread->memory) {
+        error = "Sugarbomb thunk arena requires a guest thread and memory space";
+        return false;
+    }
+    if (!base || !size || (base & K_PAGE_MASK) || (size & K_PAGE_MASK)) {
+        error = "Sugarbomb thunk arena must use nonzero page-aligned addresses";
+        return false;
+    }
+    if (thread->memory->mmap(
+            thread,
+            base,
+            size,
+            K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC,
+            K_MAP_FIXED | K_MAP_PRIVATE | K_MAP_ANONYMOUS,
+            -1,
+            0) != base) {
+        error = "Unable to reserve the Sugarbomb guest thunk arena";
+        return false;
+    }
+
+    thread->memory->memset(base, static_cast<char>(0xcc), size);
+    this->thread = thread;
+    this->arenaBase = base;
+    this->arenaSize = size;
+    this->nextAddress = base;
+    this->allocatedThunks = 0;
+    this->isFinalized = false;
+    return true;
+}
+
+bool SugarbombThunkArena::createThunk(
+    U32 callbackIndex,
+    U16 stackCleanupBytes,
+    U32& guestAddress,
+    std::string& error) {
+    guestAddress = 0;
+    if (!thread || !arenaBase) {
+        error = "Sugarbomb thunk arena is not initialized";
+        return false;
+    }
+    if (isFinalized) {
+        error = "Sugarbomb thunk arena is already executable and read-only";
+        return false;
+    }
+    if (nextAddress < arenaBase || nextAddress - arenaBase > arenaSize - THUNK_SIZE) {
+        error = "Sugarbomb guest thunk arena is full";
+        return false;
+    }
+
+    U8 code[THUNK_SIZE] = {
+        0x68, 0, 0, 0, 0,       // push callbackIndex
+        0xcd, 0x9c,              // int 9Ch
+        0x83, 0xc4, 0x04,        // add esp, 4
+        0xc3,                    // ret, or replaced with ret imm16
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc
+    };
+    code[1] = static_cast<U8>(callbackIndex);
+    code[2] = static_cast<U8>(callbackIndex >> 8);
+    code[3] = static_cast<U8>(callbackIndex >> 16);
+    code[4] = static_cast<U8>(callbackIndex >> 24);
+    if (stackCleanupBytes) {
+        code[10] = 0xc2;
+        code[11] = static_cast<U8>(stackCleanupBytes);
+        code[12] = static_cast<U8>(stackCleanupBytes >> 8);
+    }
+
+    guestAddress = nextAddress;
+    thread->memory->memcpy(guestAddress, code, sizeof(code));
+    nextAddress += THUNK_SIZE;
+    ++allocatedThunks;
+    return true;
+}
+
+bool SugarbombThunkArena::finalize(std::string& error) {
+    if (!thread || !arenaBase) {
+        error = "Sugarbomb thunk arena is not initialized";
+        return false;
+    }
+    if (isFinalized) {
+        return true;
+    }
+    if (thread->memory->mprotect(thread, arenaBase, arenaSize, K_PROT_READ | K_PROT_EXEC) != 0) {
+        error = "Unable to make the Sugarbomb guest thunk arena executable";
+        return false;
+    }
+    isFinalized = true;
+    return true;
 }
