@@ -914,6 +914,7 @@
     <ClInclude Include="..\..\..\..\include\loader.h" />
     <ClInclude Include="..\..\..\..\include\log.h" />
     <ClInclude Include="..\..\..\..\include\meminfo.h" />
+    <ClInclude Include="..\..\..\..\include\pe32loader.h" />
     <ClInclude Include="..\..\..\..\include\pixelformat.h" />
     <ClInclude Include="..\..\..\..\include\platform.h" />
     <ClInclude Include="..\..\..\..\include\platformOpenGL.h" />
@@ -926,6 +927,7 @@
     <ClInclude Include="..\..\..\..\include\syscpumaxfreq.h" />
     <ClInclude Include="..\..\..\..\include\syscpuonline.h" />
     <ClInclude Include="..\..\..\..\include\syscpuscalingmaxfreq.h" />
+    <ClInclude Include="..\..\..\..\include\sugarbombbridge.h" />
     <ClInclude Include="..\..\..\..\include\uptime.h" />
     <ClInclude Include="..\..\..\..\lib\asmjit\asmjit\arm\a64archtraits_p.h" />
     <ClInclude Include="..\..\..\..\lib\asmjit\asmjit\arm\a64assembler.h" />
@@ -1197,6 +1199,7 @@
     <ClInclude Include="..\..\..\..\source\test\cpu\testXor.h" />
     <ClInclude Include="..\..\..\..\source\test\devs\testDspAudio.h" />
     <ClInclude Include="..\..\..\..\source\test\mmu\testSelfModifying.h" />
+    <ClInclude Include="..\..\..\..\source\test\sugarbomb\testPe32Loader.h" />
     <ClInclude Include="..\..\..\..\source\ui\boxedwineui.h" />
     <ClInclude Include="..\..\..\..\source\ui\controls\appbar.h" />
     <ClInclude Include="..\..\..\..\source\ui\controls\appChooserDlg.h" />
@@ -3818,7 +3821,10 @@
     <ClCompile Include="..\..\..\..\source\sdl\multiThreaded\threadedMainloop.cpp" />
     <ClCompile Include="..\..\..\..\source\sdl\singleThreaded\mainloop.cpp" />
     <ClCompile Include="..\..\..\..\source\sdl\startupArgs.cpp" />
+    <ClCompile Include="..\..\..\..\source\sugarbomb\pe32loader.cpp" />
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombbridge.cpp" />
     <ClCompile Include="..\..\..\..\source\test\testMain.cpp" />
+    <ClCompile Include="..\..\..\..\source\test\sugarbomb\testPe32Loader.cpp" />
     <ClCompile Include="..\..\..\..\source\test\cpu\testAdc.cpp" />
     <ClCompile Include="..\..\..\..\source\test\cpu\testAdd.cpp" />
     <ClCompile Include="..\..\..\..\source\test\cpu\testAnd.cpp" />

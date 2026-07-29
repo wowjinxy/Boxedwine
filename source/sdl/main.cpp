@@ -25,6 +25,7 @@
 #include "../ui/data/globalSettings.h"
 #endif
 #include "knativesystem.h"
+#include "pe32loader.h"
 
 #ifdef BOXEDWINE_MSVC
 #include <Windows.h>
@@ -39,7 +40,58 @@ void writeSource();
 #endif
 
 int boxedmain(int argc, const char **argv) {
-    StartUpArgs startupArgs;                  
+    const bool inspectSugarbombPe = argc == 3 && (
+        strcmp(argv[1], "--sugarbomb-pe-info") == 0 ||
+        strcmp(argv[1], "--sugarbomb-pe-imports") == 0);
+    if (inspectSugarbombPe) {
+        const bool listImports = strcmp(argv[1], "--sugarbomb-pe-imports") == 0;
+        std::vector<U8> bytes;
+        Pe32ImageInfo info;
+        std::string error;
+        if (!Pe32Loader::readFile(argv[2], bytes, error) || !Pe32Loader::inspect(bytes, info, error)) {
+            fprintf(stderr, "Sugarbomb PE32 inspection failed: %s\n", error.c_str());
+            return 1;
+        }
+
+        printf("Format: PE32/i386\n");
+        printf("Image base: 0x%08X\n", info.imageBase);
+        printf("Entry point: 0x%08X (RVA 0x%08X)\n", info.entryPoint(), info.entryPointRva);
+        printf("Image size: 0x%08X\n", info.sizeOfImage);
+        printf("Sections: %zu\n", info.sections.size());
+        for (const Pe32SectionInfo& section : info.sections) {
+            printf("  %-8s RVA=0x%08X VSIZE=0x%08X RAW=0x%08X FLAGS=0x%08X\n",
+                section.name.c_str(),
+                section.virtualAddress,
+                section.virtualSize,
+                section.rawDataSize,
+                section.characteristics);
+        }
+        printf("Imports: %zu modules, %zu symbols\n", info.imports.size(), info.importSymbolCount());
+        for (const Pe32ImportModule& module : info.imports) {
+            printf("  %s: %zu\n", module.name.c_str(), module.symbols.size());
+            if (listImports) {
+                for (const Pe32ImportSymbol& symbol : module.symbols) {
+                    if (symbol.byOrdinal) {
+                        printf("    IAT=0x%08X RVA=0x%08X #%u\n",
+                            info.imageBase + symbol.iatRva,
+                            symbol.iatRva,
+                            symbol.ordinal);
+                    } else {
+                        printf("    IAT=0x%08X RVA=0x%08X %s\n",
+                            info.imageBase + symbol.iatRva,
+                            symbol.iatRva,
+                            symbol.name.c_str());
+                    }
+                }
+            }
+        }
+        printf("Base relocations: RVA=0x%08X SIZE=0x%08X\n",
+            info.baseRelocationDirectoryRva,
+            info.baseRelocationDirectorySize);
+        return 0;
+    }
+
+    StartUpArgs startupArgs;
 
     klog("Starting ...");
 #if defined(__MACH__)

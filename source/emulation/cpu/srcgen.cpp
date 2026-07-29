@@ -4800,6 +4800,7 @@ void gen0cb(struct GenData* data, struct Op* op) {
 
 void OPCALL syscall_op(struct CPU* cpu, struct Op* op);
 void OPCALL int99(struct CPU* cpu, struct Op* op);
+void OPCALL int9C(struct CPU* cpu, struct Op* op);
 void gen0cd(struct GenData* data, struct Op* op) {
     char tmp[16];
 
@@ -4811,6 +4812,8 @@ void gen0cd(struct GenData* data, struct Op* op) {
         // syscall will set nextBlock
     } else if (op->func == int99) {
         out(data, "int99Callback[peek32(cpu, 0)](cpu);");
+    } else if (op->func == int9C) {
+        out(data, "callSugarbomb(cpu, peek32(cpu, 0));");
     } else {
         kpanic("gen0cd");
     }
@@ -8773,6 +8776,7 @@ void generateSource(struct CPU* cpu, U32 eip, struct Block* block) {
         out(data, "typedef void (*Int99Callback)(struct CPU* cpu);\n");
         out(data, "extern Int99Callback* int99Callback;\n");
         out(data, "extern Int99Callback* wine_callback;\n");
+        out(data, "void callSugarbomb(struct CPU* cpu, U32 index);\n");
         out(data, "U8 parity_lookup[256] ;\n");
         out(data, "#define TAG_Valid 0\n");
         out(data, "#define TAG_Zero 1\n");

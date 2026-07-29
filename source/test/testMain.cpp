@@ -56,6 +56,7 @@
 #include "cpu/testXor.h"
 #include "devs/testDspAudio.h"
 #include "mmu/testSelfModifying.h"
+#include "sugarbomb/testPe32Loader.h"
 
 void testWaitPid();
 void testProcessSignalWakesSigwaitMask();
@@ -169,6 +170,9 @@ namespace {
 int totalFails = 0;
 
 const TestEntry TEST_ENTRIES[] = {
+    {testPe32LoaderRejectsInvalidImage, "Test Sugarbomb PE32 rejects invalid images", TEST_ENTRY_SERIAL},
+    {testPe32LoaderMapsAndExecutesImage, "Test Sugarbomb PE32 maps and executes an x86 image", TEST_ENTRY_SERIAL},
+    {testSugarbombNativeBridge, "Test Sugarbomb guest-to-native bridge", TEST_ENTRY_SERIAL},
     {testDspAudioWriteMath, "Test DSP Audio Write Math"},
     {testFastModeSelectionHelpers, "Test fast mode selection helpers"},
 #ifdef BOXEDWINE_WASM_JIT
