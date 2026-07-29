@@ -22,10 +22,27 @@ Sugarbomb owns that loading step, so the deployed path does not run
 ## Verified milestone
 
 The Windows x64 host now enters the original FalloutNV 1.4.0.525 executable at
-`0x00ECC4DB` without Wine. The current deterministic trace reaches
-`KERNEL32!CreateSemaphoreA` from game code at `0x0065952F` after 152,232 CPU
-slices and 76,167 bridged Win32 calls. Before that boundary, Fallout completes
-the MSVC CRT bootstrap and initializes its own large memory arenas.
+`0x00ECC4DB` without Wine and continues through engine startup. A 20-second
+diagnostic run executes 17,325,714 guest CPU slices and 10,004,586 bridged
+native calls without an unresolved import or guest page fault. During that run
+Fallout:
+
+- opens the base BSA archives and enumerates installed ESM/NAM content;
+- registers both game windows and creates a synthetic D3D9 device;
+- creates textures, cube textures, render targets, depth surfaces, shaders,
+  declarations, vertex/index buffers, and completes a full draw/present frame;
+- initializes DirectInput 8, XInput, DirectSound 8, WinMM, and COM;
+- constructs a DirectShow filter graph for `MainTitle.mp3`, renders its source
+  filter, queries media position, sets volume, runs, and pauses playback;
+- initializes Bink sound support and creates its `MoviePlayer` guest thread;
+- launches archive, task-manager, background-clone, and additional engine
+  worker threads using guest-visible kernel synchronization objects.
+
+At the end of the diagnostic window the main thread is sleeping on its normal
+timer path while the worker threads are parked on waits. This is a headless
+compatibility milestone: the guest is executing a sustained startup/update
+state, but D3D9, audio, and video are still facades rather than host-backed
+output, so it is not yet a playable build.
 
 The runtime currently builds:
 
@@ -34,8 +51,16 @@ The runtime currently builds:
 - the executable's static PE TLS slot and 708-byte `.tls` template;
 - dynamic TLS slots, process/CRT heaps, and logical `VirtualAlloc` reservations;
 - a read/execute-only import-thunk arena at `0x60000000`;
+- a cooperative x86 guest scheduler with suspended/runnable/completed thread
+  states, timed sleeps, and semaphore/event/mutex/thread waits;
+- filesystem, profile/INI, registry, Shell32, USER32, GDI32, input, audio,
+  DirectShow, synthetic Bink, and a broad D3D9/D3DX compatibility surface;
 - initial Kernel32 timing, process, heap, locale, console, exception, atomic,
-  critical-section, memory-status, and virtual-memory services.
+  critical-section, memory-status, and virtual-memory services;
+- version-keyed Fallout 1.4 bootstrap objects for two startup-order races: the
+  Bink manager and Havok memory system. The Havok bridge initializes the
+  game's per-thread memory router and allocates from the tracked 32-bit guest
+  heap backed by the 64-bit host.
 
 Large `MEM_RESERVE` calls remain logical until committed, so Fallout can see its
 normal 32-bit address layout without forcing the 64-bit host to back every
@@ -126,16 +151,19 @@ PE loading is the foundation, not the whole Windows contract. Implement APIs in
 dependency order and validate each group with small guest fixtures:
 
 1. **Process core:** PEB/TEB, static and dynamic TLS, virtual memory, heap,
-   timing, exceptions, module lookup, console handles, Unicode conversion, and
-   single-thread critical sections are sufficient for the current trace. Kernel
-   semaphore/event/mutex handles and guest thread scheduling are next.
+   timing, exceptions, module lookup, console handles, Unicode conversion,
+   critical sections, kernel objects, guest threads, and cooperative waits.
 2. **NVSE bootstrap:** DLL exports, import binding, CRT entry points, plugin
    enumeration, `DllMain`, and NVSE messaging/interfaces.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
-   message-loop behavior.
+   message-loop behavior. The current window/input layer is sufficient for
+   startup but does not yet create interactive host output.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
-   Sugarbomb's renderer.
-5. **Audio/video:** DirectSound, WinMM, and Bink integration.
+   Sugarbomb's renderer. The guest COM/resource model is in place; host
+   rendering and the remaining D3DX texture/shader helpers are next.
+5. **Audio/video:** DirectSound, WinMM, DirectShow, and Bink integration. The
+   current facades preserve guest contracts and timing but do not decode or
+   emit media yet.
 6. **Services:** COM, registry, sockets, shell helpers, and the small Steam API
    surface the game actually exercises.
 
@@ -157,6 +185,17 @@ From the repository root:
 .\project\msvc\BoxedWine\x64\Release\BoxedWine.exe --sugarbomb-run 'D:\path\to\FalloutNV.exe'
 ```
 
+For deterministic diagnostics, the runtime accepts two optional environment
+variables. They do not change the guest ABI:
+
+```powershell
+$env:SUGARBOMB_MAX_RUN_SLICES = '2600000'
+$env:SUGARBOMB_MAX_RUN_MILLISECONDS = '20000'
+```
+
+When either diagnostic budget expires, Sugarbomb prints every guest thread's
+state/EIP and the busiest bridged APIs.
+
 The Visual Studio project currently targets the newer v145 toolset upstream.
 The build helper explicitly selects the installed v143 toolset from Visual
 Studio 2022.
@@ -171,8 +210,9 @@ Studio 2022.
 ## Current boundary
 
 This is an executable compatibility-layer checkpoint, not a playable build.
-The next missing contract is `CreateSemaphoreA`, followed by the rest of the
-kernel object and guest-thread model. Filesystem-backed handles, DLL loading,
-USER32/D3D9, audio, and NVSE module initialization remain ahead. Several current
-services intentionally implement the single-threaded behavior needed by the
-trace; their state models must be upgraded before enabling guest `CreateThread`.
+Fallout now survives the previously missing kernel-object, guest-thread,
+USER32, D3D9, audio, DirectShow, Bink, and startup-order singleton boundaries.
+The next major work is to turn the headless D3D9/USER32 facade into host-backed
+window and rendering output, finish D3DX texture/shader helpers, persist the
+remaining virtual-file operations, and load `nvse_1_4.dll` plus NVSE plugins in
+the same guest process.
