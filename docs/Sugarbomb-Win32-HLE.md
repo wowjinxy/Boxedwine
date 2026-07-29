@@ -8,6 +8,17 @@ loader and a purpose-built Win32 high-level emulation (HLE) layer.
 The normal BoxedWine runtime still exists on this branch. The Sugarbomb path is
 additive while its Win32 coverage is being built.
 
+## Execution target
+
+The primary guest executable is **FalloutNV.exe 1.4.0.525**. Sugarbomb maps it
+at `0x00400000`, builds its Windows process environment, binds its imports, and
+starts its PE entry point.
+
+`nvse_1_4.dll` is not the execution target. It is the xNVSE runtime DLL for the
+FalloutNV 1.4 executable and is mapped into the same guest process afterward.
+Sugarbomb owns that loading step, so the deployed path does not run
+`nvse_loader.exe`.
+
 ## Verified milestone
 
 The Windows x64 host builds with Visual Studio 2022 and runs a synthetic PE32
@@ -22,16 +33,21 @@ image directly in its emulated 32-bit address space. Focused tests verify:
   bases to be mapped elsewhere;
 - an x86 guest can call a registered 64-bit C++ function through `INT 9Ch`.
 
-The PE inspector also parses the available Fallout/NVSE binaries without Wine:
+The PE inspector also parses the primary executable and its optional extension
+modules without Wine:
 
 | Module | Preferred base | Image size | Imports |
 | --- | ---: | ---: | ---: |
 | `FalloutNV.exe` (unpacked 1.4.0.525) | `0x00400000` | `0x0107B000` | 17 modules / 280 symbols |
 | `nvse_loader.exe` | `0x00400000` | `0x0002B000` | 11 modules / 87 symbols |
-| `nvse_1_4.dll` | `0x10000000` | `0x00752000` | 8 modules / 362 symbols |
+| xNVSE 6.4.8 `nvse_1_4.dll` (Release) | `0x10000000` | `0x00159000` | 13 modules / 264 symbols |
 | `ZeGaryHax.dll` | `0x10000000` | `0x001E8000` | 11 modules / 234 symbols |
 
-The two DLLs above deliberately demonstrate why base relocation support is
+`nvse_1_4.dll` names the DLL selected for the FalloutNV 1.4 game runtime; it
+does not mean NVSE version 1.4. The validated Release DLL reports file/product
+version 6.4.8.
+
+The xNVSE and plugin DLLs above demonstrate why base relocation support is
 required: both prefer `0x10000000`.
 
 ## Architecture
