@@ -295,6 +295,7 @@ private:
         S32 width = 1280;
         S32 height = 720;
         bool visible = false;
+        U32 showCommand = 5; // SW_SHOW
         std::string className;
         std::string title;
     };
@@ -597,7 +598,8 @@ private:
             guestWindow.y,
             guestWindow.width,
             guestWindow.height,
-            guestWindow.visible);
+            guestWindow.visible,
+            guestWindow.showCommand);
     }
 
     void destroyHostWindowForGuest(U32 guestHandle) {
@@ -17300,6 +17302,7 @@ private:
         window.width = width <= 0 || width == static_cast<S32>(0x80000000) ? 1280 : width;
         window.height = height <= 0 || height == static_cast<S32>(0x80000000) ? 720 : height;
         window.visible = (style & 0x10000000) != 0; // WS_VISIBLE
+        window.showCommand = window.visible ? 5 : 0; // SW_SHOW / SW_HIDE
         window.className = windowClass->name;
         window.title = titleAddress ? readAnsi(titleAddress) : "";
         U32 handle = window.handle;
@@ -17351,6 +17354,7 @@ private:
         }
         bool wasVisible = found->second.visible;
         found->second.visible = command != 0;
+        found->second.showCommand = command;
         syncHostWindow(found->second);
         if (found->second.visible &&
             !isGuestChildWindow(found->second) &&
@@ -17511,9 +17515,11 @@ private:
         }
         if (flags & 0x0040) { // SWP_SHOWWINDOW
             found->second.visible = true;
+            found->second.showCommand = 5; // SW_SHOW
         }
         if (flags & 0x0080) { // SWP_HIDEWINDOW
             found->second.visible = false;
+            found->second.showCommand = 0; // SW_HIDE
         }
         syncHostWindow(found->second);
         if (previousWidth != found->second.width ||

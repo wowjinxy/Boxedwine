@@ -725,7 +725,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>MaxSpeed</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>BOXEDWINE_MEM_CACHE;BOXEDWINE_HOST_EXCEPTIONS;ASMJIT_NO_AARCH64;ASMJIT_STATIC;BOXEDWINE_JIT_X64;BOXEDWINE_JIT;BOXEDWINE_VULKAN;BOXEDWINE_OPENGL_SDL;BOXEDWINE_IMGUI_DX9;BOXEDWINE_HIGHDPI;BOXEDWINE_MULTI_THREADED;BOXEDWINE_MIDI;BOXEDWINE_RECORDER;BOXEDWINE_64;BOXEDWINE_ZLIB;GLH=&lt;sdl_opengl.h&gt;;BOXEDWINE_MSVC;WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>BOXEDWINE_MEM_CACHE;BOXEDWINE_HOST_EXCEPTIONS;ASMJIT_NO_AARCH64;ASMJIT_STATIC;BOXEDWINE_JIT_X64;BOXEDWINE_JIT;BOXEDWINE_VULKAN;BOXEDWINE_OPENGL_SDL;BOXEDWINE_IMGUI_DX9;BOXEDWINE_HIGHDPI;BOXEDWINE_MULTI_THREADED;BOXEDWINE_MIDI;BOXEDWINE_RECORDER;BOXEDWINE_64;BOXEDWINE_ZLIB;GLH=&lt;sdl_opengl.h&gt;;BOXEDWINE_MSVC;WIN32;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\..\..\..\include</AdditionalIncludeDirectories>
       <DisableSpecificWarnings>4996;26451</DisableSpecificWarnings>
       <UndefinePreprocessorDefinitions>
@@ -740,7 +740,7 @@
       </TreatSpecificWarningsAsErrors>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>

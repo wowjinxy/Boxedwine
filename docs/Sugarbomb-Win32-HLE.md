@@ -66,11 +66,16 @@ guest `HWND` remains an integer in guest memory, while its corresponding native
 The presentation surface is now an ordinary top-level Windows application
 window, owned by a dedicated native UI thread and message loop. It has a normal
 title bar, taskbar and Alt-Tab presence, and Windows controls its foreground
-and focus state. Sugarbomb enters per-monitor-v2 DPI-aware mode before creating
-that window, so Fallout's 1920x1080 backbuffer produces a 1920x1080 physical
-client instead of being inflated to 3840x2160 by a 200% desktop scale. A visible
-validation reached the main menu in a 1946x1151 outer window, including native
-chrome around the 1920x1080 client.
+and focus state. The x64 Release target is a Windows GUI executable rather than
+a console executable that hides its console after startup. Sugarbomb also
+preserves Fallout's exact `ShowWindow` command instead of collapsing it to a
+visibility boolean: activating show modes, non-activating show modes,
+minimize/restore, and hide therefore retain their native Windows meanings.
+Sugarbomb enters per-monitor-v2 DPI-aware mode before creating that window, so
+Fallout's 1920x1080 backbuffer produces a 1920x1080 physical client instead of
+being inflated to 3840x2160 by a 200% desktop scale. A visible validation
+reached the main menu in a 1946x1151 outer window, including native chrome
+around the 1920x1080 client.
 
 Native HWND state is authoritative from the first guest query, even before the
 corresponding activation messages have drained through Fallout's queue. In the
@@ -86,6 +91,21 @@ An earlier keyboard validation accepted two extended Down-arrow scan-code
 events through the foreground native `HWND`, reported the corresponding
 DirectInput `DIK_DOWN` (`0xD0`) press/release records, and visibly advanced the
 Fallout menu highlight from no selection to `Continue` and then `New`.
+Deterministic mouse validation then established a known left edge, delivered
+fourteen separate 50-count native raw-input steps, and placed Fallout's own
+cursor over `Settings` with the game's hover rectangle visible. A native
+left-button press/release opened the `Gameplay / Display / Audio / Controls /
+Back` submenu. This proves the first end-to-end mouse-driven Fallout menu
+transition through the x64 HWND, raw DirectInput state, guest cursor, and
+original x86 menu code.
+
+A clean GUI-subsystem validation subsequently reached the same full main menu
+without any focus API, cursor injection, or synthetic input. Because Codex
+started that process from the background, Windows displayed it with
+`foreground=0` instead of allowing it to steal the user's current app. An
+ordinary click or Alt-Tab is consequently the sole activation boundary, just as
+for another Windows application; once activated, the existing native focus
+messages control DirectInput acquire, capture, loss, and reacquisition.
 
 The staged xNVSE 6.4.8 runtime now initializes automatically at Fallout's real
 WinMain boundary. A bounded headless smoke run completes both PE TLS callbacks,
@@ -162,6 +182,9 @@ The runtime currently builds:
 - native foreground/focus ownership for normal application runs, with
   activation loss and reacquisition forwarded to Fallout instead of synthesized
   by the guest runtime;
+- a GUI-subsystem x64 Release executable and exact guest-to-native `ShowWindow`
+  command translation, retaining Windows activation policy instead of hiding a
+  console or forcing foreground ownership;
 - host-backed DirectInput keyboard and mouse state, relative axes, wheel and
   button state, buffered `DIDEVICEOBJECTDATA`, and idempotent device
   acquire/unacquire behavior, including foreground cooperative-level loss and
@@ -307,8 +330,9 @@ dependency order and validate each group with small guest fixtures:
    dedicated native UI thread with an independent Windows message loop, so the
    desktop window remains responsive while the x86 guest translates or blocks.
    `PeekMessageA`, `DispatchMessageA`, and `SendMessageA` deliver lifecycle plus
-   native keyboard/mouse/focus events to Fallout's guest WndProc. Startup uses
-   ordinary `ShowWindow` behavior rather than forcing foreground ownership.
+   native keyboard/mouse/focus events to Fallout's guest WndProc. The x64
+   Release build is a GUI application, and startup translates the guest's exact
+   `ShowWindow` command rather than forcing foreground ownership.
    Native activation, clicking, and Alt-Tab are authoritative, and guest calls
    to `GetForegroundWindow`, `GetActiveWindow`, `GetFocus`, `SetActiveWindow`,
    `SetFocus`, and `SetForegroundWindow` are reflected through the real window.
@@ -321,9 +345,9 @@ dependency order and validate each group with small guest fixtures:
    normally. Mouse coordinates are scaled between a resized native client and
    Fallout's guest client, while guest D3D9 cursor positions take the inverse
    route back to native screen space. Deterministic native keyboard navigation,
-   raw relative mouse motion, button delivery, and reacquisition through the
-   main menu are verified. Remaining work includes a deterministic mouse-click
-   menu transition and XInput device state.
+   raw relative mouse motion, button delivery, reacquisition, hover selection,
+   and a mouse-click transition from the main menu into `Settings` are verified.
+   Remaining work includes the `New`-game transition and XInput device state.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
    Sugarbomb's renderer. The guest COM/resource model, native presentation
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
@@ -398,11 +422,13 @@ The 64-bit host owns the window and real D3D9 objects, translates Fallout's
 32-bit graphics workload, delivers host and lifecycle messages through
 Fallout's own 32-bit WndProc, and reaches the correctly textured main menu
 without exposing native pointers to the guest. The app-mode HWND is DPI aware,
+is hosted by a GUI-subsystem executable, preserves guest `ShowWindow` policy,
 is the immediate authority for guest activation/focus queries, and owns
-foreground DirectInput capture under normal Windows rules. xNVSE now
+foreground DirectInput capture under normal Windows rules. Keyboard navigation
+and the first mouse-click menu transition are both verified. xNVSE now
 initializes through its real static-TLS and DLL-entry sequence at the same CRT
 boundary used by the xNVSE loader, patches the same guest Fallout image, and
 loads a real NVSE plugin before the game continues. The next major work is to
-verify deterministic menu click interaction and gameplay transition through the
-native-focus/DirectInput path, persist remaining virtual-file operations, and
-expand plugin/API coverage from additional real NVSE workloads.
+advance through `New` into gameplay through the native-focus/DirectInput path,
+persist remaining virtual-file operations, and expand plugin/API coverage from
+additional real NVSE workloads.

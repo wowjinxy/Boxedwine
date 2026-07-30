@@ -39,6 +39,7 @@ struct SugarbombHostWindow::Impl {
         std::int32_t clientWidth = 1;
         std::int32_t clientHeight = 1;
         bool visible = false;
+        std::uint32_t showCommand = 5;
     };
 
     std::atomic<std::uint32_t> guestHandle{0};
@@ -55,6 +56,7 @@ struct SugarbombHostWindow::Impl {
     bool cursorVisible = true;
     bool mouseCaptured = false;
     bool rawMouseRegistered = false;
+    std::int32_t appliedShowCommand = -1;
     std::mutex eventMutex;
     std::mutex frameMutex;
     std::mutex lifecycleMutex;
@@ -545,17 +547,29 @@ bool applyNativeWindowSync(
         request.visible && !impl->visible;
     const bool becameHidden =
         !request.visible && impl->visible;
-    if (becameVisible) {
-        // ShowWindow supplies normal Win32 activation semantics. Windows,
-        // rather than the emulator, remains the foreground authority.
-        ShowWindow(window, SW_SHOW);
+    const int nativeShowCommand =
+        request.showCommand <= SW_FORCEMINIMIZE
+            ? static_cast<int>(request.showCommand)
+            : SW_SHOW;
+    const bool showCommandChanged =
+        nativeShowCommand != impl->appliedShowCommand;
+    if (request.visible &&
+        (becameVisible || showCommandChanged)) {
+        // Preserve the guest's ShowWindow request. Windows applies its normal
+        // activation policy for SW_SHOW/SW_SHOWNORMAL and its normal
+        // non-activation policy for SW_SHOWNA/SW_SHOWNOACTIVATE. Sugarbomb
+        // never invents a foreground transfer here.
+        ShowWindow(window, nativeShowCommand);
+        impl->appliedShowCommand = nativeShowCommand;
         std::printf(
             "Sugarbomb host presentation: showed guest HWND 0x%08X "
-            "as a native app window (foreground=%u)\n",
+            "as a native app window (command=%d, foreground=%u)\n",
             request.guestHandle,
+            nativeShowCommand,
             GetForegroundWindow() == window ? 1 : 0);
     } else if (becameHidden) {
         ShowWindow(window, SW_HIDE);
+        impl->appliedShowCommand = SW_HIDE;
     }
     impl->visible = request.visible;
     if (impl->visible) {
@@ -573,7 +587,8 @@ bool sameSyncRequest(
         left.y == right.y &&
         left.clientWidth == right.clientWidth &&
         left.clientHeight == right.clientHeight &&
-        left.visible == right.visible;
+        left.visible == right.visible &&
+        left.showCommand == right.showCommand;
 }
 
 LRESULT CALLBACK hostWindowProcedure(
@@ -903,6 +918,7 @@ bool startHostWindowThread(
     }
     impl->intentionalDestroy = false;
     impl->shuttingDown.store(false, std::memory_order_release);
+    impl->appliedShowCommand = -1;
     impl->windowThread =
         std::thread(hostWindowThreadMain, impl);
 
@@ -953,7 +969,8 @@ void SugarbombHostWindow::syncGuestWindow(
     std::int32_t y,
     std::int32_t clientWidth,
     std::int32_t clientHeight,
-    bool visible) {
+    bool visible,
+    std::uint32_t showCommand) {
 #ifdef _WIN32
     if (presentationDisabled() ||
         impl->userClosed.load(std::memory_order_acquire)) {
@@ -967,6 +984,7 @@ void SugarbombHostWindow::syncGuestWindow(
     request.clientWidth = clientWidth;
     request.clientHeight = clientHeight;
     request.visible = visible;
+    request.showCommand = showCommand;
 
     HWND window =
         impl->window.load(std::memory_order_acquire);
@@ -1011,6 +1029,7 @@ void SugarbombHostWindow::syncGuestWindow(
     (void)clientWidth;
     (void)clientHeight;
     (void)visible;
+    (void)showCommand;
 #endif
 }
 

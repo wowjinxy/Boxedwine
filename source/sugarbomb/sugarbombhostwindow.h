@@ -43,7 +43,8 @@ public:
         std::int32_t y,
         std::int32_t clientWidth,
         std::int32_t clientHeight,
-        bool visible);
+        bool visible,
+        std::uint32_t showCommand);
     bool activateGuestWindow(std::uint32_t guestHandle);
     bool setActiveGuestWindow(std::uint32_t guestHandle);
     bool focusGuestWindow(std::uint32_t guestHandle);

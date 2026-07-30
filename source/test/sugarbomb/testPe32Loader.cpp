@@ -393,7 +393,8 @@ void testSugarbombHostWindowLifecycle() {
         0,
         320,
         200,
-        false);
+        false,
+        SW_HIDE);
     if (!window.nativeHandle()) {
         testFail(
             "Sugarbomb native host window was not created on its UI thread");
