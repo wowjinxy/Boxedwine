@@ -22,10 +22,10 @@ Sugarbomb owns that loading step, so the deployed path does not run
 ## Verified milestone
 
 The Windows x64 host now enters the original FalloutNV 1.4.0.525 executable at
-`0x00ECC4DB` without Wine and continues through engine startup. A 30-second
-diagnostic run executes about 17.2 million guest CPU slices and 9.9 million
-bridged native calls without an unresolved import or guest page fault. During
-that run Fallout:
+`0x00ECC4DB` without Wine and continues through the intro to the fully rendered
+main menu. A 90-second diagnostic run completes 7,917 native D3D9 presentation
+cycles and 116,768 translated indexed draws without an unresolved import, guest
+page fault, or host D3D failure. During that run Fallout:
 
 - opens the base BSA archives and enumerates installed ESM/NAM content;
 - registers both game windows and creates a real D3D9 device owned by the
@@ -36,8 +36,8 @@ that run Fallout:
 - creates textures, cube textures, render targets, depth surfaces, shaders,
   declarations, and vertex/index buffers while retaining 32-bit guest COM
   identities;
-- decodes 96 texture images through the native x64 D3DX9 runtime, completes
-  roughly 600 translated indexed draws, and runs about 300 complete
+- decodes 135 texture images through the native x64 D3DX9 runtime, completes
+  116,768 translated indexed draws, and runs 7,917 complete
   `BeginScene`/`EndScene`/`Present` cycles;
 - initializes DirectInput 8, XInput, DirectSound 8, WinMM, and COM;
 - constructs a DirectShow filter graph for `MainTitle.mp3`, renders its source
@@ -46,11 +46,12 @@ that run Fallout:
 - launches archive, task-manager, background-clone, and additional engine
   worker threads using guest-visible kernel synchronization objects.
 
-At the end of the diagnostic window the main thread is sleeping on its normal
-frame-timer path while worker threads are parked on kernel-object waits.
-Fallout's 32-bit guest `HWND` remains an integer in guest memory, while its
-corresponding native `HWND` and every native D3D pointer remain private to the
-64-bit host.
+The same trace drains 8,891 `PeekMessageA` calls, dispatches 1,283 messages
+through Fallout's original guest WndProc, and observes all 1,283 guest returns.
+At the end of the diagnostic window the main thread remains runnable while
+worker threads are parked on their normal kernel-object waits. Fallout's 32-bit
+guest `HWND` remains an integer in guest memory, while its corresponding native
+`HWND` and every native D3D pointer remain private to the 64-bit host.
 
 The renderer checkpoint is no longer synthetic. Sugarbomb translates
 Fallout's render targets, surfaces, textures, texture locks, vertex/index
@@ -58,10 +59,10 @@ buffers, declarations, shader bytecode, constants, render/sampler state, and
 draw calls to a native x64 `IDirect3DDevice9`. It also forwards the surface-copy
 operations used by the engine and can capture the active render target or
 swap-chain backbuffer for deterministic diagnostics. A verified 1920x1080
-backbuffer capture contains Fallout's fully rendered Obsidian Entertainment
-startup splash. Audio output, video decoding, raw/DirectInput event fidelity,
-and enough remaining Win32 behavior to reach an interactive menu are still
-incomplete, so this is not yet a playable build.
+backbuffer capture contains Fallout's fully rendered main menu with the logo,
+Sunset Sarsaparilla sign, cursor, and all seven menu entries. Raw/DirectInput
+event fidelity, audio output, and video decoding are still incomplete, so the
+visible menu is not yet a playable build.
 
 The runtime currently builds:
 
@@ -76,6 +77,9 @@ The runtime currently builds:
   DirectShow, synthetic Bink, and a broad D3D9/D3DX compatibility surface;
 - a per-thread 32-bit `MSG` queue, creation-time window lifecycle messages, and
   translation of native keyboard, character, mouse, and focus events;
+- distinct top-level and child-window activation semantics, preserving
+  Fallout's top-level active `HWND` while its child device window owns D3D9
+  presentation;
 - initial Kernel32 timing, process, heap, locale, console, exception, atomic,
   critical-section, memory-status, and virtual-memory services;
 - version-keyed Fallout 1.4 bootstrap objects for two startup-order races: the
@@ -153,6 +157,9 @@ Callbacks may also redirect the emulated EIP. USER32 uses that path to construct
 a 32-bit stdcall WndProc frame, enter Fallout's registered procedure, and return
 through a Sugarbomb thunk that restores the interrupted import frame. Pending
 returns are stacked per guest thread, so nested guest dispatch remains valid.
+The D3D device window is retained separately from USER32's active window:
+creating or presenting through a `WS_CHILD` window does not steal activation
+from its top-level ancestor.
 
 On Windows x64 JIT builds, the direct runtime also installs BoxedWine's vectored
 host-exception handler. Guest page faults are therefore translated back into
@@ -194,7 +201,7 @@ dependency order and validate each group with small guest fixtures:
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
    and surface-copy paths are in place. Remaining work includes less common
    resource methods, volume textures, D3DX shader helpers, reset/lost-device
-   edge cases, and frame-by-frame validation beyond the startup splash.
+   edge cases, and frame-by-frame validation beyond the main menu.
 5. **Audio/video:** DirectSound, WinMM, DirectShow, and Bink integration. The
    current facades preserve guest contracts and timing but do not decode or
    emit media yet.
@@ -255,8 +262,8 @@ Fallout now survives the previously missing kernel-object, guest-thread,
 USER32, D3D9, audio, DirectShow, Bink, and startup-order singleton boundaries.
 The 64-bit host owns the window and real D3D9 objects, translates Fallout's
 32-bit graphics workload, delivers host and lifecycle messages through
-Fallout's own 32-bit WndProc, and produces a correctly textured startup splash
-without exposing native pointers to the guest. The next major work is to find
-the remaining post-splash state gate, finish the D3D9/D3DX, input, and media
-behaviors needed to reach the interactive menu, persist remaining virtual-file
-operations, and load `nvse_1_4.dll` plus NVSE plugins in the same guest process.
+Fallout's own 32-bit WndProc, and reaches the correctly textured main menu
+without exposing native pointers to the guest. The next major work is to feed
+native keyboard and mouse device state/events through DirectInput, verify
+deterministic menu interaction, persist remaining virtual-file operations, and
+map and initialize `nvse_1_4.dll` plus NVSE plugins in the same guest process.

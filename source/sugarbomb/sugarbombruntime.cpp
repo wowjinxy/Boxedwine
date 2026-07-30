@@ -1538,6 +1538,7 @@ private:
                     static_cast<U32>(state->waitKind),
                     state->suspendCount,
                     state->completed ? 1 : 0);
+                printGuestCpuDetails(*state);
                 printGuestWaitDetails(*state);
             }
             std::vector<std::pair<std::string, U32>> busiestApis(
@@ -1576,6 +1577,29 @@ private:
             };
             fprintf(stderr, "  graphics API milestones:\n");
             for (const char* milestone : graphicsMilestones) {
+                auto count = nativeApiCounts.find(milestone);
+                fprintf(
+                    stderr,
+                    "    %10u  %s\n",
+                    count == nativeApiCounts.end() ? 0 : count->second,
+                    milestone);
+            }
+            static const char* messageAndMediaMilestones[] = {
+                "USER32!PeekMessageA",
+                "USER32!DispatchMessageA",
+                "USER32!SendMessageA",
+                "SUGARBOMB!GuestWndProcReturn",
+                "BINKW32!BinkOpen",
+                "BINKW32!BinkWait",
+                "BINKW32!BinkDoFrame",
+                "BINKW32!BinkNextFrame",
+                "BINKW32!BinkCopyToBufferRect",
+                "BINKW32!BinkClose",
+                "DIRECTSHOW!IMediaPosition::get_CurrentPosition",
+                "DIRECTSHOW!IMediaEvent::GetEvent",
+            };
+            fprintf(stderr, "  message/media API milestones:\n");
+            for (const char* milestone : messageAndMediaMilestones) {
                 auto count = nativeApiCounts.find(milestone);
                 fprintf(
                     stderr,
@@ -5122,9 +5146,11 @@ private:
             height ? height : configuredDisplayDimension("iSize H", 720);
         direct3DBackBufferFormat = format ? format : 22;
         if (guestWindows.count(deviceWindow)) {
-            activeWindow = deviceWindow;
+            direct3DDeviceWindow = deviceWindow;
         }
-        auto window = guestWindows.find(activeWindow);
+        U32 presentationWindow = topLevelGuestWindow(
+            direct3DDeviceWindow ? direct3DDeviceWindow : activeWindow);
+        auto window = guestWindows.find(presentationWindow);
         if (window != guestWindows.end()) {
             window->second.width = static_cast<S32>(direct3DBackBufferWidth);
             window->second.height = static_cast<S32>(direct3DBackBufferHeight);
@@ -9587,21 +9613,47 @@ private:
             width | (height << 16));
     }
 
+    bool isGuestChildWindow(const GuestWindow& window) const {
+        return window.parent != 0 ||
+            (window.style & 0x40000000) != 0; // WS_CHILD
+    }
+
+    U32 topLevelGuestWindow(U32 handle) const {
+        U32 currentHandle = handle;
+        for (U32 depth = 0; currentHandle && depth < 32; ++depth) {
+            auto found = guestWindows.find(currentHandle);
+            if (found == guestWindows.end()) {
+                return 0;
+            }
+            if (!found->second.parent) {
+                return currentHandle;
+            }
+            currentHandle = found->second.parent;
+        }
+        return 0;
+    }
+
     void queueGuestWindowVisibility(U32 handle, bool visible) {
-        if (!guestWindows.count(handle)) {
+        auto found = guestWindows.find(handle);
+        if (found == guestWindows.end()) {
             return;
         }
+        bool childWindow = isGuestChildWindow(found->second);
         if (visible) {
             enqueueGuestMessage(handle, 0x0018, 1, 0); // WM_SHOWWINDOW
-            enqueueGuestMessage(handle, 0x001c, 1, 0); // WM_ACTIVATEAPP
-            enqueueGuestMessage(handle, 0x0006, 1, 0); // WM_ACTIVATE / WA_ACTIVE
-            enqueueGuestMessage(handle, 0x0007, 0, 0); // WM_SETFOCUS
+            if (!childWindow) {
+                enqueueGuestMessage(handle, 0x001c, 1, 0); // WM_ACTIVATEAPP
+                enqueueGuestMessage(handle, 0x0006, 1, 0); // WM_ACTIVATE / WA_ACTIVE
+                enqueueGuestMessage(handle, 0x0007, 0, 0); // WM_SETFOCUS
+            }
             queueGuestWindowSize(handle);
             enqueueGuestMessage(handle, 0x000f, 0, 0); // WM_PAINT
         } else {
-            enqueueGuestMessage(handle, 0x0008, 0, 0); // WM_KILLFOCUS
-            enqueueGuestMessage(handle, 0x0006, 0, 0); // WM_ACTIVATE / WA_INACTIVE
-            enqueueGuestMessage(handle, 0x001c, 0, 0); // WM_ACTIVATEAPP
+            if (!childWindow) {
+                enqueueGuestMessage(handle, 0x0008, 0, 0); // WM_KILLFOCUS
+                enqueueGuestMessage(handle, 0x0006, 0, 0); // WM_ACTIVATE / WA_INACTIVE
+                enqueueGuestMessage(handle, 0x001c, 0, 0); // WM_ACTIVATEAPP
+            }
             enqueueGuestMessage(handle, 0x0018, 0, 0); // WM_SHOWWINDOW
         }
     }
@@ -9867,7 +9919,9 @@ private:
         window.title = titleAddress ? readAnsi(titleAddress) : "";
         U32 handle = window.handle;
         guestWindows[handle] = window;
-        activeWindow = handle;
+        if (!isGuestChildWindow(window)) {
+            activeWindow = handle;
+        }
         syncHostWindow(guestWindows[handle]);
         if (window.visible) {
             queueGuestWindowVisibility(handle, true);
@@ -9876,10 +9930,12 @@ private:
         }
         printf(
             "Sugarbomb Win32 USER32: CreateWindowExA("
-            "%s, %s, style=0x%08X, %dx%d, visible=%u) -> 0x%08X\n",
+            "%s, %s, style=0x%08X, parent=0x%08X, "
+            "%dx%d, visible=%u) -> 0x%08X\n",
             window.className.c_str(),
             window.title.c_str(),
             window.style,
+            window.parent,
             window.width,
             window.height,
             window.visible ? 1 : 0,
@@ -9909,7 +9965,8 @@ private:
         }
         bool wasVisible = found->second.visible;
         found->second.visible = command != 0;
-        if (found->second.visible) {
+        if (found->second.visible &&
+            !isGuestChildWindow(found->second)) {
             activeWindow = handle;
         }
         syncHostWindow(found->second);
@@ -9929,11 +9986,13 @@ private:
     }
 
     bool activateGuestWindow(U32 handle) {
-        auto found = guestWindows.find(handle);
+        U32 topLevel = topLevelGuestWindow(handle);
+        auto found = guestWindows.find(topLevel);
         if (found == guestWindows.end()) {
             setLastError(1400);
             return false;
         }
+        handle = topLevel;
         U32 previous = activeWindow;
         if (previous && previous != handle && guestWindows.count(previous)) {
             enqueueGuestMessage(previous, 0x0008, handle, 0); // WM_KILLFOCUS
@@ -9996,7 +10055,8 @@ private:
             queueGuestWindowSize(handle);
         }
         if (wasVisible != found->second.visible) {
-            if (found->second.visible) {
+            if (found->second.visible &&
+                !isGuestChildWindow(found->second)) {
                 activeWindow = handle;
             }
             queueGuestWindowVisibility(handle, found->second.visible);
@@ -10558,6 +10618,29 @@ private:
             return object.signaled;
         }
         return false;
+    }
+
+    void printGuestCpuDetails(const GuestThreadState& state) const {
+        if (state.completed || !state.thread || !state.thread->cpu) {
+            return;
+        }
+        CPU* stateCpu = state.thread->cpu;
+        U32 stackPointer = stateCpu->reg[4].u32;
+        U32 stackAddress =
+            stateCpu->seg[SS].address +
+            (stackPointer & stateCpu->stackMask);
+        fprintf(stderr, "      ESP=0x%08X", stackPointer);
+        constexpr U32 STACK_WORDS = 6;
+        if (memory->canRead(stackAddress, STACK_WORDS * sizeof(U32))) {
+            fprintf(stderr, " stack:");
+            for (U32 index = 0; index < STACK_WORDS; ++index) {
+                fprintf(
+                    stderr,
+                    " 0x%08X",
+                    memory->readd(stackAddress + index * sizeof(U32)));
+            }
+        }
+        fprintf(stderr, "\n");
     }
 
     void printGuestWaitDetails(const GuestThreadState& state) const {
@@ -11212,6 +11295,7 @@ private:
     U32 nextWindowHandle = 0x57000100;
     U32 nextWindowAtom = 1;
     U32 activeWindow = 0;
+    U32 direct3DDeviceWindow = 0;
     U32 directInputVtableAddress = 0;
     U32 directInputDeviceVtableAddress = 0;
     U32 directSoundVtableAddress = 0;
