@@ -198,6 +198,14 @@ private:
         U32 waitCriticalSectionAddress = 0;
     };
 
+    struct GuestModule {
+        std::string key;
+        std::string path;
+        Pe32MappedImage image;
+        U32 references = 1;
+        bool initialized = false;
+    };
+
     struct GuestWindowClass {
         U32 atom = 0;
         U32 style = 0;
@@ -690,6 +698,13 @@ private:
                 image,
                 error)) {
             fprintf(stderr, "Sugarbomb could not map the PE32 guest: %s\n", error.c_str());
+            return false;
+        }
+        if (!mapBundledNvse()) {
+            fprintf(
+                stderr,
+                "Sugarbomb could not stage NVSE in the guest process: %s\n",
+                error.c_str());
             return false;
         }
 
@@ -1708,6 +1723,234 @@ private:
         return true;
     }
 
+    std::string guestModuleKey(const std::string& name) const {
+        std::string key =
+            std::filesystem::path(name).filename().string();
+        if (std::filesystem::path(key).extension().empty()) {
+            key += ".dll";
+        }
+        return lowerAscii(key);
+    }
+
+    bool guestRangeIsFree(U32 base, U32 size) const {
+        if (!base || !size ||
+            static_cast<U64>(base) + size >
+                std::numeric_limits<U32>::max()) {
+            return false;
+        }
+        U32 firstPage = base >> K_PAGE_SHIFT;
+        U32 lastPage =
+            static_cast<U32>(
+                (static_cast<U64>(base) + size - 1) >>
+                K_PAGE_SHIFT);
+        for (U32 page = firstPage; page <= lastPage; ++page) {
+            if (memory->isPageMapped(page)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    U32 findFreeGuestModuleBase(U32 size) {
+        U64 alignedSize =
+            (static_cast<U64>(size) + 0xffff) &
+            ~static_cast<U64>(0xffff);
+        U64 candidate =
+            (static_cast<U64>(nextGuestModuleBase) + 0xffff) &
+            ~static_cast<U64>(0xffff);
+        while (candidate >= 0x18000000 &&
+               candidate + alignedSize <= GUEST_VIRTUAL_LIMIT) {
+            if (guestRangeIsFree(
+                    static_cast<U32>(candidate),
+                    static_cast<U32>(alignedSize))) {
+                nextGuestModuleBase =
+                    static_cast<U32>(candidate + alignedSize);
+                return static_cast<U32>(candidate);
+            }
+            candidate += 0x10000;
+        }
+        return 0;
+    }
+
+    std::string resolveGuestLibraryPath(
+        const std::string& requested) const {
+        if (requested.empty()) {
+            return std::string();
+        }
+        std::filesystem::path path(requested);
+        std::error_code fileError;
+        if (std::filesystem::is_regular_file(path, fileError)) {
+            return std::filesystem::absolute(path).string();
+        }
+        std::filesystem::path imageDirectory =
+            std::filesystem::path(imagePath).parent_path();
+        std::filesystem::path besideImage = imageDirectory / path;
+        fileError.clear();
+        if (std::filesystem::is_regular_file(
+                besideImage,
+                fileError)) {
+            return std::filesystem::absolute(besideImage).string();
+        }
+        std::filesystem::path byName =
+            imageDirectory / path.filename();
+        fileError.clear();
+        if (std::filesystem::is_regular_file(byName, fileError)) {
+            return std::filesystem::absolute(byName).string();
+        }
+        return std::string();
+    }
+
+    bool mapGuestModule(
+        const std::string& requestedPath,
+        U32& moduleHandle) {
+        moduleHandle = 0;
+        std::string path = resolveGuestLibraryPath(requestedPath);
+        if (path.empty()) {
+            error = "Unable to locate guest DLL " + requestedPath;
+            return false;
+        }
+        std::string key = guestModuleKey(path);
+        auto existingName = guestModuleHandles.find(key);
+        if (existingName != guestModuleHandles.end()) {
+            GuestModule& existing =
+                guestModules[existingName->second];
+            ++existing.references;
+            moduleHandle = existing.image.loadBase;
+            return true;
+        }
+
+        std::vector<U8> bytes;
+        Pe32ImageInfo inspected;
+        std::string loadError;
+        if (!Pe32Loader::readFile(path.c_str(), bytes, loadError) ||
+            !Pe32Loader::inspect(bytes, inspected, loadError)) {
+            error = "Unable to inspect guest DLL " + path + ": " +
+                loadError;
+            return false;
+        }
+        constexpr U16 IMAGE_FILE_DLL = 0x2000;
+        if (!(inspected.characteristics & IMAGE_FILE_DLL)) {
+            error = "Guest module is not marked as a DLL: " + path;
+            return false;
+        }
+
+        U32 loadBase = guestRangeIsFree(
+            inspected.imageBase,
+            inspected.sizeOfImage)
+            ? inspected.imageBase
+            : findFreeGuestModuleBase(inspected.sizeOfImage);
+        if (!loadBase) {
+            error = "Unable to find guest address space for DLL " + path;
+            return false;
+        }
+
+        bool reopenThunks = thunks.finalized();
+        if (reopenThunks && !thunks.beginUpdate(loadError)) {
+            error = loadError;
+            return false;
+        }
+        Pe32MappedImage mapped;
+        bool mappedSuccessfully = Pe32Loader::mapImageWithImports(
+            thread,
+            bytes,
+            loadBase,
+            resolveImport,
+            this,
+            mapped,
+            loadError);
+        if (reopenThunks) {
+            std::string finalizeError;
+            if (!thunks.finalize(finalizeError) &&
+                mappedSuccessfully) {
+                mappedSuccessfully = false;
+                loadError = finalizeError;
+            }
+        }
+        if (!mappedSuccessfully) {
+            error = "Unable to map guest DLL " + path + ": " +
+                loadError;
+            return false;
+        }
+
+        GuestModule module;
+        module.key = key;
+        module.path = path;
+        module.image = mapped;
+        moduleHandle = mapped.loadBase;
+        guestModuleHandles[key] = moduleHandle;
+        guestModules[moduleHandle] = std::move(module);
+        printf(
+            "Sugarbomb Win32 loader: mapped guest DLL %s at "
+            "0x%08X-0x%08X (%zu exports, %zu imports)\n",
+            path.c_str(),
+            mapped.loadBase,
+            mapped.loadBase + mapped.info.sizeOfImage,
+            mapped.info.exports.size(),
+            mapped.info.importSymbolCount());
+        return true;
+    }
+
+    U32 guestModuleHandle(const std::string& requestedName) const {
+        std::string key = guestModuleKey(requestedName);
+        auto found = guestModuleHandles.find(key);
+        return found == guestModuleHandles.end() ? 0 : found->second;
+    }
+
+    U32 guestModuleProcAddress(
+        U32 moduleHandle,
+        const std::string& name,
+        U32 ordinal) const {
+        const Pe32ImageInfo* moduleInfo = nullptr;
+        U32 loadBase = 0;
+        if (moduleHandle == image.loadBase) {
+            moduleInfo = &image.info;
+            loadBase = image.loadBase;
+        } else {
+            auto found = guestModules.find(moduleHandle);
+            if (found != guestModules.end()) {
+                moduleInfo = &found->second.image.info;
+                loadBase = found->second.image.loadBase;
+            }
+        }
+        if (!moduleInfo) {
+            return 0;
+        }
+        const Pe32ExportSymbol* symbol = ordinal
+            ? moduleInfo->findExport(ordinal)
+            : moduleInfo->findExport(name);
+        if (!symbol || symbol->forwarded()) {
+            return 0;
+        }
+        return loadBase + symbol->rva;
+    }
+
+    bool mapBundledNvse() {
+        std::filesystem::path nvsePath =
+            std::filesystem::path(imagePath).parent_path() /
+            "nvse_1_4.dll";
+        std::error_code fileError;
+        if (!std::filesystem::is_regular_file(nvsePath, fileError)) {
+            printf(
+                "Sugarbomb NVSE: no nvse_1_4.dll beside the guest; "
+                "continuing without NVSE\n");
+            return true;
+        }
+        U32 moduleHandle = 0;
+        if (!mapGuestModule(nvsePath.string(), moduleHandle)) {
+            return false;
+        }
+        const GuestModule& module = guestModules[moduleHandle];
+        const Pe32ExportSymbol* start =
+            module.image.info.findExport("StartNVSE");
+        printf(
+            "Sugarbomb NVSE: staged nvse_1_4.dll at 0x%08X; "
+            "StartNVSE=%s0x%08X (DllMain not called yet)\n",
+            moduleHandle,
+            start ? "" : "unavailable/",
+            start ? moduleHandle + start->rva : 0);
+        return true;
+    }
+
     void initializeWindowsEnvironment() {
         memory->strcpy(ANSI_COMMAND_LINE, commandLine.c_str());
         writeUnicodeString(memory, PROCESS_PARAMETERS + 0x38, WIDE_IMAGE_PATH, imagePath);
@@ -2326,6 +2569,9 @@ private:
         } else if (symbol == "LoadLibraryA") {
             callback = callbackLoadLibraryA;
             stackCleanupBytes = 4;
+        } else if (symbol == "LoadLibraryExA") {
+            callback = callbackLoadLibraryExA;
+            stackCleanupBytes = 12;
         } else if (symbol == "FreeLibrary") {
             callback = callbackFreeLibrary;
             stackCleanupBytes = 4;
@@ -8140,11 +8386,20 @@ private:
             U32 moduleName = argument(cpu, 0);
             if (!moduleName) {
                 cpu->reg[0].u32 = session->image.loadBase;
-            } else if (lowerAscii(session->readAnsi(moduleName)) == "kernel32.dll") {
-                cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
             } else {
-                cpu->reg[0].u32 = 0;
-                session->setLastError(126); // ERROR_MOD_NOT_FOUND
+                std::string name = session->readAnsi(moduleName);
+                std::string key = session->guestModuleKey(name);
+                if (key == "kernel32.dll") {
+                    cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
+                } else if (key == "d3d9.dll") {
+                    cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
+                } else {
+                    cpu->reg[0].u32 =
+                        session->guestModuleHandle(name);
+                    if (!cpu->reg[0].u32) {
+                        session->setLastError(126);
+                    }
+                }
             }
         }
     }
@@ -8155,11 +8410,20 @@ private:
             U32 moduleName = argument(cpu, 0);
             if (!moduleName) {
                 cpu->reg[0].u32 = session->image.loadBase;
-            } else if (lowerAscii(session->readWide(moduleName)) == "kernel32.dll") {
-                cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
             } else {
-                cpu->reg[0].u32 = 0;
-                session->setLastError(126);
+                std::string name = session->readWide(moduleName);
+                std::string key = session->guestModuleKey(name);
+                if (key == "kernel32.dll") {
+                    cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
+                } else if (key == "d3d9.dll") {
+                    cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
+                } else {
+                    cpu->reg[0].u32 =
+                        session->guestModuleHandle(name);
+                    if (!cpu->reg[0].u32) {
+                        session->setLastError(126);
+                    }
+                }
             }
         }
     }
@@ -8172,14 +8436,23 @@ private:
         U32 module = argument(cpu, 0);
         U32 buffer = argument(cpu, 1);
         U32 capacity = argument(cpu, 2);
-        if ((module && module != session->image.loadBase) || !buffer || !capacity) {
+        std::string path;
+        if (!module || module == session->image.loadBase) {
+            path = session->imagePath;
+        } else {
+            auto found = session->guestModules.find(module);
+            if (found != session->guestModules.end()) {
+                path = found->second.path;
+            }
+        }
+        if (path.empty() || !buffer || !capacity) {
             session->setLastError(87);
             cpu->reg[0].u32 = 0;
             return;
         }
-        U32 length = static_cast<U32>(session->imagePath.size());
+        U32 length = static_cast<U32>(path.size());
         U32 copied = std::min(length, capacity - 1);
-        session->memory->memcpy(buffer, session->imagePath.data(), copied);
+        session->memory->memcpy(buffer, path.data(), copied);
         session->memory->writeb(buffer + copied, 0);
         cpu->reg[0].u32 = copied;
         if (copied != length) {
@@ -8437,14 +8710,29 @@ private:
         }
         U32 module = argument(cpu, 0);
         U32 nameAddress = argument(cpu, 1);
-        std::string name = nameAddress <= 0xffff
-            ? "#" + std::to_string(nameAddress)
+        U32 ordinal = nameAddress <= 0xffff ? nameAddress : 0;
+        std::string name = ordinal
+            ? "#" + std::to_string(ordinal)
             : session->readAnsi(nameAddress);
         if (module == D3D9_MODULE_HANDLE && name == "Direct3DCreate9") {
             printf(
                 "Sugarbomb Win32 loader: GetProcAddress(D3D9.DLL, Direct3DCreate9) -> 0x%08X\n",
                 session->direct3DCreate9Thunk);
             cpu->reg[0].u32 = session->direct3DCreate9Thunk;
+            return;
+        }
+        U32 guestAddress = session->guestModuleProcAddress(
+            module,
+            ordinal ? std::string() : name,
+            ordinal);
+        if (guestAddress) {
+            printf(
+                "Sugarbomb Win32 loader: GetProcAddress("
+                "0x%08X, %s) -> guest 0x%08X\n",
+                module,
+                name.c_str(),
+                guestAddress);
+            cpu->reg[0].u32 = guestAddress;
             return;
         }
         printf("Sugarbomb Win32 probe: GetProcAddress(0x%08X, %s) -> unavailable\n", module, name.c_str());
@@ -8456,7 +8744,12 @@ private:
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!LoadLibraryA");
         if (session) {
             std::string name = session->readAnsi(argument(cpu, 0));
-            if (lowerAscii(name) == "d3d9.dll" || lowerAscii(name) == "d3d9") {
+            std::string key = session->guestModuleKey(name);
+            if (key == "kernel32.dll") {
+                cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
+                return;
+            }
+            if (key == "d3d9.dll") {
                 printf(
                     "Sugarbomb Win32 loader: LoadLibraryA(%s) -> 0x%08X\n",
                     name.c_str(),
@@ -8464,15 +8757,72 @@ private:
                 cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
                 return;
             }
-            printf("Sugarbomb Win32 loader probe: LoadLibraryA(%s) -> unavailable\n", name.c_str());
+            U32 moduleHandle = 0;
+            if (session->mapGuestModule(name, moduleHandle)) {
+                cpu->reg[0].u32 = moduleHandle;
+            } else {
+                printf(
+                    "Sugarbomb Win32 loader probe: LoadLibraryA(%s) "
+                    "failed: %s\n",
+                    name.c_str(),
+                    session->error.c_str());
+                session->setLastError(126);
+                cpu->reg[0].u32 = 0;
+            }
+        }
+    }
+
+    static void callbackLoadLibraryExA(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!LoadLibraryExA");
+        if (!session) {
+            return;
+        }
+        std::string name = session->readAnsi(argument(cpu, 0));
+        std::string key = session->guestModuleKey(name);
+        if (key == "kernel32.dll") {
+            cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
+            return;
+        }
+        if (key == "d3d9.dll") {
+            cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
+            return;
+        }
+        U32 moduleHandle = 0;
+        if (session->mapGuestModule(name, moduleHandle)) {
+            cpu->reg[0].u32 = moduleHandle;
+        } else {
+            printf(
+                "Sugarbomb Win32 loader probe: LoadLibraryExA(%s, "
+                "flags=0x%08X) failed: %s\n",
+                name.c_str(),
+                argument(cpu, 2),
+                session->error.c_str());
             session->setLastError(126);
             cpu->reg[0].u32 = 0;
         }
     }
 
     static void callbackFreeLibrary(CPU* cpu) {
-        if (current(cpu, "KERNEL32!FreeLibrary")) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!FreeLibrary");
+        if (!session) {
+            return;
+        }
+        U32 moduleHandle = argument(cpu, 0);
+        auto found = session->guestModules.find(moduleHandle);
+        if (found != session->guestModules.end()) {
+            if (found->second.references) {
+                --found->second.references;
+            }
             cpu->reg[0].u32 = 1;
+        } else if (
+            moduleHandle == KERNEL32_MODULE_HANDLE ||
+            moduleHandle == D3D9_MODULE_HANDLE) {
+            cpu->reg[0].u32 = 1;
+        } else {
+            session->setLastError(6); // ERROR_INVALID_HANDLE
+            cpu->reg[0].u32 = 0;
         }
     }
 
@@ -11584,8 +11934,15 @@ private:
                                 ~static_cast<U64>(0xffff));
                     }
                 }
-                if (!overlaps) {
+                if (!overlaps &&
+                    guestRangeIsFree(
+                        static_cast<U32>(candidate),
+                        roundedSize)) {
                     return static_cast<U32>(candidate);
+                }
+                if (!overlaps) {
+                    overlaps = true;
+                    nextCandidate = candidate + 0x10000;
                 }
                 if (nextCandidate <= candidate) {
                     return 0;
@@ -11664,6 +12021,10 @@ private:
                 setLastError(487);
                 return 0;
             }
+        }
+        if (!guestRangeIsFree(base, roundedSize)) {
+            setLastError(487);
+            return 0;
         }
         if (allocationType & 0x1000) {
             U32 guestProtection = windowsProtectionToGuest(protection);
@@ -11953,6 +12314,9 @@ private:
     CPU* cpu = nullptr;
     CPU* activeCpu = nullptr;
     Pe32MappedImage image;
+    std::unordered_map<U32, GuestModule> guestModules;
+    std::unordered_map<std::string, U32> guestModuleHandles;
+    U32 nextGuestModuleBase = 0x18000000;
     SugarbombThunkArena thunks;
     U32 entryReturnThunk = 0;
     U32 threadReturnThunk = 0;

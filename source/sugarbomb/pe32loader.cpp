@@ -108,6 +108,168 @@ bool readRvaCString(const Pe32ImageInfo& info, const std::vector<U8>& bytes, U32
     return readCString(bytes, offset, value);
 }
 
+bool parseExports(
+    const std::vector<U8>& bytes,
+    Pe32ImageInfo& info,
+    std::string& error) {
+    if (!info.exportDirectoryRva || !info.exportDirectorySize) {
+        return true;
+    }
+    constexpr U32 EXPORT_DIRECTORY_SIZE = 40;
+    constexpr U32 MAX_EXPORT_FUNCTIONS = 1 << 20;
+    constexpr U32 MAX_EXPORT_NAMES = 1 << 20;
+    if (info.exportDirectorySize < EXPORT_DIRECTORY_SIZE) {
+        error = "PE32 export directory is truncated";
+        return false;
+    }
+    U32 exportEnd = 0;
+    if (!addFitsU32(
+            info.exportDirectoryRva,
+            info.exportDirectorySize,
+            exportEnd)) {
+        error = "PE32 export directory overflows the guest address space";
+        return false;
+    }
+    size_t directoryOffset = 0;
+    if (!rvaToFileOffset(
+            info,
+            bytes,
+            info.exportDirectoryRva,
+            EXPORT_DIRECTORY_SIZE,
+            directoryOffset)) {
+        error = "PE32 export directory is outside the file";
+        return false;
+    }
+
+    U32 moduleNameRva = 0;
+    U32 ordinalBase = 0;
+    U32 functionCount = 0;
+    U32 nameCount = 0;
+    U32 functionTableRva = 0;
+    U32 nameTableRva = 0;
+    U32 nameOrdinalTableRva = 0;
+    readU32(bytes, directoryOffset + 12, moduleNameRva);
+    readU32(bytes, directoryOffset + 16, ordinalBase);
+    readU32(bytes, directoryOffset + 20, functionCount);
+    readU32(bytes, directoryOffset + 24, nameCount);
+    readU32(bytes, directoryOffset + 28, functionTableRva);
+    readU32(bytes, directoryOffset + 32, nameTableRva);
+    readU32(bytes, directoryOffset + 36, nameOrdinalTableRva);
+
+    if (functionCount > MAX_EXPORT_FUNCTIONS ||
+        nameCount > MAX_EXPORT_NAMES ||
+        (nameCount && !functionCount)) {
+        error = "PE32 export table has an invalid symbol count";
+        return false;
+    }
+    if (moduleNameRva &&
+        !readRvaCString(
+            info,
+            bytes,
+            moduleNameRva,
+            info.exportModuleName)) {
+        error = "PE32 export module name is invalid";
+        return false;
+    }
+
+    std::vector<U32> functionRvas(functionCount);
+    std::vector<bool> namedFunctions(functionCount, false);
+    for (U32 index = 0; index < functionCount; ++index) {
+        U32 entryRva = 0;
+        size_t entryOffset = 0;
+        if (!addFitsU32(functionTableRva, index * 4, entryRva) ||
+            !rvaToFileOffset(info, bytes, entryRva, 4, entryOffset) ||
+            !readU32(bytes, entryOffset, functionRvas[index])) {
+            error = "PE32 export function table is outside the file";
+            return false;
+        }
+    }
+
+    auto appendExport = [&](U32 functionIndex, const std::string& name) {
+        Pe32ExportSymbol symbol;
+        symbol.name = name;
+        if (!addFitsU32(
+                ordinalBase,
+                functionIndex,
+                symbol.ordinal)) {
+            error = "PE32 export ordinal overflows";
+            return false;
+        }
+        symbol.rva = functionRvas[functionIndex];
+        if (symbol.rva >= info.sizeOfImage) {
+            error = "PE32 exported symbol is outside the image";
+            return false;
+        }
+        if (symbol.rva >= info.exportDirectoryRva &&
+            symbol.rva < exportEnd &&
+            !readRvaCString(
+                info,
+                bytes,
+                symbol.rva,
+                symbol.forwarder)) {
+            error = "PE32 forwarded export name is invalid";
+            return false;
+        }
+        info.exports.push_back(symbol);
+        return true;
+    };
+
+    for (U32 index = 0; index < nameCount; ++index) {
+        U32 nameEntryRva = 0;
+        U32 ordinalEntryRva = 0;
+        size_t nameEntryOffset = 0;
+        size_t ordinalEntryOffset = 0;
+        U32 symbolNameRva = 0;
+        U16 functionIndex = 0;
+        if (!addFitsU32(nameTableRva, index * 4, nameEntryRva) ||
+            !addFitsU32(
+                nameOrdinalTableRva,
+                index * 2,
+                ordinalEntryRva) ||
+            !rvaToFileOffset(
+                info,
+                bytes,
+                nameEntryRva,
+                4,
+                nameEntryOffset) ||
+            !rvaToFileOffset(
+                info,
+                bytes,
+                ordinalEntryRva,
+                2,
+                ordinalEntryOffset) ||
+            !readU32(bytes, nameEntryOffset, symbolNameRva) ||
+            !readU16(bytes, ordinalEntryOffset, functionIndex) ||
+            functionIndex >= functionCount ||
+            !functionRvas[functionIndex]) {
+            error = "PE32 export name table is invalid";
+            return false;
+        }
+        std::string symbolName;
+        if (!readRvaCString(
+                info,
+                bytes,
+                symbolNameRva,
+                symbolName)) {
+            error = "PE32 exported symbol name is invalid";
+            return false;
+        }
+        namedFunctions[functionIndex] = true;
+        if (!appendExport(functionIndex, symbolName)) {
+            return false;
+        }
+    }
+
+    for (U32 index = 0; index < functionCount; ++index) {
+        if (functionRvas[index] &&
+            !namedFunctions[index] &&
+            !appendExport(index, std::string())) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool parseImports(const std::vector<U8>& bytes, Pe32ImageInfo& info, std::string& error) {
     if (!info.importDirectoryRva || !info.importDirectorySize) {
         return true;
@@ -336,6 +498,25 @@ size_t Pe32ImageInfo::importSymbolCount() const {
     return result;
 }
 
+const Pe32ExportSymbol* Pe32ImageInfo::findExport(
+    const std::string& name) const {
+    for (const Pe32ExportSymbol& symbol : exports) {
+        if (symbol.name == name) {
+            return &symbol;
+        }
+    }
+    return nullptr;
+}
+
+const Pe32ExportSymbol* Pe32ImageInfo::findExport(U32 ordinal) const {
+    for (const Pe32ExportSymbol& symbol : exports) {
+        if (symbol.ordinal == ordinal) {
+            return &symbol;
+        }
+    }
+    return nullptr;
+}
+
 bool Pe32Loader::readFile(const char* path, std::vector<U8>& bytes, std::string& error) {
     bytes.clear();
     std::ifstream input(path, std::ios::binary | std::ios::ate);
@@ -432,6 +613,10 @@ bool Pe32Loader::inspect(const std::vector<U8>& bytes, Pe32ImageInfo& info, std:
         readU32(bytes, optionalHeaderOffset + 104, info.importDirectoryRva);
         readU32(bytes, optionalHeaderOffset + 108, info.importDirectorySize);
     }
+    if (numberOfDataDirectories > 0 && optionalHeaderSize >= 104) {
+        readU32(bytes, optionalHeaderOffset + 96, info.exportDirectoryRva);
+        readU32(bytes, optionalHeaderOffset + 100, info.exportDirectorySize);
+    }
     if (numberOfDataDirectories > 5 && optionalHeaderSize >= 144) {
         readU32(bytes, optionalHeaderOffset + 136, info.baseRelocationDirectoryRva);
         readU32(bytes, optionalHeaderOffset + 140, info.baseRelocationDirectorySize);
@@ -472,7 +657,8 @@ bool Pe32Loader::inspect(const std::vector<U8>& bytes, Pe32ImageInfo& info, std:
         info.sections.push_back(section);
     }
 
-    return parseImports(bytes, info, error);
+    return parseExports(bytes, info, error) &&
+        parseImports(bytes, info, error);
 }
 
 bool Pe32Loader::mapImage(KThread* thread, const std::vector<U8>& bytes, Pe32MappedImage& image, std::string& error) {
@@ -518,7 +704,7 @@ bool Pe32Loader::mapImageWithImports(
         loadBase,
         image.info.sizeOfImage,
         K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC,
-        K_MAP_FIXED | K_MAP_PRIVATE | K_MAP_ANONYMOUS,
+        K_MAP_FIXED_NOREPLACE | K_MAP_PRIVATE | K_MAP_ANONYMOUS,
         -1,
         0);
     if (mapped != loadBase) {

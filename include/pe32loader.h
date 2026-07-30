@@ -38,6 +38,17 @@ struct Pe32ImportModule {
     std::vector<Pe32ImportSymbol> symbols;
 };
 
+struct Pe32ExportSymbol {
+    std::string name;
+    std::string forwarder;
+    U32 ordinal = 0;
+    U32 rva = 0;
+
+    bool forwarded() const {
+        return !forwarder.empty();
+    }
+};
+
 struct Pe32ImageInfo {
     U16 machine = 0;
     U16 characteristics = 0;
@@ -48,13 +59,17 @@ struct Pe32ImageInfo {
     U32 sizeOfHeaders = 0;
     U32 sectionAlignment = 0;
     U32 fileAlignment = 0;
+    U32 exportDirectoryRva = 0;
+    U32 exportDirectorySize = 0;
     U32 importDirectoryRva = 0;
     U32 importDirectorySize = 0;
     U32 baseRelocationDirectoryRva = 0;
     U32 baseRelocationDirectorySize = 0;
     U32 tlsDirectoryRva = 0;
     U32 tlsDirectorySize = 0;
+    std::string exportModuleName;
     std::vector<Pe32SectionInfo> sections;
+    std::vector<Pe32ExportSymbol> exports;
     std::vector<Pe32ImportModule> imports;
 
     U32 entryPoint() const {
@@ -62,6 +77,8 @@ struct Pe32ImageInfo {
     }
 
     size_t importSymbolCount() const;
+    const Pe32ExportSymbol* findExport(const std::string& name) const;
+    const Pe32ExportSymbol* findExport(U32 ordinal) const;
 };
 
 struct Pe32MappedImage {

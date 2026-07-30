@@ -71,6 +71,11 @@ The runtime currently builds:
 - the executable's static PE TLS slot and 708-byte `.tls` template;
 - dynamic TLS slots, process/CRT heaps, and logical `VirtualAlloc` reservations;
 - a read/execute-only import-thunk arena at `0x60000000`;
+- a guest DLL registry with collision-safe preferred-base mapping, HIGHLOW
+  relocation, name/ordinal export lookup, incremental import thunks, and
+  Kernel32 module APIs;
+- automatic staging of `nvse_1_4.dll` beside Fallout at its preferred
+  `0x10000000` base, with `StartNVSE` discovered from the real export table;
 - a cooperative x86 guest scheduler with suspended/runnable/completed thread
   states, timed sleeps, and semaphore/event/mutex/thread waits;
 - filesystem, profile/INI, registry, Shell32, USER32, GDI32, input, audio,
@@ -105,7 +110,8 @@ arenas, then commits only the ranges it touches.
 Focused tests verify:
 
 - invalid PE images are rejected;
-- PE32 headers, sections, imports, and protection flags are parsed;
+- PE32 headers, sections, imports, exports, forwarded exports, and protection
+  flags are parsed;
 - the image is mapped at its preferred 32-bit base and its x86 entry point runs;
 - a resolver binds imported symbols to supplied guest thunk addresses before
   final section protections are applied;
@@ -113,7 +119,8 @@ Focused tests verify:
   bases to be mapped elsewhere;
 - PE TLS-directory metadata is retained for loader initialization;
 - stdcall import thunks contain the correct callback and stack-cleanup operands,
-  preserve their module/symbol diagnostics, and become read/execute-only;
+  preserve their module/symbol diagnostics, become read/execute-only, and can
+  reopen as a batch for dynamically mapped DLL imports before returning to RX;
 - an x86 guest can call a registered 64-bit C++ function through `INT 9Ch`;
 - a native callback can redirect the x86 CPU to a requested guest EIP, which is
   the control-transfer primitive used to enter guest callback functions.
@@ -125,7 +132,7 @@ modules without Wine:
 | --- | ---: | ---: | ---: |
 | `FalloutNV.exe` (unpacked 1.4.0.525) | `0x00400000` | `0x0107B000` | 17 modules / 280 symbols |
 | `nvse_loader.exe` | `0x00400000` | `0x0002B000` | 11 modules / 87 symbols |
-| xNVSE 6.4.8 `nvse_1_4.dll` (Release) | `0x10000000` | `0x00159000` | 13 modules / 264 symbols |
+| xNVSE 6.4.8 `nvse_1_4.dll` (current staged build) | `0x10000000` | `0x00752000` | 8 modules / 362 symbols |
 | `ZeGaryHax.dll` | `0x10000000` | `0x001E8000` | 11 modules / 234 symbols |
 
 `nvse_1_4.dll` names the DLL selected for the FalloutNV 1.4 game runtime; it
@@ -197,8 +204,10 @@ dependency order and validate each group with small guest fixtures:
 1. **Process core:** PEB/TEB, static and dynamic TLS, virtual memory, heap,
    timing, exceptions, module lookup, console handles, Unicode conversion,
    critical sections, kernel objects, guest threads, and cooperative waits.
-2. **NVSE bootstrap:** DLL exports, import binding, CRT entry points, plugin
-   enumeration, `DllMain`, and NVSE messaging/interfaces.
+2. **NVSE bootstrap:** DLL export parsing, import binding, module lookup, and
+   preferred-base staging are implemented. Remaining work includes per-module
+   TLS, CRT entry points, `DllMain`/`StartNVSE` sequencing, plugin enumeration,
+   and NVSE messaging/interfaces.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
    message-loop behavior. The guest/native HWND bridge and host message pump
    create visible output. `PeekMessageA`, `DispatchMessageA`, and `SendMessageA`
@@ -235,6 +244,7 @@ From the repository root:
 .\tools\sugarbomb\build-win64.ps1 -Configuration Release
 .\tools\sugarbomb\inspect-pe32.ps1 'D:\path\to\FalloutNV.exe'
 .\tools\sugarbomb\inspect-pe32.ps1 'D:\path\to\FalloutNV.exe' -Imports
+.\tools\sugarbomb\inspect-pe32.ps1 'D:\path\to\nvse_1_4.dll' -Exports
 .\project\msvc\BoxedWine\x64\Release\BoxedWine.exe --sugarbomb-run 'D:\path\to\FalloutNV.exe'
 ```
 
@@ -279,5 +289,6 @@ The 64-bit host owns the window and real D3D9 objects, translates Fallout's
 Fallout's own 32-bit WndProc, and reaches the correctly textured main menu
 without exposing native pointers to the guest. The next major work is to
 verify deterministic menu interaction through the new native-focus/DirectInput
-path, persist remaining virtual-file operations, and map and initialize
-`nvse_1_4.dll` plus NVSE plugins in the same guest process.
+path, persist remaining virtual-file operations, initialize the staged
+`nvse_1_4.dll` through per-module TLS and its guest entry point, then map and
+initialize NVSE plugins in the same guest process.

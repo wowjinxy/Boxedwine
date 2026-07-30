@@ -73,6 +73,8 @@ std::vector<U8> createTestPe32() {
     writeU32(bytes, optional + 60, 0x200);
     writeU16(bytes, optional + 68, 3);
     writeU32(bytes, optional + 92, 16);
+    writeU32(bytes, optional + 96, 0x2100);
+    writeU32(bytes, optional + 100, 0x80);
     writeU32(bytes, optional + 104, 0x2000);
     writeU32(bytes, optional + 108, 0x28);
     writeU32(bytes, optional + 136, 0x20a0);
@@ -114,6 +116,21 @@ std::vector<U8> createTestPe32() {
     writeU32(bytes, 0x4a4, 12);
     writeU16(bytes, 0x4a8, 0x3008);
     writeU16(bytes, 0x4aa, 0);
+
+    writeU32(bytes, 0x50c, 0x2140);
+    writeU32(bytes, 0x510, 1);
+    writeU32(bytes, 0x514, 2);
+    writeU32(bytes, 0x518, 1);
+    writeU32(bytes, 0x51c, 0x2128);
+    writeU32(bytes, 0x520, 0x2130);
+    writeU32(bytes, 0x524, 0x2138);
+    writeU32(bytes, 0x528, 0x1000);
+    writeU32(bytes, 0x52c, 0x2160);
+    writeU32(bytes, 0x530, 0x2150);
+    writeU16(bytes, 0x538, 0);
+    writeString(bytes, 0x540, "fixture.dll");
+    writeString(bytes, 0x550, "FixtureExport");
+    writeString(bytes, 0x560, "KERNEL32.ExitProcess");
     return bytes;
 }
 
@@ -164,6 +181,9 @@ void testPe32LoaderMapsAndExecutesImage() {
     if (inspected.imageBase != TEST_IMAGE_BASE ||
         inspected.entryPoint() != TEST_IMAGE_BASE + TEST_ENTRY_RVA ||
         inspected.sections.size() != 2 ||
+        inspected.exportDirectoryRva != 0x2100 ||
+        inspected.exportModuleName != "fixture.dll" ||
+        inspected.exports.size() != 2 ||
         inspected.imports.size() != 1 ||
         inspected.tlsDirectoryRva != 0x2080 ||
         inspected.tlsDirectorySize != 24 ||
@@ -171,6 +191,21 @@ void testPe32LoaderMapsAndExecutesImage() {
         inspected.imports[0].symbols.size() != 1 ||
         inspected.imports[0].symbols[0].name != "ExitProcess") {
         testFail("synthetic PE32 metadata was parsed incorrectly");
+        return;
+    }
+    const Pe32ExportSymbol* namedExport =
+        inspected.findExport("FixtureExport");
+    const Pe32ExportSymbol* forwardedExport =
+        inspected.findExport(2);
+    if (!namedExport ||
+        namedExport->ordinal != 1 ||
+        namedExport->rva != TEST_ENTRY_RVA ||
+        namedExport->forwarded() ||
+        !forwardedExport ||
+        forwardedExport->name.size() ||
+        forwardedExport->rva != 0x2160 ||
+        forwardedExport->forwarder != "KERNEL32.ExitProcess") {
+        testFail("synthetic PE32 exports were parsed incorrectly");
         return;
     }
 
@@ -192,6 +227,17 @@ void testPe32LoaderMapsAndExecutesImage() {
         !importResolved ||
         context.memory->readd(TEST_IMAGE_BASE + 0x2050) != TEST_IMPORT_ADDRESS) {
         testFail("PE32 entry point or bound import was not mapped");
+        return;
+    }
+    Pe32MappedImage collidingImage;
+    if (Pe32Loader::mapImage(
+            context.thread,
+            bytes,
+            collidingImage,
+            error) ||
+        context.memory->readb(image.entryPoint) != 0xb8) {
+        testFail(
+            "PE32 preferred-base collision replaced an existing guest image");
         return;
     }
 
@@ -258,6 +304,24 @@ void testSugarbombThunkArena() {
     }
     if (!arena.finalize(error) || context.memory->canWrite(TEST_THUNK_BASE, 1)) {
         testFail("Sugarbomb thunk arena did not become read/execute-only: %s", error.c_str());
+    }
+    U32 dynamicCallback = SugarbombBridge::registerCallback(
+        "KERNEL32.dll",
+        "DynamicThunkTest",
+        testBridgeCallback);
+    U32 dynamicThunk = 0;
+    if (!arena.beginUpdate(error) ||
+        !arena.createThunk(
+            dynamicCallback,
+            4,
+            dynamicThunk,
+            error) ||
+        dynamicThunk != TEST_THUNK_BASE + 16 ||
+        !arena.finalize(error) ||
+        context.memory->canWrite(TEST_THUNK_BASE, 1)) {
+        testFail(
+            "Sugarbomb thunk arena could not add a dynamic DLL thunk: %s",
+            error.c_str());
     }
 
     context.memory->unmap(TEST_THUNK_BASE, K_PAGE_SIZE);

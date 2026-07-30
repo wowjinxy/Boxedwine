@@ -47,9 +47,11 @@ int boxedmain(int argc, const char **argv) {
 
     const bool inspectSugarbombPe = argc == 3 && (
         strcmp(argv[1], "--sugarbomb-pe-info") == 0 ||
-        strcmp(argv[1], "--sugarbomb-pe-imports") == 0);
+        strcmp(argv[1], "--sugarbomb-pe-imports") == 0 ||
+        strcmp(argv[1], "--sugarbomb-pe-exports") == 0);
     if (inspectSugarbombPe) {
         const bool listImports = strcmp(argv[1], "--sugarbomb-pe-imports") == 0;
+        const bool listExports = strcmp(argv[1], "--sugarbomb-pe-exports") == 0;
         std::vector<U8> bytes;
         Pe32ImageInfo info;
         std::string error;
@@ -70,6 +72,28 @@ int boxedmain(int argc, const char **argv) {
                 section.virtualSize,
                 section.rawDataSize,
                 section.characteristics);
+        }
+        printf("Exports: %zu symbols from %s\n",
+            info.exports.size(),
+            info.exportModuleName.empty()
+                ? "<unnamed>"
+                : info.exportModuleName.c_str());
+        if (listExports) {
+            for (const Pe32ExportSymbol& symbol : info.exports) {
+                if (symbol.forwarded()) {
+                    printf("  ORD=%u RVA=0x%08X %-32s -> %s\n",
+                        symbol.ordinal,
+                        symbol.rva,
+                        symbol.name.empty() ? "<ordinal-only>" : symbol.name.c_str(),
+                        symbol.forwarder.c_str());
+                } else {
+                    printf("  ORD=%u ADDR=0x%08X RVA=0x%08X %s\n",
+                        symbol.ordinal,
+                        info.imageBase + symbol.rva,
+                        symbol.rva,
+                        symbol.name.empty() ? "<ordinal-only>" : symbol.name.c_str());
+                }
+            }
         }
         printf("Imports: %zu modules, %zu symbols\n", info.imports.size(), info.importSymbolCount());
         for (const Pe32ImportModule& module : info.imports) {

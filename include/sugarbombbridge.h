@@ -33,11 +33,13 @@ class SugarbombThunkArena {
 public:
     bool initialize(KThread* thread, U32 base, U32 size, std::string& error);
     bool createThunk(U32 callbackIndex, U16 stackCleanupBytes, U32& guestAddress, std::string& error);
+    bool beginUpdate(std::string& error);
     bool finalize(std::string& error);
 
     U32 base() const { return arenaBase; }
     U32 size() const { return arenaSize; }
     U32 thunkCount() const { return allocatedThunks; }
+    bool finalized() const { return isFinalized; }
 
 private:
     KThread* thread = nullptr;

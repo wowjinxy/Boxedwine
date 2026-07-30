@@ -169,6 +169,26 @@ bool SugarbombThunkArena::createThunk(
     return true;
 }
 
+bool SugarbombThunkArena::beginUpdate(std::string& error) {
+    if (!thread || !arenaBase) {
+        error = "Sugarbomb thunk arena is not initialized";
+        return false;
+    }
+    if (!isFinalized) {
+        return true;
+    }
+    if (thread->memory->mprotect(
+            thread,
+            arenaBase,
+            arenaSize,
+            K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC) != 0) {
+        error = "Unable to reopen the Sugarbomb guest thunk arena";
+        return false;
+    }
+    isFinalized = false;
+    return true;
+}
+
 bool SugarbombThunkArena::finalize(std::string& error) {
     if (!thread || !arenaBase) {
         error = "Sugarbomb thunk arena is not initialized";
