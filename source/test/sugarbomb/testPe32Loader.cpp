@@ -13,6 +13,7 @@
 
 #include "pe32loader.h"
 #include "sugarbombbridge.h"
+#include "../../sugarbomb/sugarbombhostwindow.h"
 #include "../cpu/testCPU.h"
 #include "testPe32Loader.h"
 
@@ -373,6 +374,39 @@ void testSugarbombNativeBridgeControlTransfer() {
         testFail("Sugarbomb callback did not transfer control to the requested guest EIP");
     }
     SugarbombBridge::clearForTests();
+}
+
+void testSugarbombHostWindowLifecycle() {
+#ifdef _WIN32
+    constexpr std::uint32_t GUEST_WINDOW = 0x57000100;
+    SugarbombHostWindow window;
+    window.syncGuestWindow(
+        GUEST_WINDOW,
+        "Sugarbomb hidden host-window test",
+        0,
+        0,
+        320,
+        200,
+        false);
+    if (!window.nativeHandle()) {
+        testFail(
+            "Sugarbomb native host window was not created on its UI thread");
+        return;
+    }
+
+    window.setCursorVisible(false);
+    window.setCursorVisible(true);
+    std::vector<SugarbombHostWindow::Event> events;
+    if (!window.pumpMessages(&events)) {
+        testFail(
+            "Sugarbomb hidden native host window closed unexpectedly");
+    }
+    window.destroyGuestWindow(GUEST_WINDOW);
+    if (window.nativeHandle()) {
+        testFail(
+            "Sugarbomb native host window UI thread did not shut down");
+    }
+#endif
 }
 
 #endif

@@ -10,9 +10,13 @@
 #include "sugarbombhostwindow.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -26,21 +30,43 @@
 #endif
 
 struct SugarbombHostWindow::Impl {
-    std::uint32_t guestHandle = 0;
+    struct SyncRequest {
+        std::uint32_t guestHandle = 0;
+        std::string title;
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        std::int32_t clientWidth = 1;
+        std::int32_t clientHeight = 1;
+        bool visible = false;
+    };
+
+    std::atomic<std::uint32_t> guestHandle{0};
     std::uint32_t frameWidth = 0;
     std::uint32_t frameHeight = 0;
     std::uint32_t presentCount = 0;
-    bool userClosed = false;
+    std::atomic<bool> userClosed{false};
     bool intentionalDestroy = false;
-    bool shuttingDown = false;
+    std::atomic<bool> shuttingDown{false};
     bool visible = false;
     bool cursorVisible = true;
     bool mouseCaptured = false;
     bool rawMouseRegistered = false;
+    std::mutex eventMutex;
+    std::mutex frameMutex;
+    std::mutex lifecycleMutex;
+    std::mutex syncStateMutex;
+    std::condition_variable lifecycleCondition;
+    bool startupComplete = false;
+    bool startupSucceeded = false;
+    SyncRequest startupRequest;
+    SyncRequest lastSyncRequest;
+    bool lastSyncRequestValid = false;
     std::vector<std::uint32_t> framePixels;
     std::vector<SugarbombHostWindow::Event> pendingEvents;
 #ifdef _WIN32
-    HWND window = nullptr;
+    std::atomic<HWND> window{nullptr};
+    std::atomic<DWORD> windowThreadId{0};
+    std::thread windowThread;
 #endif
 };
 
@@ -50,6 +76,16 @@ namespace {
 
 constexpr const char* HOST_WINDOW_CLASS =
     "SugarbombFalloutGuestHostWindow";
+constexpr UINT WM_SUGARBOMB_SYNC = WM_APP + 0x510;
+constexpr UINT WM_SUGARBOMB_ACTIVATE = WM_APP + 0x511;
+constexpr UINT WM_SUGARBOMB_CURSOR = WM_APP + 0x512;
+constexpr UINT WM_SUGARBOMB_CAPTURE = WM_APP + 0x513;
+constexpr UINT WM_SUGARBOMB_DESTROY = WM_APP + 0x514;
+constexpr UINT WM_SUGARBOMB_PRESENT = WM_APP + 0x515;
+constexpr UINT WM_SUGARBOMB_SET_ACTIVE = WM_APP + 0x516;
+constexpr UINT WM_SUGARBOMB_SET_FOCUS = WM_APP + 0x517;
+constexpr UINT WM_SUGARBOMB_QUERY_ACTIVE = WM_APP + 0x518;
+constexpr UINT WM_SUGARBOMB_QUERY_FOCUS = WM_APP + 0x519;
 
 bool isGuestInputOrFocusMessage(UINT message) {
     switch (message) {
@@ -95,12 +131,17 @@ void queueGuestEvent(
     UINT message,
     WPARAM wordParameter,
     LPARAM longParameter) {
-    if (!impl || !impl->guestHandle ||
+    if (!impl ||
         !isGuestInputOrFocusMessage(message)) {
         return;
     }
+    const std::uint32_t guestHandle =
+        impl->guestHandle.load(std::memory_order_acquire);
+    if (!guestHandle) {
+        return;
+    }
     SugarbombHostWindow::Event event;
-    event.guestHandle = impl->guestHandle;
+    event.guestHandle = guestHandle;
     event.message = static_cast<std::uint32_t>(message);
     event.wordParameter = static_cast<std::uint32_t>(wordParameter);
     event.longParameter = static_cast<std::uint32_t>(longParameter);
@@ -117,13 +158,19 @@ void queueGuestEvent(
     } else if (message == WM_CAPTURECHANGED) {
         event.longParameter = 0;
     }
+    std::lock_guard<std::mutex> lock(impl->eventMutex);
     impl->pendingEvents.push_back(event);
 }
 
 void queueRawMouseEvent(
     SugarbombHostWindow::Impl* impl,
     LPARAM longParameter) {
-    if (!impl || !impl->guestHandle) {
+    if (!impl) {
+        return;
+    }
+    const std::uint32_t guestHandle =
+        impl->guestHandle.load(std::memory_order_acquire);
+    if (!guestHandle) {
         return;
     }
     UINT bytes = 0;
@@ -153,7 +200,7 @@ void queueRawMouseEvent(
         return;
     }
     SugarbombHostWindow::Event event;
-    event.guestHandle = impl->guestHandle;
+    event.guestHandle = guestHandle;
     event.wordParameter =
         static_cast<std::uint32_t>(input->data.mouse.lLastX);
     event.longParameter =
@@ -161,6 +208,7 @@ void queueRawMouseEvent(
     event.time = static_cast<std::uint32_t>(GetMessageTime());
     event.forwardToGuest = false;
     event.relativeMouse = true;
+    std::lock_guard<std::mutex> lock(impl->eventMutex);
     impl->pendingEvents.push_back(event);
 }
 
@@ -168,7 +216,9 @@ void releaseNativeMouseCapture(SugarbombHostWindow::Impl* impl) {
     if (!impl || !impl->mouseCaptured) {
         return;
     }
-    if (GetCapture() == impl->window) {
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (GetCapture() == window) {
         ReleaseCapture();
     }
     ClipCursor(nullptr);
@@ -176,17 +226,22 @@ void releaseNativeMouseCapture(SugarbombHostWindow::Impl* impl) {
 }
 
 bool clipNativeMouseToClient(SugarbombHostWindow::Impl* impl) {
-    if (!impl || !impl->window) {
+    if (!impl) {
+        return false;
+    }
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window) {
         return false;
     }
     RECT client = {};
-    if (!GetClientRect(impl->window, &client)) {
+    if (!GetClientRect(window, &client)) {
         return false;
     }
     POINT upperLeft = {client.left, client.top};
     POINT lowerRight = {client.right, client.bottom};
-    if (!ClientToScreen(impl->window, &upperLeft) ||
-        !ClientToScreen(impl->window, &lowerRight)) {
+    if (!ClientToScreen(window, &upperLeft) ||
+        !ClientToScreen(window, &lowerRight)) {
         return false;
     }
     RECT screen = {
@@ -203,15 +258,19 @@ bool presentationDisabled() {
 }
 
 void paintHostWindow(SugarbombHostWindow::Impl* impl, HDC deviceContext) {
-    if (!impl || !deviceContext || !impl->window) {
+    if (!impl || !deviceContext ||
+        !impl->window.load(std::memory_order_acquire)) {
         return;
     }
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
     RECT client = {};
-    GetClientRect(impl->window, &client);
+    GetClientRect(window, &client);
     const int destinationWidth =
         std::max<LONG>(1, client.right - client.left);
     const int destinationHeight =
         std::max<LONG>(1, client.bottom - client.top);
+    std::lock_guard<std::mutex> frameLock(impl->frameMutex);
     if (!impl->framePixels.empty() &&
         impl->frameWidth &&
         impl->frameHeight) {
@@ -258,6 +317,143 @@ void paintHostWindow(SugarbombHostWindow::Impl* impl, HDC deviceContext) {
         static_cast<int>(std::strlen(status)));
 }
 
+void unregisterNativeRawMouse(SugarbombHostWindow::Impl* impl) {
+    if (!impl || !impl->rawMouseRegistered) {
+        return;
+    }
+    RAWINPUTDEVICE rawMouse = {};
+    rawMouse.usUsagePage = 0x01;
+    rawMouse.usUsage = 0x02;
+    rawMouse.dwFlags = RIDEV_REMOVE;
+    RegisterRawInputDevices(
+        &rawMouse,
+        1,
+        sizeof(rawMouse));
+    impl->rawMouseRegistered = false;
+}
+
+bool setNativeMouseCapture(
+    SugarbombHostWindow::Impl* impl,
+    bool captured) {
+    if (!impl) {
+        return false;
+    }
+    if (!captured) {
+        const bool wasCaptured = impl->mouseCaptured;
+        releaseNativeMouseCapture(impl);
+        if (wasCaptured) {
+            std::printf(
+                "Sugarbomb host input: released exclusive mouse capture\n");
+        }
+        return true;
+    }
+
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window || GetForegroundWindow() != window) {
+        return false;
+    }
+    const bool wasCaptured = impl->mouseCaptured;
+    SetCapture(window);
+    if (GetCapture() != window ||
+        !clipNativeMouseToClient(impl)) {
+        if (GetCapture() == window) {
+            ReleaseCapture();
+        }
+        ClipCursor(nullptr);
+        return false;
+    }
+    impl->mouseCaptured = true;
+    if (!wasCaptured) {
+        std::printf(
+            "Sugarbomb host input: acquired exclusive mouse capture\n");
+    }
+    return true;
+}
+
+bool applyNativeWindowSync(
+    SugarbombHostWindow::Impl* impl,
+    const SugarbombHostWindow::Impl::SyncRequest& request) {
+    if (!impl) {
+        return false;
+    }
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window ||
+        impl->guestHandle.load(std::memory_order_acquire) !=
+            request.guestHandle) {
+        return false;
+    }
+
+    const std::int32_t safeWidth =
+        std::max<std::int32_t>(
+            1,
+            std::min<std::int32_t>(
+                request.clientWidth,
+                16384));
+    const std::int32_t safeHeight =
+        std::max<std::int32_t>(
+            1,
+            std::min<std::int32_t>(
+                request.clientHeight,
+                16384));
+    const std::string resolvedTitle = request.title.empty()
+        ? "Fallout: New Vegas - Sugarbomb x64 host"
+        : request.title;
+    RECT rectangle = {0, 0, safeWidth, safeHeight};
+    AdjustWindowRect(
+        &rectangle,
+        WS_OVERLAPPEDWINDOW,
+        FALSE);
+
+    SetWindowTextA(window, resolvedTitle.c_str());
+    SetWindowPos(
+        window,
+        nullptr,
+        request.x,
+        request.y,
+        rectangle.right - rectangle.left,
+        rectangle.bottom - rectangle.top,
+        SWP_NOACTIVATE | SWP_NOZORDER);
+    if (impl->mouseCaptured) {
+        setNativeMouseCapture(impl, true);
+    }
+
+    const bool becameVisible =
+        request.visible && !impl->visible;
+    const bool becameHidden =
+        !request.visible && impl->visible;
+    if (becameVisible) {
+        // ShowWindow supplies normal Win32 activation semantics. Windows,
+        // rather than the emulator, remains the foreground authority.
+        ShowWindow(window, SW_SHOW);
+        std::printf(
+            "Sugarbomb host presentation: showed guest HWND 0x%08X "
+            "as a native app window (foreground=%u)\n",
+            request.guestHandle,
+            GetForegroundWindow() == window ? 1 : 0);
+    } else if (becameHidden) {
+        ShowWindow(window, SW_HIDE);
+    }
+    impl->visible = request.visible;
+    if (impl->visible) {
+        InvalidateRect(window, nullptr, FALSE);
+    }
+    return true;
+}
+
+bool sameSyncRequest(
+    const SugarbombHostWindow::Impl::SyncRequest& left,
+    const SugarbombHostWindow::Impl::SyncRequest& right) {
+    return left.guestHandle == right.guestHandle &&
+        left.title == right.title &&
+        left.x == right.x &&
+        left.y == right.y &&
+        left.clientWidth == right.clientWidth &&
+        left.clientHeight == right.clientHeight &&
+        left.visible == right.visible;
+}
+
 LRESULT CALLBACK hostWindowProcedure(
     HWND window,
     UINT message,
@@ -286,6 +482,70 @@ LRESULT CALLBACK hostWindowProcedure(
             wordParameter,
             longParameter);
         switch (message) {
+        case WM_SUGARBOMB_SYNC: {
+            const auto* request =
+                reinterpret_cast<
+                    const SugarbombHostWindow::Impl::SyncRequest*>(
+                        longParameter);
+            return request &&
+                applyNativeWindowSync(impl, *request)
+                ? TRUE
+                : FALSE;
+        }
+        case WM_SUGARBOMB_ACTIVATE:
+            if (static_cast<std::uint32_t>(wordParameter) !=
+                impl->guestHandle.load(std::memory_order_acquire)) {
+                return FALSE;
+            }
+            return SetForegroundWindow(window) ||
+                GetForegroundWindow() == window
+                ? TRUE
+                : FALSE;
+        case WM_SUGARBOMB_SET_ACTIVE:
+            if (wordParameter &&
+                static_cast<std::uint32_t>(wordParameter) !=
+                    impl->guestHandle.load(std::memory_order_acquire)) {
+                return FALSE;
+            }
+            SetActiveWindow(wordParameter ? window : nullptr);
+            return GetActiveWindow() ==
+                    (wordParameter ? window : nullptr)
+                ? TRUE
+                : FALSE;
+        case WM_SUGARBOMB_SET_FOCUS:
+            if (wordParameter &&
+                static_cast<std::uint32_t>(wordParameter) !=
+                    impl->guestHandle.load(std::memory_order_acquire)) {
+                return FALSE;
+            }
+            SetFocus(wordParameter ? window : nullptr);
+            return GetFocus() == (wordParameter ? window : nullptr)
+                ? TRUE
+                : FALSE;
+        case WM_SUGARBOMB_QUERY_ACTIVE:
+            return GetActiveWindow() == window ? TRUE : FALSE;
+        case WM_SUGARBOMB_QUERY_FOCUS:
+            return GetFocus() == window ? TRUE : FALSE;
+        case WM_SUGARBOMB_CURSOR:
+            impl->cursorVisible = wordParameter != 0;
+            SetCursor(
+                impl->cursorVisible
+                    ? LoadCursorA(nullptr, IDC_ARROW)
+                    : nullptr);
+            return TRUE;
+        case WM_SUGARBOMB_CAPTURE:
+            return setNativeMouseCapture(
+                impl,
+                wordParameter != 0)
+                ? TRUE
+                : FALSE;
+        case WM_SUGARBOMB_PRESENT:
+            InvalidateRect(window, nullptr, FALSE);
+            return TRUE;
+        case WM_SUGARBOMB_DESTROY:
+            impl->intentionalDestroy = true;
+            DestroyWindow(window);
+            return TRUE;
         case WM_ACTIVATEAPP:
             if (!wordParameter) {
                 releaseNativeMouseCapture(impl);
@@ -295,7 +555,8 @@ LRESULT CALLBACK hostWindowProcedure(
             releaseNativeMouseCapture(impl);
             break;
         case WM_CAPTURECHANGED:
-            if (reinterpret_cast<HWND>(longParameter) != impl->window) {
+            if (reinterpret_cast<HWND>(longParameter) !=
+                impl->window.load(std::memory_order_acquire)) {
                 releaseNativeMouseCapture(impl);
             }
             break;
@@ -328,11 +589,16 @@ LRESULT CALLBACK hostWindowProcedure(
             return 0;
         case WM_NCDESTROY:
             releaseNativeMouseCapture(impl);
-            impl->window = nullptr;
-            if (!impl->intentionalDestroy && !impl->shuttingDown) {
-                impl->userClosed = true;
+            unregisterNativeRawMouse(impl);
+            impl->window.store(nullptr, std::memory_order_release);
+            impl->visible = false;
+            impl->guestHandle.store(0, std::memory_order_release);
+            if (!impl->intentionalDestroy &&
+                !impl->shuttingDown.load(std::memory_order_acquire)) {
+                impl->userClosed.store(true, std::memory_order_release);
             }
             SetWindowLongPtrA(window, GWLP_USERDATA, 0);
+            PostQuitMessage(0);
             break;
         default:
             break;
@@ -362,6 +628,174 @@ bool registerHostWindowClass(HINSTANCE instance) {
     windowClass.lpszClassName = HOST_WINDOW_CLASS;
     return RegisterClassExA(&windowClass) != 0 ||
         GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+void hostWindowThreadMain(SugarbombHostWindow::Impl* impl) {
+    if (!impl) {
+        return;
+    }
+    SugarbombHostWindow::Impl::SyncRequest request;
+    {
+        std::lock_guard<std::mutex> lock(impl->lifecycleMutex);
+        request = impl->startupRequest;
+    }
+
+    impl->windowThreadId.store(
+        GetCurrentThreadId(),
+        std::memory_order_release);
+    bool succeeded = false;
+    HINSTANCE instance = GetModuleHandleA(nullptr);
+    if (!registerHostWindowClass(instance)) {
+        std::fprintf(
+            stderr,
+            "Sugarbomb host presentation: RegisterClassExA failed "
+            "with error %lu\n",
+            GetLastError());
+    } else {
+        const std::int32_t safeWidth =
+            std::max<std::int32_t>(
+                1,
+                std::min<std::int32_t>(
+                    request.clientWidth,
+                    16384));
+        const std::int32_t safeHeight =
+            std::max<std::int32_t>(
+                1,
+                std::min<std::int32_t>(
+                    request.clientHeight,
+                    16384));
+        const std::string resolvedTitle = request.title.empty()
+            ? "Fallout: New Vegas - Sugarbomb x64 host"
+            : request.title;
+        RECT rectangle = {0, 0, safeWidth, safeHeight};
+        AdjustWindowRect(
+            &rectangle,
+            WS_OVERLAPPEDWINDOW,
+            FALSE);
+        HWND window = CreateWindowExA(
+            0,
+            HOST_WINDOW_CLASS,
+            resolvedTitle.c_str(),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            rectangle.right - rectangle.left,
+            rectangle.bottom - rectangle.top,
+            nullptr,
+            nullptr,
+            instance,
+            impl);
+        if (!window) {
+            std::fprintf(
+                stderr,
+                "Sugarbomb host presentation: CreateWindowExA failed "
+                "with error %lu\n",
+                GetLastError());
+        } else {
+            impl->window.store(window, std::memory_order_release);
+            impl->guestHandle.store(
+                request.guestHandle,
+                std::memory_order_release);
+            RAWINPUTDEVICE rawMouse = {};
+            rawMouse.usUsagePage = 0x01;
+            rawMouse.usUsage = 0x02;
+            rawMouse.hwndTarget = window;
+            impl->rawMouseRegistered =
+                RegisterRawInputDevices(
+                    &rawMouse,
+                    1,
+                    sizeof(rawMouse)) != FALSE;
+            if (!impl->rawMouseRegistered) {
+                std::fprintf(
+                    stderr,
+                    "Sugarbomb host input: RegisterRawInputDevices "
+                    "failed with error %lu; using WM_MOUSEMOVE "
+                    "fallback\n",
+                    GetLastError());
+            }
+            std::printf(
+                "Sugarbomb host presentation: mapped guest HWND "
+                "0x%08X to native window %p on UI thread %lu "
+                "(%dx%d)\n",
+                request.guestHandle,
+                static_cast<void*>(window),
+                GetCurrentThreadId(),
+                safeWidth,
+                safeHeight);
+            succeeded =
+                applyNativeWindowSync(impl, request);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(impl->lifecycleMutex);
+        impl->startupSucceeded = succeeded;
+        impl->startupComplete = true;
+    }
+    impl->lifecycleCondition.notify_all();
+    if (!succeeded) {
+        HWND window =
+            impl->window.load(std::memory_order_acquire);
+        if (window) {
+            impl->intentionalDestroy = true;
+            DestroyWindow(window);
+        }
+        impl->windowThreadId.store(0, std::memory_order_release);
+        return;
+    }
+
+    MSG message = {};
+    while (true) {
+        const BOOL result =
+            GetMessageA(&message, nullptr, 0, 0);
+        if (result <= 0) {
+            break;
+        }
+        TranslateMessage(&message);
+        DispatchMessageA(&message);
+    }
+
+    HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (window) {
+        impl->intentionalDestroy = true;
+        DestroyWindow(window);
+    }
+    impl->windowThreadId.store(0, std::memory_order_release);
+}
+
+bool startHostWindowThread(
+    SugarbombHostWindow::Impl* impl,
+    const SugarbombHostWindow::Impl::SyncRequest& request) {
+    if (!impl) {
+        return false;
+    }
+    if (impl->windowThread.joinable()) {
+        impl->windowThread.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl->lifecycleMutex);
+        impl->startupRequest = request;
+        impl->startupComplete = false;
+        impl->startupSucceeded = false;
+    }
+    impl->intentionalDestroy = false;
+    impl->shuttingDown.store(false, std::memory_order_release);
+    impl->windowThread =
+        std::thread(hostWindowThreadMain, impl);
+
+    std::unique_lock<std::mutex> lock(impl->lifecycleMutex);
+    impl->lifecycleCondition.wait(
+        lock,
+        [impl]() {
+            return impl->startupComplete;
+        });
+    const bool succeeded = impl->startupSucceeded;
+    lock.unlock();
+    if (!succeeded && impl->windowThread.joinable()) {
+        impl->windowThread.join();
+    }
+    return succeeded;
 }
 
 } // namespace
@@ -399,109 +833,53 @@ void SugarbombHostWindow::syncGuestWindow(
     std::int32_t clientHeight,
     bool visible) {
 #ifdef _WIN32
-    if (presentationDisabled() || impl->userClosed) {
+    if (presentationDisabled() ||
+        impl->userClosed.load(std::memory_order_acquire)) {
         return;
     }
-    HINSTANCE instance = GetModuleHandleA(nullptr);
-    if (!registerHostWindowClass(instance)) {
-        std::fprintf(
-            stderr,
-            "Sugarbomb host presentation: RegisterClassExA failed "
-            "with error %lu\n",
-            GetLastError());
-        return;
-    }
-    const std::int32_t safeWidth =
-        std::max<std::int32_t>(1, std::min<std::int32_t>(clientWidth, 16384));
-    const std::int32_t safeHeight =
-        std::max<std::int32_t>(1, std::min<std::int32_t>(clientHeight, 16384));
-    const std::string resolvedTitle = title.empty()
-        ? "Fallout: New Vegas - Sugarbomb x64 host"
-        : title;
-    RECT rectangle = {0, 0, safeWidth, safeHeight};
-    AdjustWindowRect(&rectangle, WS_OVERLAPPEDWINDOW, FALSE);
+    Impl::SyncRequest request;
+    request.guestHandle = guestHandle;
+    request.title = title;
+    request.x = x;
+    request.y = y;
+    request.clientWidth = clientWidth;
+    request.clientHeight = clientHeight;
+    request.visible = visible;
 
-    if (!impl->window) {
-        impl->window = CreateWindowExA(
-            0,
-            HOST_WINDOW_CLASS,
-            resolvedTitle.c_str(),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rectangle.right - rectangle.left,
-            rectangle.bottom - rectangle.top,
-            nullptr,
-            nullptr,
-            instance,
-            impl);
-        if (!impl->window) {
-            std::fprintf(
-                stderr,
-                "Sugarbomb host presentation: CreateWindowExA failed "
-                "with error %lu\n",
-                GetLastError());
+    HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window) {
+        if (startHostWindowThread(impl, request)) {
+            std::lock_guard<std::mutex> lock(
+                impl->syncStateMutex);
+            impl->lastSyncRequest = request;
+            impl->lastSyncRequestValid = true;
+        }
+        return;
+    }
+    if (impl->guestHandle.load(std::memory_order_acquire) !=
+        guestHandle) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(
+            impl->syncStateMutex);
+        if (impl->lastSyncRequestValid &&
+            sameSyncRequest(
+                impl->lastSyncRequest,
+                request)) {
             return;
         }
-        impl->guestHandle = guestHandle;
-        RAWINPUTDEVICE rawMouse = {};
-        rawMouse.usUsagePage = 0x01;
-        rawMouse.usUsage = 0x02;
-        rawMouse.hwndTarget = impl->window;
-        impl->rawMouseRegistered =
-            RegisterRawInputDevices(
-                &rawMouse,
-                1,
-                sizeof(rawMouse)) != FALSE;
-        if (!impl->rawMouseRegistered) {
-            std::fprintf(
-                stderr,
-                "Sugarbomb host input: RegisterRawInputDevices failed "
-                "with error %lu; using WM_MOUSEMOVE fallback\n",
-                GetLastError());
-        }
-        std::printf(
-            "Sugarbomb host presentation: mapped guest HWND 0x%08X to "
-            "native window %p (%dx%d)\n",
-            guestHandle,
-            static_cast<void*>(impl->window),
-            safeWidth,
-            safeHeight);
     }
-    if (impl->guestHandle != guestHandle) {
-        return;
-    }
-    SetWindowTextA(impl->window, resolvedTitle.c_str());
-    SetWindowPos(
-        impl->window,
-        nullptr,
-        x,
-        y,
-        rectangle.right - rectangle.left,
-        rectangle.bottom - rectangle.top,
-        SWP_NOACTIVATE | SWP_NOZORDER);
-    if (impl->mouseCaptured) {
-        setMouseCapture(true);
-    }
-    bool becameVisible = visible && !impl->visible;
-    bool becameHidden = !visible && impl->visible;
-    if (becameVisible) {
-        ShowWindow(impl->window, SW_SHOW);
-        BOOL foreground = SetForegroundWindow(impl->window);
-        bool ownsForeground =
-            foreground || GetForegroundWindow() == impl->window;
-        std::printf(
-            "Sugarbomb host presentation: requested native activation "
-            "for guest HWND 0x%08X (foreground=%u, owned=%u)\n",
-            guestHandle,
-            foreground ? 1 : 0,
-            ownsForeground ? 1 : 0);
-    } else if (becameHidden) {
-        ShowWindow(impl->window, SW_HIDE);
-    }
-    impl->visible = visible;
-    if (impl->visible) {
-        UpdateWindow(impl->window);
+    if (SendMessageA(
+            window,
+            WM_SUGARBOMB_SYNC,
+            0,
+            reinterpret_cast<LPARAM>(&request))) {
+        std::lock_guard<std::mutex> lock(
+            impl->syncStateMutex);
+        impl->lastSyncRequest = request;
+        impl->lastSyncRequestValid = true;
     }
 #else
     (void)guestHandle;
@@ -516,11 +894,62 @@ void SugarbombHostWindow::syncGuestWindow(
 
 bool SugarbombHostWindow::activateGuestWindow(std::uint32_t guestHandle) {
 #ifdef _WIN32
-    if (!impl->window || impl->guestHandle != guestHandle) {
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window ||
+        impl->guestHandle.load(std::memory_order_acquire) !=
+            guestHandle) {
         return false;
     }
-    BOOL foreground = SetForegroundWindow(impl->window);
-    return foreground || GetForegroundWindow() == impl->window;
+    return SendMessageA(
+        window,
+        WM_SUGARBOMB_ACTIVATE,
+        guestHandle,
+        0) != FALSE;
+#else
+    (void)guestHandle;
+    return true;
+#endif
+}
+
+bool SugarbombHostWindow::setActiveGuestWindow(
+    std::uint32_t guestHandle) {
+#ifdef _WIN32
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window ||
+        (guestHandle &&
+         impl->guestHandle.load(std::memory_order_acquire) !=
+             guestHandle)) {
+        return false;
+    }
+    return SendMessageA(
+        window,
+        WM_SUGARBOMB_SET_ACTIVE,
+        guestHandle,
+        0) != FALSE;
+#else
+    (void)guestHandle;
+    return true;
+#endif
+}
+
+bool SugarbombHostWindow::focusGuestWindow(
+    std::uint32_t guestHandle) {
+#ifdef _WIN32
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window ||
+        (guestHandle &&
+         impl->guestHandle.load(std::memory_order_acquire) !=
+             guestHandle)) {
+        return false;
+    }
+    return SendMessageA(
+        window,
+        WM_SUGARBOMB_SET_FOCUS,
+        guestHandle,
+        0) != FALSE;
 #else
     (void)guestHandle;
     return true;
@@ -530,9 +959,54 @@ bool SugarbombHostWindow::activateGuestWindow(std::uint32_t guestHandle) {
 bool SugarbombHostWindow::isGuestWindowForeground(
     std::uint32_t guestHandle) const {
 #ifdef _WIN32
-    return impl->window &&
-        impl->guestHandle == guestHandle &&
-        GetForegroundWindow() == impl->window;
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    return window &&
+        impl->guestHandle.load(std::memory_order_acquire) ==
+            guestHandle &&
+        GetForegroundWindow() == window;
+#else
+    (void)guestHandle;
+    return true;
+#endif
+}
+
+bool SugarbombHostWindow::isGuestWindowActive(
+    std::uint32_t guestHandle) const {
+#ifdef _WIN32
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window ||
+        impl->guestHandle.load(std::memory_order_acquire) !=
+            guestHandle) {
+        return false;
+    }
+    return SendMessageA(
+        window,
+        WM_SUGARBOMB_QUERY_ACTIVE,
+        0,
+        0) != FALSE;
+#else
+    (void)guestHandle;
+    return true;
+#endif
+}
+
+bool SugarbombHostWindow::isGuestWindowFocused(
+    std::uint32_t guestHandle) const {
+#ifdef _WIN32
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window ||
+        impl->guestHandle.load(std::memory_order_acquire) !=
+            guestHandle) {
+        return false;
+    }
+    return SendMessageA(
+        window,
+        WM_SUGARBOMB_QUERY_FOCUS,
+        0,
+        0) != FALSE;
 #else
     (void)guestHandle;
     return true;
@@ -541,9 +1015,14 @@ bool SugarbombHostWindow::isGuestWindowForeground(
 
 void SugarbombHostWindow::setCursorVisible(bool visible) {
 #ifdef _WIN32
-    impl->cursorVisible = visible;
-    if (impl->window) {
-        SetCursor(visible ? LoadCursorA(nullptr, IDC_ARROW) : nullptr);
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (window) {
+        SendMessageA(
+            window,
+            WM_SUGARBOMB_CURSOR,
+            visible ? 1 : 0,
+            0);
     }
 #else
     (void)visible;
@@ -552,35 +1031,14 @@ void SugarbombHostWindow::setCursorVisible(bool visible) {
 
 bool SugarbombHostWindow::setMouseCapture(bool captured) {
 #ifdef _WIN32
-    if (!captured) {
-        bool wasCaptured = impl->mouseCaptured;
-        releaseNativeMouseCapture(impl);
-        if (wasCaptured) {
-            std::printf(
-                "Sugarbomb host input: released exclusive mouse capture\n");
-        }
-        return true;
-    }
-    if (!impl->window ||
-        GetForegroundWindow() != impl->window) {
-        return false;
-    }
-    bool wasCaptured = impl->mouseCaptured;
-    SetCapture(impl->window);
-    if (GetCapture() != impl->window ||
-        !clipNativeMouseToClient(impl)) {
-        if (GetCapture() == impl->window) {
-            ReleaseCapture();
-        }
-        ClipCursor(nullptr);
-        return false;
-    }
-    impl->mouseCaptured = true;
-    if (!wasCaptured) {
-        std::printf(
-            "Sugarbomb host input: acquired exclusive mouse capture\n");
-    }
-    return true;
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    return window &&
+        SendMessageA(
+            window,
+            WM_SUGARBOMB_CAPTURE,
+            captured ? 1 : 0,
+            0) != FALSE;
 #else
     (void)captured;
     return true;
@@ -589,27 +1047,30 @@ bool SugarbombHostWindow::setMouseCapture(bool captured) {
 
 void SugarbombHostWindow::destroyGuestWindow(std::uint32_t guestHandle) {
 #ifdef _WIN32
-    if (!impl->window || impl->guestHandle != guestHandle) {
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window ||
+        impl->guestHandle.load(std::memory_order_acquire) !=
+            guestHandle) {
         return;
     }
-    if (impl->rawMouseRegistered) {
-        RAWINPUTDEVICE rawMouse = {};
-        rawMouse.usUsagePage = 0x01;
-        rawMouse.usUsage = 0x02;
-        rawMouse.dwFlags = RIDEV_REMOVE;
-        RegisterRawInputDevices(
-            &rawMouse,
-            1,
-            sizeof(rawMouse));
-        impl->rawMouseRegistered = false;
+    SendMessageA(window, WM_SUGARBOMB_DESTROY, 0, 0);
+    if (impl->windowThread.joinable()) {
+        impl->windowThread.join();
     }
-    impl->intentionalDestroy = true;
-    DestroyWindow(impl->window);
     impl->intentionalDestroy = false;
-    impl->userClosed = false;
-    impl->guestHandle = 0;
-    impl->visible = false;
-    impl->framePixels.clear();
+    impl->userClosed.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(
+            impl->syncStateMutex);
+        impl->lastSyncRequestValid = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl->frameMutex);
+        impl->framePixels.clear();
+        impl->frameWidth = 0;
+        impl->frameHeight = 0;
+    }
 #else
     (void)guestHandle;
 #endif
@@ -617,19 +1078,17 @@ void SugarbombHostWindow::destroyGuestWindow(std::uint32_t guestHandle) {
 
 bool SugarbombHostWindow::pumpMessages(std::vector<Event>* events) {
 #ifdef _WIN32
-    MSG message = {};
-    while (PeekMessageA(&message, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&message);
-        DispatchMessageA(&message);
+    {
+        std::lock_guard<std::mutex> lock(impl->eventMutex);
+        if (events && !impl->pendingEvents.empty()) {
+            events->insert(
+                events->end(),
+                impl->pendingEvents.begin(),
+                impl->pendingEvents.end());
+        }
+        impl->pendingEvents.clear();
     }
-    if (events && !impl->pendingEvents.empty()) {
-        events->insert(
-            events->end(),
-            impl->pendingEvents.begin(),
-            impl->pendingEvents.end());
-    }
-    impl->pendingEvents.clear();
-    return !impl->userClosed;
+    return !impl->userClosed.load(std::memory_order_acquire);
 #else
     (void)events;
     return true;
@@ -638,7 +1097,8 @@ bool SugarbombHostWindow::pumpMessages(std::vector<Event>* events) {
 
 std::uintptr_t SugarbombHostWindow::nativeHandle() const {
 #ifdef _WIN32
-    return reinterpret_cast<std::uintptr_t>(impl->window);
+    return reinterpret_cast<std::uintptr_t>(
+        impl->window.load(std::memory_order_acquire));
 #else
     return 0;
 #endif
@@ -649,19 +1109,20 @@ void SugarbombHostWindow::present(
     std::uint32_t width,
     std::uint32_t height) {
 #ifdef _WIN32
-    if (!impl->window || !pixels || !width || !height) {
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (!window || !pixels || !width || !height) {
         return;
     }
     const std::size_t pixelCount =
         static_cast<std::size_t>(width) * height;
-    impl->framePixels.assign(pixels, pixels + pixelCount);
-    impl->frameWidth = width;
-    impl->frameHeight = height;
-    HDC deviceContext = GetDC(impl->window);
-    if (deviceContext) {
-        paintHostWindow(impl, deviceContext);
-        ReleaseDC(impl->window, deviceContext);
+    {
+        std::lock_guard<std::mutex> lock(impl->frameMutex);
+        impl->framePixels.assign(pixels, pixels + pixelCount);
+        impl->frameWidth = width;
+        impl->frameHeight = height;
     }
+    PostMessageA(window, WM_SUGARBOMB_PRESENT, 0, 0);
     ++impl->presentCount;
     if (impl->presentCount == 1) {
         std::printf(
@@ -679,25 +1140,36 @@ void SugarbombHostWindow::present(
 
 void SugarbombHostWindow::shutdown() {
 #ifdef _WIN32
-    impl->shuttingDown = true;
-    releaseNativeMouseCapture(impl);
-    if (impl->rawMouseRegistered) {
-        RAWINPUTDEVICE rawMouse = {};
-        rawMouse.usUsagePage = 0x01;
-        rawMouse.usUsage = 0x02;
-        rawMouse.dwFlags = RIDEV_REMOVE;
-        RegisterRawInputDevices(
-            &rawMouse,
-            1,
-            sizeof(rawMouse));
-        impl->rawMouseRegistered = false;
+    impl->shuttingDown.store(true, std::memory_order_release);
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    if (window) {
+        SendMessageA(window, WM_SUGARBOMB_DESTROY, 0, 0);
+    } else {
+        const DWORD threadId =
+            impl->windowThreadId.load(std::memory_order_acquire);
+        if (threadId) {
+            PostThreadMessageA(threadId, WM_QUIT, 0, 0);
+        }
     }
-    if (impl->window) {
-        DestroyWindow(impl->window);
+    if (impl->windowThread.joinable()) {
+        impl->windowThread.join();
     }
-    pumpMessages();
+    {
+        std::lock_guard<std::mutex> lock(
+            impl->syncStateMutex);
+        impl->lastSyncRequestValid = false;
+    }
 #endif
-    impl->framePixels.clear();
-    impl->pendingEvents.clear();
+    {
+        std::lock_guard<std::mutex> lock(impl->frameMutex);
+        impl->framePixels.clear();
+        impl->frameWidth = 0;
+        impl->frameHeight = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl->eventMutex);
+        impl->pendingEvents.clear();
+    }
     impl->visible = false;
 }

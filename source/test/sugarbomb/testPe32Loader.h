@@ -15,5 +15,6 @@ void testPe32LoaderMapsAndExecutesImage();
 void testSugarbombThunkArena();
 void testSugarbombNativeBridge();
 void testSugarbombNativeBridgeControlTransfer();
+void testSugarbombHostWindowLifecycle();
 
 #endif

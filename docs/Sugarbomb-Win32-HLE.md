@@ -233,18 +233,21 @@ dependency order and validate each group with small guest fixtures:
    ordinary launches, mapping `Data/NVSE/Plugins/*.dll`, and implementing the
    NVSE plugin-query/load, messaging, and interface contracts.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
-   message-loop behavior. The guest/native HWND bridge and host message pump
-   create visible output. `PeekMessageA`, `DispatchMessageA`, and `SendMessageA`
-   now deliver lifecycle plus native keyboard/mouse/focus events to Fallout's
-   guest WndProc. The native top-level window is the focus authority: ordinary
-   Windows activation, clicking, and Alt-Tab determine whether Fallout's
-   foreground DirectInput devices may be acquired. The same host event stream
-   feeds keyboard and mouse DirectInput state plus buffered menu events. Raw
-   mouse motion and exclusive foreground capture follow the native window
-   lifecycle; focus loss, capture revocation, and cancel-mode transitions
-   release ownership so Fallout can reacquire it normally. Remaining work
-   includes cursor-coordinate validation, deterministic menu actions, and
-   XInput device state.
+   message-loop behavior. Fallout's mapped top-level `HWND` now belongs to a
+   dedicated native UI thread with an independent Windows message loop, so the
+   desktop window remains responsive while the x86 guest translates or blocks.
+   `PeekMessageA`, `DispatchMessageA`, and `SendMessageA` deliver lifecycle plus
+   native keyboard/mouse/focus events to Fallout's guest WndProc. Startup uses
+   ordinary `ShowWindow` behavior rather than forcing foreground ownership.
+   Native activation, clicking, and Alt-Tab are authoritative, and guest calls
+   to `GetForegroundWindow`, `GetActiveWindow`, `GetFocus`, `SetActiveWindow`,
+   `SetFocus`, and `SetForegroundWindow` are reflected through the real window.
+   The same host event stream feeds keyboard and mouse DirectInput state plus
+   buffered menu events. Raw mouse motion and exclusive foreground capture
+   follow the native window lifecycle; focus loss, capture revocation, and
+   cancel-mode transitions release ownership so Fallout can reacquire it
+   normally. Remaining work includes cursor-coordinate validation,
+   deterministic menu actions, and XInput device state.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
    Sugarbomb's renderer. The guest COM/resource model, native presentation
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
@@ -267,7 +270,7 @@ From the repository root:
 
 ```powershell
 .\tools\sugarbomb\build-win64.ps1 -Configuration Test
-.\project\msvc\BoxedWine\x64\Test\BoxedWine.exe 0 5 1
+.\project\msvc\BoxedWine\x64\Test\BoxedWine.exe 0 6 1
 
 .\tools\sugarbomb\build-win64.ps1 -Configuration Release
 .\tools\sugarbomb\inspect-pe32.ps1 'D:\path\to\FalloutNV.exe'

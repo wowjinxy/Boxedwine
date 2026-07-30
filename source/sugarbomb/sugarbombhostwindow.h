@@ -45,7 +45,11 @@ public:
         std::int32_t clientHeight,
         bool visible);
     bool activateGuestWindow(std::uint32_t guestHandle);
+    bool setActiveGuestWindow(std::uint32_t guestHandle);
+    bool focusGuestWindow(std::uint32_t guestHandle);
     bool isGuestWindowForeground(std::uint32_t guestHandle) const;
+    bool isGuestWindowActive(std::uint32_t guestHandle) const;
+    bool isGuestWindowFocused(std::uint32_t guestHandle) const;
     void setCursorVisible(bool visible);
     bool setMouseCapture(bool captured);
     void destroyGuestWindow(std::uint32_t guestHandle);

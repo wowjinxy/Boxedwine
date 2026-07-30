@@ -280,6 +280,12 @@ private:
         S32 pointY = 0;
     };
 
+    enum class NativeWindowState {
+        Active,
+        Focused,
+        Foreground
+    };
+
     struct PendingWndProcDispatch {
         U32 nativeThunkStackPointer = 0;
         U32 nativeThunkResumeEip = 0;
@@ -572,9 +578,11 @@ private:
         const SugarbombHostWindow::Event& event) {
         constexpr U32 WM_ACTIVATE_GUEST = 0x0006;
         constexpr U32 WM_SETFOCUS_GUEST = 0x0007;
+        constexpr U32 WM_KILLFOCUS_GUEST = 0x0008;
         constexpr U32 WM_ACTIVATEAPP_GUEST = 0x001c;
         if (event.message != WM_ACTIVATE_GUEST &&
             event.message != WM_SETFOCUS_GUEST &&
+            event.message != WM_KILLFOCUS_GUEST &&
             event.message != WM_ACTIVATEAPP_GUEST) {
             return;
         }
@@ -2611,6 +2619,16 @@ private:
                 stackCleanupBytes = 8;
             } else if (symbol == "GetActiveWindow") {
                 callback = callbackGetActiveWindow;
+            } else if (symbol == "GetForegroundWindow") {
+                callback = callbackGetForegroundWindow;
+            } else if (symbol == "GetFocus") {
+                callback = callbackGetFocus;
+            } else if (symbol == "SetActiveWindow") {
+                callback = callbackSetActiveWindow;
+                stackCleanupBytes = 4;
+            } else if (symbol == "SetFocus") {
+                callback = callbackSetFocus;
+                stackCleanupBytes = 4;
             } else if (symbol == "SetForegroundWindow") {
                 callback = callbackSetForegroundWindow;
                 stackCleanupBytes = 4;
@@ -3903,7 +3921,55 @@ private:
     static void callbackGetActiveWindow(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "USER32!GetActiveWindow");
         if (session) {
-            cpu->reg[0].u32 = session->activeWindow;
+            cpu->reg[0].u32 =
+                session->guestWindowWithNativeState(
+                    NativeWindowState::Active);
+        }
+    }
+
+    static void callbackGetForegroundWindow(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "USER32!GetForegroundWindow");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->guestWindowWithNativeState(
+                    NativeWindowState::Foreground);
+        }
+    }
+
+    static void callbackGetFocus(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "USER32!GetFocus");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->guestWindowWithNativeState(
+                    NativeWindowState::Focused);
+        }
+    }
+
+    static void callbackSetActiveWindow(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "USER32!SetActiveWindow");
+        if (session) {
+            U32 previous = session->guestWindowWithNativeState(
+                NativeWindowState::Active);
+            cpu->reg[0].u32 =
+                session->setActiveGuestWindow(argument(cpu, 0))
+                ? previous
+                : 0;
+        }
+    }
+
+    static void callbackSetFocus(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "USER32!SetFocus");
+        if (session) {
+            U32 previous = session->guestWindowWithNativeState(
+                NativeWindowState::Focused);
+            cpu->reg[0].u32 =
+                session->focusGuestWindow(argument(cpu, 0))
+                ? previous
+                : 0;
         }
     }
 
@@ -15758,6 +15824,71 @@ private:
         }
         enqueueGuestMessage(handle, 0x000f, 0, 0); // WM_PAINT
         return true;
+    }
+
+    U32 guestWindowWithNativeState(
+        NativeWindowState state) const {
+        U32 topLevel = topLevelGuestWindow(activeWindow);
+        if (!hostWindow.nativeHandle()) {
+            return topLevel;
+        }
+        if (!topLevel) {
+            return 0;
+        }
+        bool ownsState = false;
+        switch (state) {
+        case NativeWindowState::Active:
+            ownsState =
+                hostWindow.isGuestWindowActive(topLevel);
+            break;
+        case NativeWindowState::Focused:
+            ownsState =
+                hostWindow.isGuestWindowFocused(topLevel);
+            break;
+        case NativeWindowState::Foreground:
+            ownsState =
+                hostWindow.isGuestWindowForeground(topLevel);
+            break;
+        }
+        return ownsState ? topLevel : 0;
+    }
+
+    bool setActiveGuestWindow(U32 handle) {
+        if (!handle) {
+            if (hostWindow.nativeHandle()) {
+                return hostWindow.setActiveGuestWindow(0);
+            }
+            activeWindow = 0;
+            return true;
+        }
+        U32 topLevel = topLevelGuestWindow(handle);
+        if (!topLevel || !guestWindows.count(topLevel)) {
+            setLastError(1400);
+            return false;
+        }
+        if (hostWindow.nativeHandle()) {
+            return hostWindow.setActiveGuestWindow(topLevel);
+        }
+        return activateGuestWindow(topLevel);
+    }
+
+    bool focusGuestWindow(U32 handle) {
+        if (!handle) {
+            if (hostWindow.nativeHandle()) {
+                return hostWindow.focusGuestWindow(0);
+            }
+            activeWindow = 0;
+            return true;
+        }
+        U32 topLevel = topLevelGuestWindow(handle);
+        if (!topLevel || !guestWindows.count(topLevel)) {
+            setLastError(1400);
+            return false;
+        }
+        if (hostWindow.nativeHandle()) {
+            return hostWindow.focusGuestWindow(topLevel);
+        }
+        return activateGuestWindow(topLevel);
     }
 
     bool activateGuestWindow(U32 handle) {
