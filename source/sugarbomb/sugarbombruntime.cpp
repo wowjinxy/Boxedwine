@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -48,7 +49,6 @@ constexpr U32 CHILD_STACK_FIRST_TOP = STACK_BASE;
 constexpr U32 CHILD_ENV_FIRST_BASE = 0x7ffc0000;
 constexpr U32 CHILD_ENV_SIZE = 0x00010000;
 constexpr U32 CHILD_TLS_ARRAY_OFFSET = 0x0000;
-constexpr U32 CHILD_STATIC_TLS_OFFSET = 0x0400;
 constexpr U32 CHILD_TEB_OFFSET = 0xe000;
 constexpr U32 ENV_BASE = 0x7ffd8000;
 constexpr U32 ENV_SIZE = 0x00008000;
@@ -56,8 +56,6 @@ constexpr U32 ANSI_COMMAND_LINE = 0x7ffd8000;
 constexpr U32 WIDE_IMAGE_PATH = 0x7ffd8800;
 constexpr U32 WIDE_COMMAND_LINE = 0x7ffd9000;
 constexpr U32 TLS_ARRAY = 0x7ffda000;
-constexpr U32 STATIC_TLS_DATA = 0x7ffda400;
-constexpr U32 STATIC_TLS_CAPACITY = 0x00000c00;
 constexpr U32 ANSI_ENVIRONMENT = 0x7ffdb000;
 constexpr U32 WIDE_ENVIRONMENT = 0x7ffdb400;
 constexpr U32 PROCESS_PARAMETERS = 0x7ffdc000;
@@ -174,7 +172,9 @@ private:
         None,
         KernelObjects,
         Sleep,
-        CriticalSection
+        CriticalSection,
+        SlimReaderWriterLock,
+        ConditionVariable
     };
 
     struct GuestThreadState {
@@ -185,7 +185,7 @@ private:
         U32 environmentBase = 0;
         U32 tebAddress = 0;
         U32 tlsArray = 0;
-        U32 staticTlsData = 0;
+        std::vector<U32> staticTlsBlocks;
         U32 suspendCount = 0;
         U32 exitCode = STILL_ACTIVE;
         std::string name;
@@ -196,6 +196,42 @@ private:
         U64 waitDeadline = 0;
         bool waitAll = false;
         U32 waitCriticalSectionAddress = 0;
+        U32 waitSlimReaderWriterLockAddress = 0;
+        bool waitSlimReaderWriterLockExclusive = false;
+        U32 waitConditionVariableAddress = 0;
+        bool waitConditionVariableSignaled = false;
+    };
+
+    struct StaticTlsTemplate {
+        U32 moduleBase = 0;
+        U32 slot = 0;
+        U32 rawStart = 0;
+        U32 rawSize = 0;
+        U32 zeroFillSize = 0;
+        std::vector<U32> callbacks;
+    };
+
+    struct GuestModuleInitializer {
+        U32 address = 0;
+        U32 moduleBase = 0;
+        bool requireSuccess = false;
+        bool marksModuleInitialized = false;
+        std::string label;
+    };
+
+    struct GuestOnExitTable {
+        U32 allocation = 0;
+        U32 capacity = 0;
+        bool owned = false;
+    };
+
+    struct PendingGuestFunctionArray {
+        U32 nativeThunkStackPointer = 0;
+        U32 nativeThunkResumeEip = 0;
+        std::vector<U32> functions;
+        std::size_t nextIndex = 0;
+        bool stopOnFailure = false;
+        std::string label;
     };
 
     struct GuestModule {
@@ -720,9 +756,29 @@ private:
             "sugarbomb",
             "GuestWndProcReturn",
             callbackGuestWndProcReturn);
+        U32 moduleInitializerReturnCallback =
+            SugarbombBridge::registerCallback(
+                "sugarbomb",
+                "GuestModuleInitializerReturn",
+                callbackGuestModuleInitializerReturn);
+        U32 guestFunctionArrayReturnCallback =
+            SugarbombBridge::registerCallback(
+                "sugarbomb",
+                "GuestFunctionArrayReturn",
+                callbackGuestFunctionArrayReturn);
         if (!thunks.createThunk(exitCallback, 0, entryReturnThunk, error) ||
             !thunks.createThunk(threadExitCallback, 0, threadReturnThunk, error) ||
             !thunks.createThunk(wndProcReturnCallback, 0, wndProcReturnThunk, error) ||
+            !thunks.createThunk(
+                moduleInitializerReturnCallback,
+                0,
+                moduleInitializerReturnThunk,
+                error) ||
+            !thunks.createThunk(
+                guestFunctionArrayReturnCallback,
+                0,
+                guestFunctionArrayReturnThunk,
+                error) ||
             !initializeDirectInputComThunks() ||
             !initializeDirectSoundComThunks() ||
             !initializeDirectShowComThunks() ||
@@ -733,13 +789,23 @@ private:
             return false;
         }
 
-        if (!initializeStaticTls()) {
-            fprintf(stderr, "Sugarbomb could not initialize PE static TLS: %s\n", error.c_str());
-            return false;
-        }
         initializeWindowsEnvironment();
         initializeCpu();
         registerMainGuestThread();
+        if (!initializeStaticTlsModules()) {
+            fprintf(
+                stderr,
+                "Sugarbomb could not initialize PE static TLS modules: %s\n",
+                error.c_str());
+            return false;
+        }
+        if (!prepareBundledNvseInitialization()) {
+            fprintf(
+                stderr,
+                "Sugarbomb could not prepare NVSE initialization: %s\n",
+                error.c_str());
+            return false;
+        }
         initializeFalloutBootstrapObjects();
         printf(
             "Sugarbomb: mapped PE32 guest at 0x%08X-0x%08X; entry 0x%08X\n",
@@ -1442,11 +1508,21 @@ private:
                 Direct3DResourceKind::Query);
     }
 
-    bool initializeStaticTls() {
-        if (!image.info.tlsDirectoryRva || image.info.tlsDirectorySize < 24) {
+    bool appendStaticTlsTemplate(const Pe32MappedImage& mapped) {
+        if (!mapped.info.tlsDirectoryRva ||
+            mapped.info.tlsDirectorySize < 24) {
             return true;
         }
-        U32 directory = image.loadBase + image.info.tlsDirectoryRva;
+        if (nextTlsIndex >= 64) {
+            error = "PE static TLS module count exceeds the guest TLS array";
+            return false;
+        }
+        U32 directory =
+            mapped.loadBase + mapped.info.tlsDirectoryRva;
+        if (!memory->canRead(directory, 24)) {
+            error = "PE TLS directory is outside the mapped module";
+            return false;
+        }
         U32 rawStart = memory->readd(directory + 0);
         U32 rawEnd = memory->readd(directory + 4);
         U32 indexAddress = memory->readd(directory + 8);
@@ -1458,41 +1534,427 @@ private:
         }
         U32 rawSize = rawEnd - rawStart;
         U64 totalSize = static_cast<U64>(rawSize) + zeroFillSize;
-        if (!indexAddress || totalSize > STATIC_TLS_CAPACITY ||
+        constexpr U32 MAX_STATIC_TLS_BYTES = 64 * 1024 * 1024;
+        if (!indexAddress ||
+            !memory->canWrite(indexAddress, 4) ||
+            totalSize > MAX_STATIC_TLS_BYTES ||
             (rawSize && !memory->canRead(rawStart, rawSize))) {
-            error = "PE TLS template does not fit the bootstrap TLS storage";
+            error = "PE TLS template is invalid or too large";
             return false;
         }
 
-        memory->writed(indexAddress, 0);
-        memory->writed(TLS_ARRAY, STATIC_TLS_DATA);
-        staticTlsRawStart = rawStart;
-        staticTlsRawSize = rawSize;
-        staticTlsZeroFillSize = zeroFillSize;
-        if (rawSize) {
-            memory->memcpy(STATIC_TLS_DATA, rawStart, rawSize);
-        }
-        if (zeroFillSize) {
-            memory->memset(STATIC_TLS_DATA + rawSize, 0, zeroFillSize);
-        }
-        nextTlsIndex = 1;
+        StaticTlsTemplate tls;
+        tls.moduleBase = mapped.loadBase;
+        tls.slot = nextTlsIndex++;
+        tls.rawStart = rawStart;
+        tls.rawSize = rawSize;
+        tls.zeroFillSize = zeroFillSize;
+        memory->writed(indexAddress, tls.slot);
 
-        U32 callbackCount = 0;
         if (callbacksAddress) {
-            while (callbackCount < 1024 && memory->canRead(callbacksAddress + callbackCount * 4, 4)) {
-                U32 callback = memory->readd(callbacksAddress + callbackCount * 4);
+            for (U32 index = 0; index < 1024; ++index) {
+                U32 entryAddress = callbacksAddress + index * 4;
+                if (!memory->canRead(entryAddress, 4)) {
+                    error = "PE TLS callback array is outside the module";
+                    return false;
+                }
+                U32 callback = memory->readd(entryAddress);
                 if (!callback) {
                     break;
                 }
-                ++callbackCount;
+                if (!memory->canRead(callback, 1)) {
+                    error = "PE TLS callback points outside guest code";
+                    return false;
+                }
+                tls.callbacks.push_back(callback);
+                if (index == 1023) {
+                    error = "PE TLS callback array is not terminated";
+                    return false;
+                }
             }
         }
         printf(
-            "Sugarbomb: initialized PE static TLS slot 0 (%u template bytes, %u zero-fill bytes, %u callbacks)\n",
-            rawSize,
-            zeroFillSize,
-            callbackCount);
+            "Sugarbomb Win32 loader: registered static TLS slot %u "
+            "for module 0x%08X (%u template bytes, %u zero-fill "
+            "bytes, %zu callbacks)\n",
+            tls.slot,
+            tls.moduleBase,
+            tls.rawSize,
+            tls.zeroFillSize,
+            tls.callbacks.size());
+        staticTlsTemplates.push_back(std::move(tls));
         return true;
+    }
+
+    bool initializeThreadStaticTlsTemplate(
+        GuestThreadState& state,
+        const StaticTlsTemplate& tls) {
+        U32 totalSize = tls.rawSize + tls.zeroFillSize;
+        U32 block = allocateGuestHeap(totalSize, true);
+        if (!block) {
+            error = "Unable to allocate a guest static TLS block";
+            return false;
+        }
+        if (tls.rawSize) {
+            memory->memcpy(block, tls.rawStart, tls.rawSize);
+        }
+        memory->writed(
+            state.tlsArray + tls.slot * sizeof(U32),
+            block);
+        state.staticTlsBlocks.push_back(block);
+        return true;
+    }
+
+    bool initializeThreadStaticTls(GuestThreadState& state) {
+        if (!state.tlsArray ||
+            !memory->canWrite(state.tlsArray, 64 * sizeof(U32))) {
+            error = "Guest thread TLS array is invalid";
+            return false;
+        }
+        memory->memset(state.tlsArray, 0, 64 * sizeof(U32));
+        for (const StaticTlsTemplate& tls : staticTlsTemplates) {
+            if (!initializeThreadStaticTlsTemplate(state, tls)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool initializeStaticTlsModules() {
+        staticTlsTemplates.clear();
+        nextTlsIndex = 0;
+        if (!appendStaticTlsTemplate(image)) {
+            return false;
+        }
+        for (U32 moduleHandle : guestModuleLoadOrder) {
+            auto found = guestModules.find(moduleHandle);
+            if (found != guestModules.end() &&
+                !appendStaticTlsTemplate(found->second.image)) {
+                return false;
+            }
+        }
+        GuestThreadState* mainState = findGuestThread(thread->id);
+        if (!mainState ||
+            !initializeThreadStaticTls(*mainState)) {
+            return false;
+        }
+        staticTlsInitialized = true;
+        return true;
+    }
+
+    bool scheduleGuestModuleInitializer(CPU* guestCpu) {
+        if (guestModuleInitializerIndex >=
+            guestModuleInitializers.size()) {
+            initializeCpu();
+            printf(
+                "Sugarbomb Win32 loader: guest module initialization "
+                "completed; transferring to Fallout entry 0x%08X\n",
+                image.entryPoint);
+            return true;
+        }
+        const GuestModuleInitializer& initializer =
+            guestModuleInitializers[guestModuleInitializerIndex];
+        constexpr U32 INITIALIZER_FRAME_BYTES = 16;
+        U32 stackPointer = STACK_TOP - INITIALIZER_FRAME_BYTES;
+        if (!initializer.address ||
+            !memory->canRead(initializer.address, 1) ||
+            !memory->canWrite(
+                stackPointer,
+                INITIALIZER_FRAME_BYTES)) {
+            error = "Guest module initializer or stack frame is invalid";
+            return false;
+        }
+        memory->writed(
+            stackPointer,
+            moduleInitializerReturnThunk);
+        memory->writed(stackPointer + 4, initializer.moduleBase);
+        memory->writed(stackPointer + 8, 1); // DLL_PROCESS_ATTACH
+        memory->writed(stackPointer + 12, 0);
+        guestCpu->reg[4].u32 = stackPointer;
+        guestCpu->eip.u32 = initializer.address;
+        guestCpu->nextOp = nullptr;
+        printf(
+            "Sugarbomb Win32 loader: calling %s at 0x%08X "
+            "(module=0x%08X, reason=DLL_PROCESS_ATTACH)\n",
+            initializer.label.c_str(),
+            initializer.address,
+            initializer.moduleBase);
+        return true;
+    }
+
+    bool prepareBundledNvseInitialization() {
+        const char* configured =
+            std::getenv("SUGARBOMB_RUN_NVSE_ENTRY");
+        if (!configured ||
+            !*configured ||
+            std::strcmp(configured, "0") == 0) {
+            return true;
+        }
+        U32 moduleBase = guestModuleHandle("nvse_1_4.dll");
+        auto module = guestModules.find(moduleBase);
+        if (!moduleBase || module == guestModules.end()) {
+            error =
+                "SUGARBOMB_RUN_NVSE_ENTRY requested but nvse_1_4.dll "
+                "was not staged";
+            return false;
+        }
+
+        guestModuleInitializers.clear();
+        guestModuleInitializerIndex = 0;
+        const StaticTlsTemplate* tls = nullptr;
+        for (const StaticTlsTemplate& candidate :
+             staticTlsTemplates) {
+            if (candidate.moduleBase == moduleBase) {
+                tls = &candidate;
+                break;
+            }
+        }
+        if (tls) {
+            for (std::size_t index = 0;
+                 index < tls->callbacks.size();
+                 ++index) {
+                GuestModuleInitializer initializer;
+                initializer.address = tls->callbacks[index];
+                initializer.moduleBase = moduleBase;
+                initializer.label =
+                    "nvse_1_4.dll TLS callback #" +
+                    std::to_string(index + 1);
+                guestModuleInitializers.push_back(
+                    std::move(initializer));
+            }
+        }
+        if (module->second.image.info.entryPointRva) {
+            GuestModuleInitializer initializer;
+            initializer.address =
+                module->second.image.entryPoint;
+            initializer.moduleBase = moduleBase;
+            initializer.requireSuccess = true;
+            initializer.marksModuleInitialized = true;
+            initializer.label =
+                "nvse_1_4.dll PE entry point";
+            guestModuleInitializers.push_back(
+                std::move(initializer));
+        }
+        if (guestModuleInitializers.empty()) {
+            error = "nvse_1_4.dll has no TLS callbacks or PE entry point";
+            return false;
+        }
+        printf(
+            "Sugarbomb NVSE: diagnostic initialization enabled; "
+            "queued %zu TLS/entry initializer(s)\n",
+            guestModuleInitializers.size());
+        return scheduleGuestModuleInitializer(cpu);
+    }
+
+    void completeGuestModuleInitializer(CPU* guestCpu) {
+        if (guestModuleInitializerIndex >=
+            guestModuleInitializers.size()) {
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 loader: initializer return without "
+                "a pending initializer\n");
+            runtimeStopping = true;
+            guestCpu->thread->terminating = true;
+            return;
+        }
+        GuestModuleInitializer initializer =
+            guestModuleInitializers[guestModuleInitializerIndex];
+        U32 result = guestCpu->reg[0].u32;
+        printf(
+            "Sugarbomb Win32 loader: %s returned EAX=0x%08X\n",
+            initializer.label.c_str(),
+            result);
+        if (initializer.requireSuccess && !result) {
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 loader: %s rejected "
+                "DLL_PROCESS_ATTACH\n",
+                initializer.label.c_str());
+            runtimeStopping = true;
+            guestCpu->thread->terminating = true;
+            return;
+        }
+        if (initializer.marksModuleInitialized) {
+            auto module =
+                guestModules.find(initializer.moduleBase);
+            if (module != guestModules.end()) {
+                module->second.initialized = true;
+            }
+        }
+        ++guestModuleInitializerIndex;
+        if (!scheduleGuestModuleInitializer(guestCpu)) {
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 loader: could not schedule the next "
+                "guest module initializer: %s\n",
+                error.c_str());
+            runtimeStopping = true;
+            guestCpu->thread->terminating = true;
+        }
+    }
+
+    bool scheduleNextGuestFunction(CPU* guestCpu) {
+        U32 threadId = guestCpu->thread->id;
+        auto found = pendingGuestFunctionArrays.find(threadId);
+        if (found == pendingGuestFunctionArrays.end() ||
+            found->second.empty()) {
+            error =
+                "No pending guest function array for the current thread";
+            return false;
+        }
+        PendingGuestFunctionArray& pending =
+            found->second.back();
+        if (pending.nextIndex >= pending.functions.size()) {
+            return finishGuestFunctionArray(guestCpu, 0);
+        }
+        U32 function =
+            pending.functions[pending.nextIndex++];
+        U32 stackPointer =
+            pending.nativeThunkStackPointer;
+        U32 returnStackPointer =
+            (stackPointer & guestCpu->stackNotMask) |
+            ((stackPointer - sizeof(U32)) &
+             guestCpu->stackMask);
+        U32 returnAddress =
+            guestCpu->seg[SS].address +
+            (returnStackPointer & guestCpu->stackMask);
+        if (!memory->canWrite(returnAddress, sizeof(U32))) {
+            error =
+                "Guest function-array return frame is outside the stack";
+            return false;
+        }
+        guestCpu->reg[4].u32 = stackPointer;
+        guestCpu->push32(guestFunctionArrayReturnThunk);
+        guestCpu->eip.u32 = function;
+        guestCpu->nextOp = nullptr;
+        if (++guestFunctionArrayDispatchTraceCount <= 64) {
+            printf(
+                "Sugarbomb Win32 loader: %s calling guest "
+                "function 0x%08X (%zu/%zu)\n",
+                pending.label.c_str(),
+                function,
+                pending.nextIndex,
+                pending.functions.size());
+        }
+        return true;
+    }
+
+    bool finishGuestFunctionArray(
+        CPU* guestCpu,
+        U32 result) {
+        U32 threadId = guestCpu->thread->id;
+        auto found = pendingGuestFunctionArrays.find(threadId);
+        if (found == pendingGuestFunctionArrays.end() ||
+            found->second.empty()) {
+            error =
+                "Guest function-array completion has no pending frame";
+            return false;
+        }
+        PendingGuestFunctionArray pending =
+            std::move(found->second.back());
+        found->second.pop_back();
+        if (found->second.empty()) {
+            pendingGuestFunctionArrays.erase(found);
+        }
+        guestCpu->reg[4].u32 =
+            pending.nativeThunkStackPointer;
+        guestCpu->eip.u32 =
+            pending.nativeThunkResumeEip;
+        guestCpu->reg[0].u32 = result;
+        guestCpu->nextOp = nullptr;
+        printf(
+            "Sugarbomb Win32 loader: %s completed with "
+            "result 0x%08X\n",
+            pending.label.c_str(),
+            result);
+        return true;
+    }
+
+    bool beginGuestFunctionArray(
+        CPU* guestCpu,
+        U32 first,
+        U32 last,
+        bool stopOnFailure,
+        const char* label) {
+        constexpr U32 MAX_FUNCTION_ARRAY_BYTES =
+            4 * 1024 * 1024;
+        if (last < first ||
+            ((last - first) & (sizeof(U32) - 1)) ||
+            last - first > MAX_FUNCTION_ARRAY_BYTES ||
+            (last != first &&
+             !memory->canRead(first, last - first))) {
+            error = std::string(label) +
+                " received an invalid function-pointer range";
+            return false;
+        }
+
+        PendingGuestFunctionArray pending;
+        pending.nativeThunkStackPointer =
+            guestCpu->reg[4].u32;
+        pending.nativeThunkResumeEip =
+            guestCpu->eip.u32 + 2;
+        pending.stopOnFailure = stopOnFailure;
+        pending.label = label;
+        for (U32 entry = first;
+             entry < last;
+             entry += sizeof(U32)) {
+            U32 function = memory->readd(entry);
+            if (!function) {
+                continue;
+            }
+            if (!memory->canRead(function, 1)) {
+                error = std::string(label) +
+                    " contains a function pointer outside guest code";
+                return false;
+            }
+            pending.functions.push_back(function);
+        }
+        if (pending.functions.empty()) {
+            guestCpu->reg[0].u32 = 0;
+            printf(
+                "Sugarbomb Win32 loader: %s contained no "
+                "guest functions\n",
+                label);
+            return true;
+        }
+        pendingGuestFunctionArrays[guestCpu->thread->id]
+            .push_back(std::move(pending));
+        return scheduleNextGuestFunction(guestCpu);
+    }
+
+    void completeGuestFunctionArray(CPU* guestCpu) {
+        U32 threadId = guestCpu->thread->id;
+        auto found = pendingGuestFunctionArrays.find(threadId);
+        if (found == pendingGuestFunctionArrays.end() ||
+            found->second.empty()) {
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 loader: guest function return "
+                "without a pending array on thread %u\n",
+                threadId);
+            runtimeStopping = true;
+            guestCpu->thread->terminating = true;
+            return;
+        }
+        U32 result = guestCpu->reg[0].u32;
+        PendingGuestFunctionArray& pending =
+            found->second.back();
+        if (pending.stopOnFailure && result) {
+            if (!finishGuestFunctionArray(guestCpu, result)) {
+                runtimeStopping = true;
+                guestCpu->thread->terminating = true;
+            }
+            return;
+        }
+        if (!scheduleNextGuestFunction(guestCpu)) {
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 loader: could not continue "
+                "guest function array: %s\n",
+                error.c_str());
+            runtimeStopping = true;
+            guestCpu->thread->terminating = true;
+        }
     }
 
     bool execute() {
@@ -1879,6 +2341,26 @@ private:
         moduleHandle = mapped.loadBase;
         guestModuleHandles[key] = moduleHandle;
         guestModules[moduleHandle] = std::move(module);
+        guestModuleLoadOrder.push_back(moduleHandle);
+        if (staticTlsInitialized) {
+            std::size_t previousTemplateCount =
+                staticTlsTemplates.size();
+            if (!appendStaticTlsTemplate(
+                    guestModules[moduleHandle].image)) {
+                return false;
+            }
+            if (staticTlsTemplates.size() != previousTemplateCount) {
+                const StaticTlsTemplate& tls =
+                    staticTlsTemplates.back();
+                for (auto& state : guestThreads) {
+                    if (!initializeThreadStaticTlsTemplate(
+                            *state,
+                            tls)) {
+                        return false;
+                    }
+                }
+            }
+        }
         printf(
             "Sugarbomb Win32 loader: mapped guest DLL %s at "
             "0x%08X-0x%08X (%zu exports, %zu imports)\n",
@@ -2035,7 +2517,6 @@ private:
         state->environmentBase = ENV_BASE;
         state->tebAddress = TEB_ADDRESS;
         state->tlsArray = TLS_ARRAY;
-        state->staticTlsData = STATIC_TLS_DATA;
         state->mainThread = true;
         guestThreads.push_back(std::move(state));
     }
@@ -2454,6 +2935,79 @@ private:
             }
             return;
         }
+        if (module == "vcruntime140.dll" ||
+            module == "vcruntime140d.dll") {
+            findCrtMemoryCallback(
+                symbol,
+                callback,
+                stackCleanupBytes);
+            return;
+        }
+        if (module == "ucrtbase.dll" ||
+            module == "ucrtbased.dll") {
+            if (findCrtMemoryCallback(
+                    symbol,
+                    callback,
+                    stackCleanupBytes)) {
+            } else if (findUcrtStringCallback(
+                           symbol,
+                           callback,
+                           stackCleanupBytes)) {
+            } else if (findUcrtFileCallback(
+                           symbol,
+                           callback,
+                           stackCleanupBytes)) {
+            } else if (findUcrtStdioCallback(
+                           symbol,
+                           callback,
+                           stackCleanupBytes)) {
+            } else if (findUcrtMathCallback(
+                           symbol,
+                           callback,
+                           stackCleanupBytes)) {
+            } else if (symbol == "_initialize_onexit_table") {
+                callback = callbackInitializeOnExitTable;
+            } else if (symbol == "___lc_codepage_func") {
+                callback = callbackUcrtLocaleCodepage;
+            } else if (symbol == "_register_onexit_function") {
+                callback = callbackRegisterOnExitFunction;
+            } else if (symbol == "_configure_narrow_argv") {
+                callback = callbackConfigureNarrowArgv;
+            } else if (
+                symbol == "_initialize_narrow_environment") {
+                callback =
+                    callbackInitializeNarrowEnvironment;
+            } else if (symbol == "_initterm") {
+                callback = callbackInitTerm;
+            } else if (symbol == "_initterm_e") {
+                callback = callbackInitTermE;
+            } else if (symbol == "malloc") {
+                callback = callbackUcrtMalloc;
+            } else if (symbol == "free") {
+                callback = callbackUcrtFree;
+            } else if (symbol == "realloc") {
+                callback = callbackUcrtRealloc;
+            } else if (symbol == "_malloc_dbg") {
+                callback = callbackUcrtMallocDebug;
+            } else if (symbol == "_calloc_dbg") {
+                callback = callbackUcrtCallocDebug;
+            } else if (symbol == "_free_dbg") {
+                callback = callbackUcrtFreeDebug;
+            }
+            return;
+        }
+        if (module == "msvcp140.dll" ||
+            module == "msvcp140d.dll") {
+            if (symbol ==
+                "??0_Lockit@std@@QAE@H@Z") {
+                callback = callbackMsvcpLockitConstruct;
+                stackCleanupBytes = 4;
+            } else if (
+                symbol == "??1_Lockit@std@@QAE@XZ") {
+                callback = callbackMsvcpLockitDestruct;
+            }
+            return;
+        }
         if (module != "kernel32.dll" && module != "kernelbase.dll") {
             return;
         }
@@ -2462,6 +3016,8 @@ private:
             stackCleanupBytes = 4;
         } else if (symbol == "GetCurrentProcessId") {
             callback = callbackGetCurrentProcessId;
+        } else if (symbol == "GetCurrentProcess") {
+            callback = callbackGetCurrentProcess;
         } else if (symbol == "GetCurrentThreadId") {
             callback = callbackGetCurrentThreadId;
         } else if (symbol == "GetTickCount") {
@@ -2503,15 +3059,14 @@ private:
         } else if (symbol == "GetCurrentDirectoryA") {
             callback = callbackGetCurrentDirectoryA;
             stackCleanupBytes = 8;
-        } else if (symbol == "CreateDirectoryA") {
-            callback = callbackCreateDirectoryA;
-            stackCleanupBytes = 8;
-        } else if (symbol == "DeleteFileA") {
-            callback = callbackDeleteFileA;
-            stackCleanupBytes = 4;
-        } else if (symbol == "GetFileAttributesA") {
-            callback = callbackGetFileAttributesA;
-            stackCleanupBytes = 4;
+        } else if (findKernelDirectoryCallback(
+                       symbol,
+                       callback,
+                       stackCleanupBytes)) {
+        } else if (findKernelFileMetadataCallback(
+                       symbol,
+                       callback,
+                       stackCleanupBytes)) {
         } else if (symbol == "CreateFileA") {
             callback = callbackCreateFileA;
             stackCleanupBytes = 28;
@@ -2604,6 +3159,10 @@ private:
         } else if (symbol == "LeaveCriticalSection") {
             callback = callbackLeaveCriticalSection;
             stackCleanupBytes = 4;
+        } else if (findKernelSrwLockCallback(
+                       symbol,
+                       callback,
+                       stackCleanupBytes)) {
         } else if (symbol == "InterlockedExchange") {
             callback = callbackInterlockedExchange;
             stackCleanupBytes = 8;
@@ -2634,38 +3193,10 @@ private:
         } else if (symbol == "GetConsoleMode") {
             callback = callbackGetConsoleMode;
             stackCleanupBytes = 8;
-        } else if (symbol == "GetConsoleCP") {
-            callback = callbackGetConsoleCP;
-        } else if (symbol == "GetConsoleOutputCP") {
-            callback = callbackGetConsoleOutputCP;
-        } else if (symbol == "GetACP") {
-            callback = callbackGetACP;
-        } else if (symbol == "GetOEMCP") {
-            callback = callbackGetOEMCP;
-        } else if (symbol == "GetCPInfo") {
-            callback = callbackGetCPInfo;
-            stackCleanupBytes = 8;
-        } else if (symbol == "IsValidCodePage") {
-            callback = callbackIsValidCodePage;
-            stackCleanupBytes = 4;
-        } else if (symbol == "WideCharToMultiByte") {
-            callback = callbackWideCharToMultiByte;
-            stackCleanupBytes = 32;
-        } else if (symbol == "MultiByteToWideChar") {
-            callback = callbackMultiByteToWideChar;
-            stackCleanupBytes = 24;
-        } else if (symbol == "GetStringTypeW") {
-            callback = callbackGetStringTypeW;
-            stackCleanupBytes = 16;
-        } else if (symbol == "GetStringTypeA") {
-            callback = callbackGetStringTypeA;
-            stackCleanupBytes = 20;
-        } else if (symbol == "LCMapStringW") {
-            callback = callbackLCMapStringW;
-            stackCleanupBytes = 24;
-        } else if (symbol == "LCMapStringA") {
-            callback = callbackLCMapStringA;
-            stackCleanupBytes = 24;
+        } else if (findKernelCodePageCallback(
+                       symbol,
+                       callback,
+                       stackCleanupBytes)) {
         } else if (symbol == "SetUnhandledExceptionFilter") {
             callback = callbackSetUnhandledExceptionFilter;
             stackCleanupBytes = 4;
@@ -2689,15 +3220,17 @@ private:
         } else if (symbol == "GetSystemInfo") {
             callback = callbackGetSystemInfo;
             stackCleanupBytes = 4;
-        } else if (symbol == "VirtualAlloc") {
-            callback = callbackVirtualAlloc;
-            stackCleanupBytes = 16;
-        } else if (symbol == "VirtualFree") {
-            callback = callbackVirtualFree;
-            stackCleanupBytes = 12;
-        } else if (symbol == "VirtualQuery") {
-            callback = callbackVirtualQuery;
-            stackCleanupBytes = 12;
+        } else if (symbol == "IsProcessorFeaturePresent") {
+            callback = callbackIsProcessorFeaturePresent;
+            stackCleanupBytes = 4;
+        } else if (findKernelSListCallback(
+                       symbol,
+                       callback,
+                       stackCleanupBytes)) {
+        } else if (findKernelVirtualMemoryCallback(
+                       symbol,
+                       callback,
+                       stackCleanupBytes)) {
         } else if (symbol == "CreateSemaphoreA") {
             callback = callbackCreateSemaphoreA;
             stackCleanupBytes = 16;
@@ -2793,6 +3326,390 @@ private:
             callback = callbackExitProcess;
             stackCleanupBytes = 4;
         }
+    }
+
+    bool findKernelDirectoryCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        if (symbol == "CreateDirectoryA") {
+            callback = callbackCreateDirectoryA;
+            stackCleanupBytes = 8;
+        } else if (symbol == "CreateDirectoryW") {
+            callback = callbackCreateDirectoryW;
+            stackCleanupBytes = 8;
+        } else if (symbol == "CreateDirectoryExA") {
+            callback = callbackCreateDirectoryExA;
+            stackCleanupBytes = 12;
+        } else if (symbol == "CreateDirectoryExW") {
+            callback = callbackCreateDirectoryExW;
+            stackCleanupBytes = 12;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findKernelFileMetadataCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        if (symbol == "DeleteFileA") {
+            callback = callbackDeleteFileA;
+            stackCleanupBytes = 4;
+        } else if (symbol == "DeleteFileW") {
+            callback = callbackDeleteFileW;
+            stackCleanupBytes = 4;
+        } else if (symbol == "GetFileAttributesA") {
+            callback = callbackGetFileAttributesA;
+            stackCleanupBytes = 4;
+        } else if (symbol == "GetFileAttributesW") {
+            callback = callbackGetFileAttributesW;
+            stackCleanupBytes = 4;
+        } else if (symbol == "GetFileAttributesExA") {
+            callback = callbackGetFileAttributesExA;
+            stackCleanupBytes = 12;
+        } else if (symbol == "GetFileAttributesExW") {
+            callback = callbackGetFileAttributesExW;
+            stackCleanupBytes = 12;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findKernelCodePageCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        stackCleanupBytes = 0;
+        if (symbol == "GetConsoleCP") {
+            callback = callbackGetConsoleCP;
+        } else if (symbol == "GetConsoleOutputCP") {
+            callback = callbackGetConsoleOutputCP;
+        } else if (symbol == "AreFileApisANSI") {
+            callback = callbackAreFileApisAnsi;
+        } else if (symbol == "SetFileApisToANSI") {
+            callback = callbackSetFileApisToAnsi;
+        } else if (symbol == "SetFileApisToOEM") {
+            callback = callbackSetFileApisToOem;
+        } else if (symbol == "GetACP") {
+            callback = callbackGetACP;
+        } else if (symbol == "GetOEMCP") {
+            callback = callbackGetOEMCP;
+        } else if (symbol == "GetCPInfo") {
+            callback = callbackGetCPInfo;
+            stackCleanupBytes = 8;
+        } else if (symbol == "IsValidCodePage") {
+            callback = callbackIsValidCodePage;
+            stackCleanupBytes = 4;
+        } else if (symbol == "WideCharToMultiByte") {
+            callback = callbackWideCharToMultiByte;
+            stackCleanupBytes = 32;
+        } else if (symbol == "MultiByteToWideChar") {
+            callback = callbackMultiByteToWideChar;
+            stackCleanupBytes = 24;
+        } else if (symbol == "GetStringTypeW") {
+            callback = callbackGetStringTypeW;
+            stackCleanupBytes = 16;
+        } else if (symbol == "GetStringTypeA") {
+            callback = callbackGetStringTypeA;
+            stackCleanupBytes = 20;
+        } else if (symbol == "LCMapStringW") {
+            callback = callbackLCMapStringW;
+            stackCleanupBytes = 24;
+        } else if (symbol == "LCMapStringA") {
+            callback = callbackLCMapStringA;
+            stackCleanupBytes = 24;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findKernelSrwLockCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        stackCleanupBytes = 4;
+        if (symbol == "AcquireSRWLockExclusive") {
+            callback = callbackAcquireSrwLockExclusive;
+        } else if (symbol == "AcquireSRWLockShared") {
+            callback = callbackAcquireSrwLockShared;
+        } else if (symbol == "ReleaseSRWLockExclusive") {
+            callback = callbackReleaseSrwLockExclusive;
+        } else if (symbol == "ReleaseSRWLockShared") {
+            callback = callbackReleaseSrwLockShared;
+        } else if (symbol == "TryAcquireSRWLockExclusive") {
+            callback = callbackTryAcquireSrwLockExclusive;
+        } else if (symbol == "TryAcquireSRWLockShared") {
+            callback = callbackTryAcquireSrwLockShared;
+        } else if (symbol == "SleepConditionVariableSRW") {
+            callback = callbackSleepConditionVariableSrw;
+            stackCleanupBytes = 16;
+        } else if (symbol == "WakeConditionVariable") {
+            callback = callbackWakeConditionVariable;
+        } else if (symbol == "WakeAllConditionVariable") {
+            callback = callbackWakeAllConditionVariable;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findKernelSListCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        if (symbol == "InitializeSListHead") {
+            callback = callbackInitializeSListHead;
+            stackCleanupBytes = 4;
+        } else if (symbol == "InterlockedPushEntrySList") {
+            callback = callbackInterlockedPushEntrySList;
+            stackCleanupBytes = 8;
+        } else if (symbol == "InterlockedPopEntrySList") {
+            callback = callbackInterlockedPopEntrySList;
+            stackCleanupBytes = 4;
+        } else if (symbol == "InterlockedFlushSList") {
+            callback = callbackInterlockedFlushSList;
+            stackCleanupBytes = 4;
+        } else if (symbol == "QueryDepthSList") {
+            callback = callbackQueryDepthSList;
+            stackCleanupBytes = 4;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findKernelVirtualMemoryCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        if (symbol == "VirtualAlloc") {
+            callback = callbackVirtualAlloc;
+            stackCleanupBytes = 16;
+        } else if (symbol == "VirtualFree") {
+            callback = callbackVirtualFree;
+            stackCleanupBytes = 12;
+        } else if (symbol == "VirtualProtect") {
+            callback = callbackVirtualProtect;
+            stackCleanupBytes = 16;
+        } else if (symbol == "VirtualQuery") {
+            callback = callbackVirtualQuery;
+            stackCleanupBytes = 12;
+        } else if (symbol == "FlushInstructionCache") {
+            callback = callbackFlushInstructionCache;
+            stackCleanupBytes = 12;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findCrtMemoryCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        stackCleanupBytes = 0; // CRT entry points are cdecl.
+        if (symbol == "memset") {
+            callback = callbackCrtMemset;
+        } else if (symbol == "memcpy") {
+            callback = callbackCrtMemcpy;
+        } else if (symbol == "memmove") {
+            callback = callbackCrtMemmove;
+        } else if (symbol == "memcmp") {
+            callback = callbackCrtMemcmp;
+        } else if (symbol == "memchr") {
+            callback = callbackCrtMemchr;
+        } else if (symbol == "strchr") {
+            callback = callbackCrtStrchr;
+        } else if (symbol == "strrchr") {
+            callback = callbackCrtStrrchr;
+        } else if (symbol == "strstr") {
+            callback = callbackCrtStrstr;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findUcrtStringCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        stackCleanupBytes = 0; // UCRT string entry points are cdecl.
+        if (symbol == "_strdup") {
+            callback = callbackUcrtStrdup;
+        } else if (symbol == "strlen") {
+            callback = callbackUcrtStrlen;
+        } else if (symbol == "strcmp") {
+            callback = callbackUcrtStrcmp;
+        } else if (symbol == "strncmp") {
+            callback = callbackUcrtStrncmp;
+        } else if (symbol == "_stricmp") {
+            callback = callbackUcrtStricmp;
+        } else if (symbol == "_strnicmp") {
+            callback = callbackUcrtStrnicmp;
+        } else if (symbol == "strcpy") {
+            callback = callbackUcrtStrcpy;
+        } else if (symbol == "strcpy_s") {
+            callback = callbackUcrtStrcpyS;
+        } else if (symbol == "strcat_s") {
+            callback = callbackUcrtStrcatS;
+        } else if (symbol == "islower") {
+            callback = callbackUcrtIsLower;
+        } else if (symbol == "isupper") {
+            callback = callbackUcrtIsUpper;
+        } else if (symbol == "isalpha") {
+            callback = callbackUcrtIsAlpha;
+        } else if (symbol == "isdigit") {
+            callback = callbackUcrtIsDigit;
+        } else if (symbol == "isalnum") {
+            callback = callbackUcrtIsAlnum;
+        } else if (symbol == "isspace") {
+            callback = callbackUcrtIsSpace;
+        } else if (symbol == "ispunct") {
+            callback = callbackUcrtIsPunct;
+        } else if (symbol == "isprint") {
+            callback = callbackUcrtIsPrint;
+        } else if (symbol == "tolower") {
+            callback = callbackUcrtToLower;
+        } else if (symbol == "toupper") {
+            callback = callbackUcrtToUpper;
+        } else if (symbol == "strtol") {
+            callback = callbackUcrtStrtol;
+        } else if (symbol == "strtoll") {
+            callback = callbackUcrtStrtoll;
+        } else if (symbol == "strtoul") {
+            callback = callbackUcrtStrtoul;
+        } else if (symbol == "strtod") {
+            callback = callbackUcrtStrtod;
+        } else if (symbol == "atoi") {
+            callback = callbackUcrtAtoi;
+        } else if (symbol == "atof") {
+            callback = callbackUcrtAtof;
+        } else if (symbol == "_errno") {
+            callback = callbackUcrtErrno;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findUcrtFileCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        stackCleanupBytes = 0; // UCRT stream functions are cdecl.
+        if (symbol == "_fsopen") {
+            callback = callbackUcrtFsopen;
+        } else if (symbol == "fopen_s") {
+            callback = callbackUcrtFopenS;
+        } else if (symbol == "fclose") {
+            callback = callbackUcrtFclose;
+        } else if (symbol == "fread") {
+            callback = callbackUcrtFread;
+        } else if (symbol == "fwrite") {
+            callback = callbackUcrtFwrite;
+        } else if (symbol == "fgetc") {
+            callback = callbackUcrtFgetc;
+        } else if (symbol == "fputc") {
+            callback = callbackUcrtFputc;
+        } else if (symbol == "fputs") {
+            callback = callbackUcrtFputs;
+        } else if (symbol == "fflush") {
+            callback = callbackUcrtFflush;
+        } else if (symbol == "_fseeki64") {
+            callback = callbackUcrtFseeki64;
+        } else if (symbol == "fgetpos") {
+            callback = callbackUcrtFgetpos;
+        } else if (symbol == "fsetpos") {
+            callback = callbackUcrtFsetpos;
+        } else if (symbol == "setvbuf") {
+            callback = callbackUcrtSetvbuf;
+        } else if (symbol == "ungetc") {
+            callback = callbackUcrtUngetc;
+        } else if (symbol == "_lock_file") {
+            callback = callbackUcrtLockFile;
+        } else if (symbol == "_unlock_file") {
+            callback = callbackUcrtUnlockFile;
+        } else if (symbol == "_get_stream_buffer_pointers") {
+            callback = callbackUcrtGetStreamBufferPointers;
+        } else if (symbol == "__acrt_iob_func") {
+            callback = callbackUcrtIobFunction;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findUcrtStdioCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        stackCleanupBytes = 0; // UCRT stdio entry points are cdecl.
+        if (symbol == "__stdio_common_vsprintf_s") {
+            callback = callbackUcrtStdioCommonVsprintfS;
+        } else if (symbol == "__stdio_common_vsprintf") {
+            callback = callbackUcrtStdioCommonVsprintf;
+        } else if (symbol == "__stdio_common_vfprintf_s") {
+            callback = callbackUcrtStdioCommonVfprintfS;
+        } else if (symbol == "__stdio_common_vfprintf") {
+            callback = callbackUcrtStdioCommonVfprintf;
+        } else if (symbol == "__stdio_common_vswprintf") {
+            callback = callbackUcrtStdioCommonVswprintf;
+        } else if (symbol == "__stdio_common_vsscanf") {
+            callback = callbackUcrtStdioCommonVsscanf;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    bool findUcrtMathCallback(
+        const std::string& symbol,
+        SugarbombNativeCallback& callback,
+        U16& stackCleanupBytes) {
+        stackCleanupBytes = 0; // UCRT math entry points are cdecl.
+        if (symbol == "acos") {
+            callback = callbackUcrtAcos;
+        } else if (symbol == "asin") {
+            callback = callbackUcrtAsin;
+        } else if (symbol == "atan") {
+            callback = callbackUcrtAtan;
+        } else if (symbol == "atan2") {
+            callback = callbackUcrtAtan2;
+        } else if (symbol == "ceil") {
+            callback = callbackUcrtCeil;
+        } else if (symbol == "cos") {
+            callback = callbackUcrtCos;
+        } else if (symbol == "cosh") {
+            callback = callbackUcrtCosh;
+        } else if (symbol == "exp") {
+            callback = callbackUcrtExp;
+        } else if (symbol == "fabs") {
+            callback = callbackUcrtFabs;
+        } else if (symbol == "floor") {
+            callback = callbackUcrtFloor;
+        } else if (symbol == "log10") {
+            callback = callbackUcrtLog10;
+        } else if (symbol == "pow") {
+            callback = callbackUcrtPow;
+        } else if (symbol == "sin") {
+            callback = callbackUcrtSin;
+        } else if (symbol == "sinh") {
+            callback = callbackUcrtSinh;
+        } else if (symbol == "sqrt") {
+            callback = callbackUcrtSqrt;
+        } else if (symbol == "tan") {
+            callback = callbackUcrtTan;
+        } else if (symbol == "tanh") {
+            callback = callbackUcrtTanh;
+        } else {
+            return false;
+        }
+        return true;
     }
 
     static SugarbombRuntimeSession* current(CPU* cpu, const char* api) {
@@ -3869,6 +4786,1019 @@ private:
         double value = 0.0;
         memcpy(&value, &bits, sizeof(value));
         return value;
+    }
+
+    bool readGuestVa32(U32& cursor, U32& value) {
+        if (cursor > std::numeric_limits<U32>::max() - 4 ||
+            !memory->canRead(cursor, 4)) {
+            return false;
+        }
+        value = memory->readd(cursor);
+        cursor += 4;
+        return true;
+    }
+
+    bool readGuestVa64(U32& cursor, U64& value) {
+        if (cursor > std::numeric_limits<U32>::max() - 8 ||
+            !memory->canRead(cursor, 8)) {
+            return false;
+        }
+        value = memory->readq(cursor);
+        cursor += 8;
+        return true;
+    }
+
+    bool readGuestWideString(
+        U32 address,
+        std::string& value,
+        U32 limit = 1024 * 1024) {
+        value.clear();
+        if (!address) {
+            return false;
+        }
+        for (U32 index = 0; index < limit; ++index) {
+            const U64 characterAddress =
+                static_cast<U64>(address) +
+                static_cast<U64>(index) * 2;
+            if (characterAddress >
+                    std::numeric_limits<U32>::max() - 1ULL ||
+                !memory->canRead(
+                    static_cast<U32>(characterAddress),
+                    2)) {
+                return false;
+            }
+            U16 character =
+                memory->readw(static_cast<U32>(characterAddress));
+            if (!character) {
+                return true;
+            }
+            value.push_back(
+                character <= 0x7f
+                ? static_cast<char>(character)
+                : '?');
+        }
+        return false;
+    }
+
+    template <typename Value>
+    static bool appendHostFormatted(
+        std::string& output,
+        const std::string& format,
+        Value value) {
+        int required =
+            std::snprintf(nullptr, 0, format.c_str(), value);
+        if (required < 0 ||
+            static_cast<U64>(output.size()) +
+                    static_cast<U32>(required) >
+                16 * 1024 * 1024ULL) {
+            return false;
+        }
+        std::vector<char> buffer(
+            static_cast<std::size_t>(required) + 1);
+        int written = std::snprintf(
+            buffer.data(),
+            buffer.size(),
+            format.c_str(),
+            value);
+        if (written != required) {
+            return false;
+        }
+        output.append(
+            buffer.data(),
+            static_cast<std::size_t>(written));
+        return true;
+    }
+
+    bool formatGuestPrintf(
+        const std::string& format,
+        U32 vaList,
+        bool wideFormat,
+        std::string& output) {
+        output.clear();
+        U32 cursor = vaList;
+        for (std::size_t index = 0;
+             index < format.size();) {
+            if (format[index] != '%') {
+                output.push_back(format[index++]);
+                continue;
+            }
+            ++index;
+            if (index >= format.size()) {
+                return false;
+            }
+            if (format[index] == '%') {
+                output.push_back('%');
+                ++index;
+                continue;
+            }
+
+            std::string flags;
+            while (index < format.size() &&
+                   std::string("-+ #0").find(format[index]) !=
+                       std::string::npos) {
+                flags.push_back(format[index++]);
+            }
+
+            bool widthPresent = false;
+            S32 width = 0;
+            if (index < format.size() &&
+                format[index] == '*') {
+                U32 rawWidth = 0;
+                if (!readGuestVa32(cursor, rawWidth)) {
+                    return false;
+                }
+                width = static_cast<S32>(rawWidth);
+                widthPresent = true;
+                ++index;
+                if (width < 0) {
+                    if (flags.find('-') == std::string::npos) {
+                        flags.push_back('-');
+                    }
+                    width = width == std::numeric_limits<S32>::min()
+                        ? std::numeric_limits<S32>::max()
+                        : -width;
+                }
+            } else {
+                while (index < format.size() &&
+                       std::isdigit(
+                           static_cast<unsigned char>(
+                               format[index]))) {
+                    widthPresent = true;
+                    if (width > 1000000) {
+                        return false;
+                    }
+                    width =
+                        width * 10 + (format[index++] - '0');
+                }
+            }
+
+            bool precisionPresent = false;
+            S32 precision = 0;
+            if (index < format.size() &&
+                format[index] == '.') {
+                ++index;
+                precisionPresent = true;
+                if (index < format.size() &&
+                    format[index] == '*') {
+                    U32 rawPrecision = 0;
+                    if (!readGuestVa32(
+                            cursor,
+                            rawPrecision)) {
+                        return false;
+                    }
+                    precision =
+                        static_cast<S32>(rawPrecision);
+                    ++index;
+                    if (precision < 0) {
+                        precisionPresent = false;
+                        precision = 0;
+                    }
+                } else {
+                    while (index < format.size() &&
+                           std::isdigit(
+                               static_cast<unsigned char>(
+                                   format[index]))) {
+                        if (precision > 1000000) {
+                            return false;
+                        }
+                        precision =
+                            precision * 10 +
+                            (format[index++] - '0');
+                    }
+                }
+            }
+
+            std::string length;
+            if (index + 2 < format.size() &&
+                format.compare(index, 3, "I64") == 0) {
+                length = "I64";
+                index += 3;
+            } else if (
+                index + 2 < format.size() &&
+                format.compare(index, 3, "I32") == 0) {
+                length = "I32";
+                index += 3;
+            } else if (
+                index + 1 < format.size() &&
+                (format.compare(index, 2, "hh") == 0 ||
+                 format.compare(index, 2, "ll") == 0)) {
+                length = format.substr(index, 2);
+                index += 2;
+            } else if (
+                index < format.size() &&
+                std::string("hljztLw").find(format[index]) !=
+                    std::string::npos) {
+                length.push_back(format[index++]);
+            }
+            if (index >= format.size()) {
+                return false;
+            }
+            char conversion = format[index++];
+
+            std::string hostPrefix = "%" + flags;
+            if (widthPresent) {
+                hostPrefix += std::to_string(width);
+            }
+            if (precisionPresent) {
+                hostPrefix += "." +
+                    std::to_string(precision);
+            }
+
+            if (conversion == 'n') {
+                U32 destination = 0;
+                if (!readGuestVa32(cursor, destination)) {
+                    return false;
+                }
+                U32 size =
+                    length == "hh" ? 1 :
+                    (length == "h" ? 2 :
+                     ((length == "ll" ||
+                       length == "I64") ? 8 : 4));
+                if (!destination ||
+                    !memory->canWrite(destination, size)) {
+                    return false;
+                }
+                if (size == 1) {
+                    memory->writeb(
+                        destination,
+                        static_cast<U8>(output.size()));
+                } else if (size == 2) {
+                    memory->writew(
+                        destination,
+                        static_cast<U16>(output.size()));
+                } else if (size == 8) {
+                    memory->writeq(
+                        destination,
+                        static_cast<U64>(output.size()));
+                } else {
+                    memory->writed(
+                        destination,
+                        static_cast<U32>(output.size()));
+                }
+                continue;
+            }
+
+            if (conversion == 's' ||
+                conversion == 'S') {
+                U32 source = 0;
+                if (!readGuestVa32(cursor, source)) {
+                    return false;
+                }
+                bool wideString =
+                    wideFormat
+                    ? (conversion == 's' &&
+                       length != "h")
+                    : ((conversion == 's' &&
+                        (length == "l" ||
+                         length == "w")) ||
+                       (conversion == 'S' &&
+                        length != "h"));
+                std::string value;
+                if (!source) {
+                    value = "(null)";
+                } else if (wideString) {
+                    if (!readGuestWideString(source, value)) {
+                        return false;
+                    }
+                } else {
+                    U32 valueLength = 0;
+                    if (!guestCStringLength(
+                            source,
+                            valueLength,
+                            1024 * 1024)) {
+                        return false;
+                    }
+                    value = readAnsi(source, valueLength + 1);
+                }
+                if (!appendHostFormatted(
+                        output,
+                        hostPrefix + "s",
+                        value.c_str())) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (conversion == 'c' ||
+                conversion == 'C') {
+                U32 raw = 0;
+                if (!readGuestVa32(cursor, raw)) {
+                    return false;
+                }
+                char character =
+                    raw <= 0x7f
+                    ? static_cast<char>(raw)
+                    : '?';
+                if (!appendHostFormatted(
+                        output,
+                        hostPrefix + "c",
+                        character)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (std::string("di").find(conversion) !=
+                std::string::npos) {
+                S64 value = 0;
+                if (length == "ll" ||
+                    length == "I64") {
+                    U64 raw = 0;
+                    if (!readGuestVa64(cursor, raw)) {
+                        return false;
+                    }
+                    value = static_cast<S64>(raw);
+                } else {
+                    U32 raw = 0;
+                    if (!readGuestVa32(cursor, raw)) {
+                        return false;
+                    }
+                    value = length == "hh"
+                        ? static_cast<S8>(raw)
+                        : (length == "h"
+                           ? static_cast<S16>(raw)
+                           : static_cast<S32>(raw));
+                }
+                if (!appendHostFormatted(
+                        output,
+                        hostPrefix + "ll" + conversion,
+                        static_cast<long long>(value))) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (std::string("uoxX").find(conversion) !=
+                std::string::npos) {
+                U64 value = 0;
+                if (length == "ll" ||
+                    length == "I64") {
+                    if (!readGuestVa64(cursor, value)) {
+                        return false;
+                    }
+                } else {
+                    U32 raw = 0;
+                    if (!readGuestVa32(cursor, raw)) {
+                        return false;
+                    }
+                    value = length == "hh"
+                        ? static_cast<U8>(raw)
+                        : (length == "h"
+                           ? static_cast<U16>(raw)
+                           : raw);
+                }
+                if (!appendHostFormatted(
+                        output,
+                        hostPrefix + "ll" + conversion,
+                        static_cast<unsigned long long>(value))) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (conversion == 'p') {
+                U32 value = 0;
+                if (!readGuestVa32(cursor, value)) {
+                    return false;
+                }
+                char pointer[11] = {};
+                std::snprintf(
+                    pointer,
+                    sizeof(pointer),
+                    "0x%08X",
+                    value);
+                if (!appendHostFormatted(
+                        output,
+                        hostPrefix + "s",
+                        pointer)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (std::string("fFeEgGaA").find(conversion) !=
+                std::string::npos) {
+                U64 raw = 0;
+                if (!readGuestVa64(cursor, raw)) {
+                    return false;
+                }
+                double value = 0.0;
+                memcpy(&value, &raw, sizeof(value));
+                if (!appendHostFormatted(
+                        output,
+                        hostPrefix + conversion,
+                        value)) {
+                    return false;
+                }
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool writeGuestScannedInteger(
+        U32 destination,
+        const std::string& length,
+        U64 value) {
+        U32 size =
+            length == "hh" ? 1 :
+            (length == "h" ? 2 :
+             ((length == "ll" ||
+               length == "I64" ||
+               length == "j") ? 8 : 4));
+        if (!destination ||
+            !memory->canWrite(destination, size)) {
+            return false;
+        }
+        if (size == 1) {
+            memory->writeb(destination, static_cast<U8>(value));
+        } else if (size == 2) {
+            memory->writew(destination, static_cast<U16>(value));
+        } else if (size == 8) {
+            memory->writeq(destination, value);
+        } else {
+            memory->writed(destination, static_cast<U32>(value));
+        }
+        return true;
+    }
+
+    bool formatGuestScanf(
+        const std::string& input,
+        const std::string& format,
+        U32 vaList,
+        S32& result) {
+        std::size_t inputIndex = 0;
+        std::size_t formatIndex = 0;
+        U32 cursor = vaList;
+        S32 assignments = 0;
+        bool inputFailure = false;
+
+        while (formatIndex < format.size()) {
+            unsigned char formatCharacter =
+                static_cast<unsigned char>(
+                    format[formatIndex]);
+            if (std::isspace(formatCharacter)) {
+                while (formatIndex < format.size() &&
+                       std::isspace(
+                           static_cast<unsigned char>(
+                               format[formatIndex]))) {
+                    ++formatIndex;
+                }
+                while (inputIndex < input.size() &&
+                       std::isspace(
+                           static_cast<unsigned char>(
+                               input[inputIndex]))) {
+                    ++inputIndex;
+                }
+                continue;
+            }
+            if (format[formatIndex] != '%') {
+                if (inputIndex >= input.size()) {
+                    inputFailure = true;
+                    break;
+                }
+                if (input[inputIndex] !=
+                    format[formatIndex]) {
+                    break;
+                }
+                ++inputIndex;
+                ++formatIndex;
+                continue;
+            }
+
+            ++formatIndex;
+            if (formatIndex >= format.size()) {
+                result = -1;
+                return false;
+            }
+            if (format[formatIndex] == '%') {
+                if (inputIndex >= input.size()) {
+                    inputFailure = true;
+                    break;
+                }
+                if (input[inputIndex] != '%') {
+                    break;
+                }
+                ++inputIndex;
+                ++formatIndex;
+                continue;
+            }
+
+            bool suppress = false;
+            if (format[formatIndex] == '*') {
+                suppress = true;
+                ++formatIndex;
+            }
+            U32 width = 0;
+            while (formatIndex < format.size() &&
+                   std::isdigit(
+                       static_cast<unsigned char>(
+                           format[formatIndex]))) {
+                if (width > 1000000) {
+                    result = -1;
+                    return false;
+                }
+                width =
+                    width * 10 +
+                    (format[formatIndex++] - '0');
+            }
+
+            std::string length;
+            if (formatIndex + 2 < format.size() &&
+                format.compare(
+                    formatIndex,
+                    3,
+                    "I64") == 0) {
+                length = "I64";
+                formatIndex += 3;
+            } else if (
+                formatIndex + 2 < format.size() &&
+                format.compare(
+                    formatIndex,
+                    3,
+                    "I32") == 0) {
+                length = "I32";
+                formatIndex += 3;
+            } else if (
+                formatIndex + 1 < format.size() &&
+                (format.compare(
+                     formatIndex,
+                     2,
+                     "hh") == 0 ||
+                 format.compare(
+                     formatIndex,
+                     2,
+                     "ll") == 0)) {
+                length = format.substr(formatIndex, 2);
+                formatIndex += 2;
+            } else if (
+                formatIndex < format.size() &&
+                std::string("hljztLw").find(
+                    format[formatIndex]) !=
+                    std::string::npos) {
+                length.push_back(format[formatIndex++]);
+            }
+            if (formatIndex >= format.size()) {
+                result = -1;
+                return false;
+            }
+            char conversion = format[formatIndex++];
+
+            if (conversion != 'c' &&
+                conversion != 'C' &&
+                conversion != '[' &&
+                conversion != 'n') {
+                while (inputIndex < input.size() &&
+                       std::isspace(
+                           static_cast<unsigned char>(
+                               input[inputIndex]))) {
+                    ++inputIndex;
+                }
+            }
+
+            if (conversion == 'n') {
+                if (!suppress) {
+                    U32 destination = 0;
+                    if (!readGuestVa32(
+                            cursor,
+                            destination) ||
+                        !writeGuestScannedInteger(
+                            destination,
+                            length,
+                            inputIndex)) {
+                        result = -1;
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            std::size_t available =
+                input.size() - inputIndex;
+            std::size_t limit =
+                width
+                ? std::min<std::size_t>(available, width)
+                : available;
+            if (!limit) {
+                inputFailure = true;
+                break;
+            }
+
+            if (std::string("diuoxXp").find(conversion) !=
+                std::string::npos) {
+                std::string token =
+                    input.substr(inputIndex, limit);
+                char* end = nullptr;
+                U64 value = 0;
+                if (conversion == 'd' ||
+                    conversion == 'i') {
+                    int base = conversion == 'i' ? 0 : 10;
+                    value = static_cast<U64>(
+                        std::strtoll(
+                            token.c_str(),
+                            &end,
+                            base));
+                } else {
+                    int base =
+                        conversion == 'o' ? 8 :
+                        ((conversion == 'x' ||
+                          conversion == 'X' ||
+                          conversion == 'p') ? 16 : 10);
+                    value = std::strtoull(
+                        token.c_str(),
+                        &end,
+                        base);
+                }
+                std::size_t consumed =
+                    static_cast<std::size_t>(
+                        end - token.c_str());
+                if (!consumed) {
+                    break;
+                }
+                inputIndex += consumed;
+                if (!suppress) {
+                    U32 destination = 0;
+                    if (!readGuestVa32(
+                            cursor,
+                            destination) ||
+                        !writeGuestScannedInteger(
+                            destination,
+                            conversion == 'p'
+                                ? std::string()
+                                : length,
+                            value)) {
+                        result = -1;
+                        return false;
+                    }
+                    ++assignments;
+                }
+                continue;
+            }
+
+            if (std::string("fFeEgGaA").find(conversion) !=
+                std::string::npos) {
+                std::string token =
+                    input.substr(inputIndex, limit);
+                char* end = nullptr;
+                double value =
+                    std::strtod(token.c_str(), &end);
+                std::size_t consumed =
+                    static_cast<std::size_t>(
+                        end - token.c_str());
+                if (!consumed) {
+                    break;
+                }
+                inputIndex += consumed;
+                if (!suppress) {
+                    U32 destination = 0;
+                    bool doubleDestination =
+                        length == "l" ||
+                        length == "L";
+                    U32 size =
+                        doubleDestination ? 8 : 4;
+                    if (!readGuestVa32(
+                            cursor,
+                            destination) ||
+                        !destination ||
+                        !memory->canWrite(
+                            destination,
+                            size)) {
+                        result = -1;
+                        return false;
+                    }
+                    if (doubleDestination) {
+                        U64 bits = 0;
+                        memcpy(
+                            &bits,
+                            &value,
+                            sizeof(bits));
+                        memory->writeq(destination, bits);
+                    } else {
+                        float single =
+                            static_cast<float>(value);
+                        U32 bits = 0;
+                        memcpy(
+                            &bits,
+                            &single,
+                            sizeof(bits));
+                        memory->writed(destination, bits);
+                    }
+                    ++assignments;
+                }
+                continue;
+            }
+
+            bool scanset = conversion == '[';
+            std::array<bool, 256> accepted = {};
+            bool invert = false;
+            if (scanset) {
+                if (formatIndex < format.size() &&
+                    format[formatIndex] == '^') {
+                    invert = true;
+                    ++formatIndex;
+                }
+                bool first = true;
+                int previous = -1;
+                while (formatIndex < format.size() &&
+                       (first ||
+                        format[formatIndex] != ']')) {
+                    unsigned char character =
+                        static_cast<unsigned char>(
+                            format[formatIndex++]);
+                    if (character == '-' &&
+                        previous >= 0 &&
+                        formatIndex < format.size() &&
+                        format[formatIndex] != ']') {
+                        unsigned char last =
+                            static_cast<unsigned char>(
+                                format[formatIndex++]);
+                        for (int value = previous;
+                             value <= last;
+                             ++value) {
+                            accepted[
+                                static_cast<U8>(value)] = true;
+                        }
+                        previous = last;
+                    } else {
+                        accepted[character] = true;
+                        previous = character;
+                    }
+                    first = false;
+                }
+                if (formatIndex >= format.size() ||
+                    format[formatIndex] != ']') {
+                    result = -1;
+                    return false;
+                }
+                ++formatIndex;
+            }
+
+            if (conversion == 's' ||
+                conversion == 'S' ||
+                conversion == 'c' ||
+                conversion == 'C' ||
+                scanset) {
+                std::size_t consumed = 0;
+                if (conversion == 'c' ||
+                    conversion == 'C') {
+                    consumed = width ? width : 1;
+                    if (consumed > available) {
+                        inputFailure = true;
+                        break;
+                    }
+                } else {
+                    while (consumed < limit) {
+                        unsigned char character =
+                            static_cast<unsigned char>(
+                                input[inputIndex + consumed]);
+                        if (scanset) {
+                            bool matches =
+                                accepted[character];
+                            if (invert) {
+                                matches = !matches;
+                            }
+                            if (!matches) {
+                                break;
+                            }
+                        } else if (
+                            std::isspace(character)) {
+                            break;
+                        }
+                        ++consumed;
+                    }
+                    if (!consumed) {
+                        break;
+                    }
+                }
+                if (!suppress) {
+                    U32 destination = 0;
+                    if (!readGuestVa32(
+                            cursor,
+                            destination)) {
+                        result = -1;
+                        return false;
+                    }
+                    bool wideDestination =
+                        conversion == 'S' ||
+                        conversion == 'C' ||
+                        length == "l" ||
+                        length == "w";
+                    U32 terminator =
+                        (conversion == 'c' ||
+                         conversion == 'C') ? 0 : 1;
+                    U64 required =
+                        (consumed + terminator) *
+                        (wideDestination ? 2 : 1);
+                    if (!destination ||
+                        required >
+                            std::numeric_limits<U32>::max() ||
+                        !memory->canWrite(
+                            destination,
+                            static_cast<U32>(required))) {
+                        result = -1;
+                        return false;
+                    }
+                    for (U32 character = 0;
+                         character < consumed;
+                         ++character) {
+                        U8 value = static_cast<U8>(
+                            input[inputIndex + character]);
+                        if (wideDestination) {
+                            memory->writew(
+                                destination + character * 2,
+                                value);
+                        } else {
+                            memory->writeb(
+                                destination + character,
+                                value);
+                        }
+                    }
+                    if (terminator) {
+                        if (wideDestination) {
+                            memory->writew(
+                                destination +
+                                    static_cast<U32>(
+                                        consumed) * 2,
+                                0);
+                        } else {
+                            memory->writeb(
+                                destination +
+                                    static_cast<U32>(
+                                        consumed),
+                                0);
+                        }
+                    }
+                    ++assignments;
+                }
+                inputIndex += consumed;
+                continue;
+            }
+
+            result = -1;
+            return false;
+        }
+        result =
+            inputFailure && !assignments
+            ? -1
+            : assignments;
+        return true;
+    }
+
+    static void returnGuestDouble(CPU* cpu, double value) {
+        U64 bits = 0;
+        memcpy(&bits, &value, sizeof(bits));
+        cpu->fpu.PREP_PUSH();
+        cpu->fpu.FLD_F64(bits, cpu->fpu.STV(0));
+    }
+
+    static void callbackUcrtUnaryMath(
+        CPU* cpu,
+        const char* api,
+        double (*operation)(double)) {
+        SugarbombRuntimeSession* session =
+            current(cpu, api);
+        if (session) {
+            returnGuestDouble(
+                cpu,
+                operation(argumentDouble(cpu, 0)));
+        }
+    }
+
+    static void callbackUcrtBinaryMath(
+        CPU* cpu,
+        const char* api,
+        double (*operation)(double, double)) {
+        SugarbombRuntimeSession* session =
+            current(cpu, api);
+        if (session) {
+            returnGuestDouble(
+                cpu,
+                operation(
+                    argumentDouble(cpu, 0),
+                    argumentDouble(cpu, 2)));
+        }
+    }
+
+    static void callbackUcrtAcos(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!acos",
+            static_cast<double (*)(double)>(std::acos));
+    }
+
+    static void callbackUcrtAsin(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!asin",
+            static_cast<double (*)(double)>(std::asin));
+    }
+
+    static void callbackUcrtAtan(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!atan",
+            static_cast<double (*)(double)>(std::atan));
+    }
+
+    static void callbackUcrtAtan2(CPU* cpu) {
+        callbackUcrtBinaryMath(
+            cpu,
+            "UCRT!atan2",
+            static_cast<double (*)(double, double)>(
+                std::atan2));
+    }
+
+    static void callbackUcrtCeil(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!ceil",
+            static_cast<double (*)(double)>(std::ceil));
+    }
+
+    static void callbackUcrtCos(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!cos",
+            static_cast<double (*)(double)>(std::cos));
+    }
+
+    static void callbackUcrtCosh(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!cosh",
+            static_cast<double (*)(double)>(std::cosh));
+    }
+
+    static void callbackUcrtExp(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!exp",
+            static_cast<double (*)(double)>(std::exp));
+    }
+
+    static void callbackUcrtFabs(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!fabs",
+            static_cast<double (*)(double)>(std::fabs));
+    }
+
+    static void callbackUcrtFloor(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!floor",
+            static_cast<double (*)(double)>(std::floor));
+    }
+
+    static void callbackUcrtLog10(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!log10",
+            static_cast<double (*)(double)>(std::log10));
+    }
+
+    static void callbackUcrtPow(CPU* cpu) {
+        callbackUcrtBinaryMath(
+            cpu,
+            "UCRT!pow",
+            static_cast<double (*)(double, double)>(
+                std::pow));
+    }
+
+    static void callbackUcrtSin(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!sin",
+            static_cast<double (*)(double)>(std::sin));
+    }
+
+    static void callbackUcrtSinh(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!sinh",
+            static_cast<double (*)(double)>(std::sinh));
+    }
+
+    static void callbackUcrtSqrt(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!sqrt",
+            static_cast<double (*)(double)>(std::sqrt));
+    }
+
+    static void callbackUcrtTan(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!tan",
+            static_cast<double (*)(double)>(std::tan));
+    }
+
+    static void callbackUcrtTanh(CPU* cpu) {
+        callbackUcrtUnaryMath(
+            cpu,
+            "UCRT!tanh",
+            static_cast<double (*)(double)>(std::tanh));
     }
 
     static double directShowPosition(const DirectShowGraph& graph) {
@@ -8348,6 +10278,12 @@ private:
         }
     }
 
+    static void callbackGetCurrentProcess(CPU* cpu) {
+        if (current(cpu, "KERNEL32!GetCurrentProcess")) {
+            cpu->reg[0].u32 = 0xffffffff;
+        }
+    }
+
     static void callbackGetCurrentThreadId(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!GetCurrentThreadId");
         if (session) {
@@ -8533,21 +10469,125 @@ private:
     static void callbackCreateDirectoryA(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!CreateDirectoryA");
         if (session) {
-            cpu->reg[0].u32 = session->createDirectory(argument(cpu, 0)) ? 1 : 0;
+            cpu->reg[0].u32 =
+                session->createDirectory(
+                    session->readAnsi(argument(cpu, 0), 32768))
+                ? 1
+                : 0;
+        }
+    }
+
+    static void callbackCreateDirectoryW(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!CreateDirectoryW");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->createDirectory(
+                    session->readWide(argument(cpu, 0), 32768))
+                ? 1
+                : 0;
+        }
+    }
+
+    static void callbackCreateDirectoryExA(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!CreateDirectoryExA");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->createDirectory(
+                    session->readAnsi(argument(cpu, 1), 32768))
+                ? 1
+                : 0;
+        }
+    }
+
+    static void callbackCreateDirectoryExW(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!CreateDirectoryExW");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->createDirectory(
+                    session->readWide(argument(cpu, 1), 32768))
+                ? 1
+                : 0;
         }
     }
 
     static void callbackDeleteFileA(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!DeleteFileA");
         if (session) {
-            cpu->reg[0].u32 = session->deleteFile(argument(cpu, 0)) ? 1 : 0;
+            cpu->reg[0].u32 =
+                session->deleteFile(
+                    session->readAnsi(argument(cpu, 0), 32768))
+                ? 1
+                : 0;
+        }
+    }
+
+    static void callbackDeleteFileW(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!DeleteFileW");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->deleteFile(
+                    session->readWide(argument(cpu, 0), 32768))
+                ? 1
+                : 0;
         }
     }
 
     static void callbackGetFileAttributesA(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!GetFileAttributesA");
         if (session) {
-            cpu->reg[0].u32 = session->getFileAttributes(argument(cpu, 0));
+            cpu->reg[0].u32 =
+                session->getFileAttributes(
+                    session->readAnsi(argument(cpu, 0), 32768));
+        }
+    }
+
+    static void callbackGetFileAttributesW(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!GetFileAttributesW");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->getFileAttributes(
+                    session->readWide(argument(cpu, 0), 32768));
+        }
+    }
+
+    static void callbackGetFileAttributesExA(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!GetFileAttributesExA");
+        if (session) {
+            if (argument(cpu, 1) != 0) {
+                session->setLastError(87);
+                cpu->reg[0].u32 = 0;
+            } else {
+                cpu->reg[0].u32 =
+                    session->writeFileAttributesEx(
+                        session->readAnsi(argument(cpu, 0), 32768),
+                        argument(cpu, 2))
+                    ? 1
+                    : 0;
+            }
+        }
+    }
+
+    static void callbackGetFileAttributesExW(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!GetFileAttributesExW");
+        if (session) {
+            if (argument(cpu, 1) != 0) {
+                session->setLastError(87);
+                cpu->reg[0].u32 = 0;
+            } else {
+                cpu->reg[0].u32 =
+                    session->writeFileAttributesEx(
+                        session->readWide(argument(cpu, 0), 32768),
+                        argument(cpu, 2))
+                    ? 1
+                    : 0;
+            }
         }
     }
 
@@ -8968,6 +11008,147 @@ private:
         }
     }
 
+    static void acquireSrwLock(
+        CPU* cpu,
+        const char* api,
+        bool exclusive) {
+        SugarbombRuntimeSession* session = current(cpu, api);
+        if (!session) {
+            return;
+        }
+        U32 address = argument(cpu, 0);
+        if (session->tryAcquireSrwLock(address, exclusive)) {
+            return;
+        }
+        GuestThreadState* state =
+            session->findGuestThread(cpu->thread->id);
+        if (!state) {
+            session->setLastError(6);
+            return;
+        }
+        session->parkGuestThreadOnSrwLock(
+            *state,
+            address,
+            exclusive);
+    }
+
+    static void callbackAcquireSrwLockExclusive(CPU* cpu) {
+        acquireSrwLock(
+            cpu,
+            "KERNEL32!AcquireSRWLockExclusive",
+            true);
+    }
+
+    static void callbackAcquireSrwLockShared(CPU* cpu) {
+        acquireSrwLock(
+            cpu,
+            "KERNEL32!AcquireSRWLockShared",
+            false);
+    }
+
+    static void callbackReleaseSrwLockExclusive(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!ReleaseSRWLockExclusive");
+        if (session) {
+            session->releaseSrwLock(argument(cpu, 0), true);
+        }
+    }
+
+    static void callbackReleaseSrwLockShared(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!ReleaseSRWLockShared");
+        if (session) {
+            session->releaseSrwLock(argument(cpu, 0), false);
+        }
+    }
+
+    static void tryAcquireSrwLock(
+        CPU* cpu,
+        const char* api,
+        bool exclusive) {
+        SugarbombRuntimeSession* session = current(cpu, api);
+        if (session) {
+            cpu->reg[0].u32 =
+                session->tryAcquireSrwLock(
+                    argument(cpu, 0),
+                    exclusive)
+                ? 1
+                : 0;
+        }
+    }
+
+    static void callbackTryAcquireSrwLockExclusive(CPU* cpu) {
+        tryAcquireSrwLock(
+            cpu,
+            "KERNEL32!TryAcquireSRWLockExclusive",
+            true);
+    }
+
+    static void callbackTryAcquireSrwLockShared(CPU* cpu) {
+        tryAcquireSrwLock(
+            cpu,
+            "KERNEL32!TryAcquireSRWLockShared",
+            false);
+    }
+
+    static void callbackSleepConditionVariableSrw(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!SleepConditionVariableSRW");
+        if (!session) {
+            return;
+        }
+        U32 conditionVariable = argument(cpu, 0);
+        U32 lock = argument(cpu, 1);
+        U32 timeout = argument(cpu, 2);
+        U32 flags = argument(cpu, 3);
+        if (!conditionVariable ||
+            !session->memory->canWrite(conditionVariable, 4) ||
+            flags & ~1U) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        bool exclusive = !(flags & 1);
+        if (!session->releaseSrwLock(lock, exclusive)) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        GuestThreadState* state =
+            session->findGuestThread(cpu->thread->id);
+        if (!state) {
+            session->setLastError(6);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        cpu->reg[0].u32 = 1;
+        session->parkGuestThreadOnConditionVariable(
+            *state,
+            conditionVariable,
+            lock,
+            exclusive,
+            timeout);
+    }
+
+    static void callbackWakeConditionVariable(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!WakeConditionVariable");
+        if (session) {
+            session->wakeConditionVariable(
+                argument(cpu, 0),
+                false);
+        }
+    }
+
+    static void callbackWakeAllConditionVariable(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!WakeAllConditionVariable");
+        if (session) {
+            session->wakeConditionVariable(
+                argument(cpu, 0),
+                true);
+        }
+    }
+
     static void callbackInterlockedExchange(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!InterlockedExchange");
         if (session) {
@@ -9104,6 +11285,31 @@ private:
     static void callbackGetConsoleOutputCP(CPU* cpu) {
         if (current(cpu, "KERNEL32!GetConsoleOutputCP")) {
             cpu->reg[0].u32 = 437;
+        }
+    }
+
+    static void callbackAreFileApisAnsi(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!AreFileApisANSI");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->fileApisAnsi ? 1 : 0;
+        }
+    }
+
+    static void callbackSetFileApisToAnsi(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!SetFileApisToANSI");
+        if (session) {
+            session->fileApisAnsi = true;
+        }
+    }
+
+    static void callbackSetFileApisToOem(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!SetFileApisToOEM");
+        if (session) {
+            session->fileApisAnsi = false;
         }
     }
 
@@ -9423,6 +11629,2047 @@ private:
         session->memory->writew(info + 34, 0x3a09);
     }
 
+    static void callbackIsProcessorFeaturePresent(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!IsProcessorFeaturePresent");
+        if (!session) {
+            return;
+        }
+        U32 feature = argument(cpu, 0);
+        bool available = false;
+        switch (feature) {
+        case 2:  // PF_COMPARE_EXCHANGE_DOUBLE
+        case 3:  // PF_MMX_INSTRUCTIONS_AVAILABLE
+        case 6:  // PF_XMMI_INSTRUCTIONS_AVAILABLE
+        case 8:  // PF_RDTSC_INSTRUCTION_AVAILABLE
+        case 10: // PF_XMMI64_INSTRUCTIONS_AVAILABLE
+            available = true;
+            break;
+        default:
+            break;
+        }
+        cpu->reg[0].u32 = available ? 1 : 0;
+        if (++session->processorFeatureTraceCount <= 16) {
+            printf(
+                "Sugarbomb Win32 CPU: "
+                "IsProcessorFeaturePresent(%u) -> %u\n",
+                feature,
+                available ? 1 : 0);
+        }
+    }
+
+    static bool validSListHeader(
+        SugarbombRuntimeSession* session,
+        U32 header) {
+        return header &&
+            !(header & 7) &&
+            session->memory->canRead(header, 8) &&
+            session->memory->canWrite(header, 8);
+    }
+
+    static void callbackInitializeSListHead(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!InitializeSListHead");
+        if (!session) {
+            return;
+        }
+        U32 header = argument(cpu, 0);
+        if (!validSListHeader(session, header)) {
+            session->setLastError(87);
+            return;
+        }
+        session->memory->writeq(header, 0);
+        printf(
+            "Sugarbomb Win32 SList: initialized header 0x%08X\n",
+            header);
+    }
+
+    static void callbackInterlockedPushEntrySList(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!InterlockedPushEntrySList");
+        if (!session) {
+            return;
+        }
+        U32 header = argument(cpu, 0);
+        U32 entry = argument(cpu, 1);
+        if (!validSListHeader(session, header) ||
+            !entry ||
+            !session->memory->canWrite(entry, 4)) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 previous = session->memory->readd(header);
+        U16 depth = session->memory->readw(header + 4);
+        U16 sequence = session->memory->readw(header + 6);
+        session->memory->writed(entry, previous);
+        session->memory->writed(header, entry);
+        session->memory->writew(
+            header + 4,
+            static_cast<U16>(depth + 1));
+        session->memory->writew(
+            header + 6,
+            static_cast<U16>(sequence + 1));
+        cpu->reg[0].u32 = previous;
+    }
+
+    static void callbackInterlockedPopEntrySList(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!InterlockedPopEntrySList");
+        if (!session) {
+            return;
+        }
+        U32 header = argument(cpu, 0);
+        if (!validSListHeader(session, header)) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 first = session->memory->readd(header);
+        if (!first) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        if (!session->memory->canRead(first, 4)) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 next = session->memory->readd(first);
+        U16 depth = session->memory->readw(header + 4);
+        U16 sequence = session->memory->readw(header + 6);
+        session->memory->writed(header, next);
+        session->memory->writew(
+            header + 4,
+            depth ? static_cast<U16>(depth - 1) : 0);
+        session->memory->writew(
+            header + 6,
+            static_cast<U16>(sequence + 1));
+        cpu->reg[0].u32 = first;
+    }
+
+    static void callbackInterlockedFlushSList(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!InterlockedFlushSList");
+        if (!session) {
+            return;
+        }
+        U32 header = argument(cpu, 0);
+        if (!validSListHeader(session, header)) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 first = session->memory->readd(header);
+        U16 sequence = session->memory->readw(header + 6);
+        session->memory->writed(header, 0);
+        session->memory->writew(header + 4, 0);
+        session->memory->writew(
+            header + 6,
+            static_cast<U16>(sequence + 1));
+        cpu->reg[0].u32 = first;
+    }
+
+    static void callbackQueryDepthSList(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!QueryDepthSList");
+        if (!session) {
+            return;
+        }
+        U32 header = argument(cpu, 0);
+        if (!validSListHeader(session, header)) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        cpu->reg[0].u32 =
+            session->memory->readw(header + 4);
+    }
+
+    static void callbackInitializeOnExitTable(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_initialize_onexit_table");
+        if (!session) {
+            return;
+        }
+        U32 table = argument(cpu, 0);
+        if (!table || !session->memory->canWrite(table, 12)) {
+            cpu->reg[0].u32 = 22; // EINVAL
+            return;
+        }
+        auto previous = session->onExitTables.find(table);
+        if (previous != session->onExitTables.end()) {
+            if (previous->second.owned) {
+                session->freeGuestHeap(
+                    previous->second.allocation);
+            }
+            session->onExitTables.erase(previous);
+        }
+        session->memory->memset(table, 0, 12);
+        cpu->reg[0].u32 = 0;
+        printf(
+            "Sugarbomb UCRT: initialized on-exit table at 0x%08X\n",
+            table);
+    }
+
+    static void callbackUcrtLocaleCodepage(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!___lc_codepage_func");
+        if (!session) {
+            return;
+        }
+        if (!session->ucrtLocaleCodepageAddress) {
+            session->ucrtLocaleCodepageAddress =
+                session->allocateGuestHeap(4, true);
+            if (session->ucrtLocaleCodepageAddress) {
+                session->memory->writed(
+                    session->ucrtLocaleCodepageAddress,
+                    1252);
+            }
+        }
+        cpu->reg[0].u32 =
+            session->ucrtLocaleCodepageAddress;
+    }
+
+    static void callbackRegisterOnExitFunction(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_register_onexit_function");
+        if (!session) {
+            return;
+        }
+        U32 table = argument(cpu, 0);
+        U32 function = argument(cpu, 1);
+        if (!table ||
+            !function ||
+            !session->memory->canWrite(table, 12) ||
+            !session->memory->canRead(function, 1)) {
+            cpu->reg[0].u32 = 22; // EINVAL
+            return;
+        }
+
+        U32 first = session->memory->readd(table);
+        U32 last = session->memory->readd(table + 4);
+        U32 end = session->memory->readd(table + 8);
+        GuestOnExitTable& tracked =
+            session->onExitTables[table];
+        if (!first && !last && !end) {
+            tracked.capacity = 32;
+            tracked.allocation = session->allocateGuestHeap(
+                tracked.capacity * sizeof(U32),
+                true);
+            if (!tracked.allocation) {
+                session->onExitTables.erase(table);
+                cpu->reg[0].u32 = 12; // ENOMEM
+                return;
+            }
+            tracked.owned = true;
+            first = tracked.allocation;
+            last = first;
+            end = first + tracked.capacity * sizeof(U32);
+        } else if (
+            !first ||
+            first > last ||
+            last > end ||
+            ((last - first) & 3) ||
+            ((end - first) & 3) ||
+            !session->memory->canRead(
+                first,
+                end - first)) {
+            session->onExitTables.erase(table);
+            cpu->reg[0].u32 = 22; // EINVAL
+            return;
+        } else if (!tracked.allocation) {
+            tracked.allocation = first;
+            tracked.capacity = (end - first) / sizeof(U32);
+            tracked.owned = false;
+        }
+
+        if (last == end) {
+            U32 used = (last - first) / sizeof(U32);
+            U32 capacity = std::max<U32>(
+                32,
+                tracked.capacity);
+            if (capacity > 0x10000) {
+                cpu->reg[0].u32 = 12; // ENOMEM
+                return;
+            }
+            U32 replacementCapacity = capacity * 2;
+            U32 replacement = session->allocateGuestHeap(
+                replacementCapacity * sizeof(U32),
+                true);
+            if (!replacement) {
+                cpu->reg[0].u32 = 12; // ENOMEM
+                return;
+            }
+            if (used) {
+                session->memory->memcpy(
+                    replacement,
+                    first,
+                    used * sizeof(U32));
+            }
+            if (tracked.owned &&
+                tracked.allocation == first) {
+                session->freeGuestHeap(first);
+            }
+            tracked.allocation = replacement;
+            tracked.capacity = replacementCapacity;
+            tracked.owned = true;
+            first = replacement;
+            last = replacement + used * sizeof(U32);
+            end = replacement +
+                replacementCapacity * sizeof(U32);
+        }
+        session->memory->writed(last, function);
+        last += sizeof(U32);
+        session->memory->writed(table, first);
+        session->memory->writed(table + 4, last);
+        session->memory->writed(table + 8, end);
+        cpu->reg[0].u32 = 0;
+        printf(
+            "Sugarbomb UCRT: registered on-exit function "
+            "0x%08X in table 0x%08X (%u entries)\n",
+            function,
+            table,
+            static_cast<U32>(
+                (last - first) / sizeof(U32)));
+    }
+
+    static void callbackConfigureNarrowArgv(CPU* cpu) {
+        if (current(cpu, "UCRT!_configure_narrow_argv")) {
+            cpu->reg[0].u32 = 0;
+        }
+    }
+
+    static void callbackInitializeNarrowEnvironment(CPU* cpu) {
+        if (current(
+                cpu,
+                "UCRT!_initialize_narrow_environment")) {
+            cpu->reg[0].u32 = 0;
+        }
+    }
+
+    static void callbackInitTerm(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_initterm");
+        if (session &&
+            !session->beginGuestFunctionArray(
+                cpu,
+                argument(cpu, 0),
+                argument(cpu, 1),
+                false,
+                "UCRT _initterm")) {
+            fprintf(
+                stderr,
+                "Sugarbomb UCRT: _initterm failed: %s\n",
+                session->error.c_str());
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+        }
+    }
+
+    static void callbackInitTermE(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_initterm_e");
+        if (session &&
+            !session->beginGuestFunctionArray(
+                cpu,
+                argument(cpu, 0),
+                argument(cpu, 1),
+                true,
+                "UCRT _initterm_e")) {
+            fprintf(
+                stderr,
+                "Sugarbomb UCRT: _initterm_e failed: %s\n",
+                session->error.c_str());
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+        }
+    }
+
+    static void callbackUcrtMalloc(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!malloc");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->allocateGuestHeap(
+                    argument(cpu, 0),
+                    false);
+        }
+    }
+
+    static void callbackUcrtFree(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!free");
+        if (session) {
+            session->freeGuestHeap(argument(cpu, 0));
+        }
+    }
+
+    static void callbackUcrtRealloc(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!realloc");
+        if (!session) {
+            return;
+        }
+        U32 previous = argument(cpu, 0);
+        U32 size = argument(cpu, 1);
+        if (previous && !size) {
+            session->freeGuestHeap(previous);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        cpu->reg[0].u32 =
+            session->reallocateGuestHeap(
+                previous,
+                size,
+                false);
+    }
+
+    static void callbackUcrtMallocDebug(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_malloc_dbg");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->allocateGuestHeap(
+                    argument(cpu, 0),
+                    false);
+        }
+    }
+
+    static void callbackUcrtCallocDebug(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_calloc_dbg");
+        if (!session) {
+            return;
+        }
+        U64 bytes =
+            static_cast<U64>(argument(cpu, 0)) *
+            argument(cpu, 1);
+        if (bytes > std::numeric_limits<U32>::max()) {
+            session->setLastError(8);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        cpu->reg[0].u32 =
+            session->allocateGuestHeap(
+                static_cast<U32>(bytes),
+                true);
+    }
+
+    static void callbackUcrtFreeDebug(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_free_dbg");
+        if (session) {
+            session->freeGuestHeap(argument(cpu, 0));
+        }
+    }
+
+    static bool validateCrtMemory(
+        SugarbombRuntimeSession* session,
+        CPU* cpu,
+        const char* operation,
+        U32 destination,
+        U32 source,
+        U32 size,
+        bool readSource) {
+        if (!size) {
+            return true;
+        }
+        if (!destination ||
+            !session->memory->canWrite(destination, size) ||
+            (readSource &&
+             (!source ||
+              !session->memory->canRead(source, size)))) {
+            fprintf(
+                stderr,
+                "Sugarbomb CRT: %s received an invalid guest range "
+                "(destination=0x%08X, source=0x%08X, size=%u)\n",
+                operation,
+                destination,
+                source,
+                size);
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return false;
+        }
+        return true;
+    }
+
+    static void callbackCrtMemset(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!memset");
+        if (!session) {
+            return;
+        }
+        U32 destination = argument(cpu, 0);
+        U32 size = argument(cpu, 2);
+        if (!validateCrtMemory(
+                session,
+                cpu,
+                "memset",
+                destination,
+                0,
+                size,
+                false)) {
+            return;
+        }
+        if (size) {
+            session->memory->memset(
+                destination,
+                static_cast<U8>(argument(cpu, 1)),
+                size);
+        }
+        cpu->reg[0].u32 = destination;
+    }
+
+    static void callbackCrtMemcpy(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!memcpy");
+        if (!session) {
+            return;
+        }
+        U32 destination = argument(cpu, 0);
+        U32 source = argument(cpu, 1);
+        U32 size = argument(cpu, 2);
+        if (!validateCrtMemory(
+                session,
+                cpu,
+                "memcpy",
+                destination,
+                source,
+                size,
+                true)) {
+            return;
+        }
+        if (size) {
+            session->memory->memcpy(
+                destination,
+                source,
+                size);
+        }
+        cpu->reg[0].u32 = destination;
+    }
+
+    static void callbackCrtMemmove(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!memmove");
+        if (!session) {
+            return;
+        }
+        U32 destination = argument(cpu, 0);
+        U32 source = argument(cpu, 1);
+        U32 size = argument(cpu, 2);
+        if (!validateCrtMemory(
+                session,
+                cpu,
+                "memmove",
+                destination,
+                source,
+                size,
+                true)) {
+            return;
+        }
+        if (size) {
+            // KMemory's guest-to-guest copy selects a direction and is
+            // overlap-safe.
+            session->memory->memcpy(
+                destination,
+                source,
+                size);
+        }
+        cpu->reg[0].u32 = destination;
+    }
+
+    static void callbackCrtMemcmp(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!memcmp");
+        if (!session) {
+            return;
+        }
+        U32 left = argument(cpu, 0);
+        U32 right = argument(cpu, 1);
+        U32 size = argument(cpu, 2);
+        if (size &&
+            (!left ||
+             !right ||
+             !session->memory->canRead(left, size) ||
+             !session->memory->canRead(right, size))) {
+            fprintf(
+                stderr,
+                "Sugarbomb CRT: memcmp received an invalid guest "
+                "range (left=0x%08X, right=0x%08X, size=%u)\n",
+                left,
+                right,
+                size);
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        S32 result = 0;
+        for (U32 index = 0; index < size; ++index) {
+            U8 leftByte =
+                session->memory->readb(left + index);
+            U8 rightByte =
+                session->memory->readb(right + index);
+            if (leftByte != rightByte) {
+                result = static_cast<S32>(leftByte) -
+                    static_cast<S32>(rightByte);
+                break;
+            }
+        }
+        cpu->reg[0].u32 = static_cast<U32>(result);
+    }
+
+    static void callbackCrtMemchr(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!memchr");
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 0);
+        U8 value = static_cast<U8>(argument(cpu, 1));
+        U32 size = argument(cpu, 2);
+        if (size &&
+            (!source ||
+             !session->memory->canRead(source, size))) {
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        cpu->reg[0].u32 = 0;
+        for (U32 index = 0; index < size; ++index) {
+            if (session->memory->readb(source + index) == value) {
+                cpu->reg[0].u32 = source + index;
+                break;
+            }
+        }
+    }
+
+    static void callbackCrtStrchr(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!strchr");
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 0);
+        U8 value = static_cast<U8>(argument(cpu, 1));
+        U32 length = 0;
+        if (!session->guestCStringLength(source, length)) {
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        cpu->reg[0].u32 = 0;
+        for (U32 index = 0; index <= length; ++index) {
+            if (session->memory->readb(source + index) == value) {
+                cpu->reg[0].u32 = source + index;
+                break;
+            }
+        }
+    }
+
+    static void callbackCrtStrrchr(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!strrchr");
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 0);
+        U8 value = static_cast<U8>(argument(cpu, 1));
+        U32 length = 0;
+        if (!session->guestCStringLength(source, length)) {
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        cpu->reg[0].u32 = 0;
+        for (U32 index = length + 1; index; --index) {
+            U32 offset = index - 1;
+            if (session->memory->readb(source + offset) == value) {
+                cpu->reg[0].u32 = source + offset;
+                break;
+            }
+        }
+    }
+
+    static void callbackCrtStrstr(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "CRT!strstr");
+        if (!session) {
+            return;
+        }
+        U32 haystack = argument(cpu, 0);
+        U32 needle = argument(cpu, 1);
+        U32 haystackLength = 0;
+        U32 needleLength = 0;
+        if (!session->guestCStringLength(
+                haystack,
+                haystackLength) ||
+            !session->guestCStringLength(
+                needle,
+                needleLength)) {
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        if (!needleLength) {
+            cpu->reg[0].u32 = haystack;
+            return;
+        }
+        cpu->reg[0].u32 = 0;
+        if (needleLength > haystackLength) {
+            return;
+        }
+        for (U32 index = 0;
+             index <= haystackLength - needleLength;
+             ++index) {
+            bool equal = true;
+            for (U32 character = 0;
+                 character < needleLength;
+                 ++character) {
+                if (session->memory->readb(
+                        haystack + index + character) !=
+                    session->memory->readb(
+                        needle + character)) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) {
+                cpu->reg[0].u32 = haystack + index;
+                break;
+            }
+        }
+    }
+
+    static bool readGuestCrtString(
+        SugarbombRuntimeSession* session,
+        CPU* cpu,
+        U32 address,
+        std::string& value,
+        U32& length) {
+        if (!session->guestCStringLength(address, length)) {
+            fprintf(
+                stderr,
+                "Sugarbomb UCRT: invalid string pointer "
+                "0x%08X\n",
+                address);
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return false;
+        }
+        value = session->readAnsi(address, length + 1);
+        return true;
+    }
+
+    static U8 asciiLower(U8 value) {
+        return value >= 'A' && value <= 'Z'
+            ? static_cast<U8>(value + ('a' - 'A'))
+            : value;
+    }
+
+    static bool compareGuestCrtStrings(
+        SugarbombRuntimeSession* session,
+        CPU* cpu,
+        U32 left,
+        U32 right,
+        U32 limit,
+        bool limited,
+        bool ignoreCase,
+        S32& result) {
+        result = 0;
+        if (limited && !limit) {
+            return true;
+        }
+        U32 index = 0;
+        for (;;) {
+            if (index >
+                    std::numeric_limits<U32>::max() - left ||
+                index >
+                    std::numeric_limits<U32>::max() - right ||
+                !session->memory->canRead(left + index, 1) ||
+                !session->memory->canRead(right + index, 1)) {
+                session->runtimeStopping = true;
+                cpu->thread->terminating = true;
+                return false;
+            }
+            U8 leftValue =
+                session->memory->readb(left + index);
+            U8 rightValue =
+                session->memory->readb(right + index);
+            U8 comparedLeft =
+                ignoreCase ? asciiLower(leftValue) : leftValue;
+            U8 comparedRight =
+                ignoreCase ? asciiLower(rightValue) : rightValue;
+            if (comparedLeft != comparedRight) {
+                result =
+                    static_cast<S32>(comparedLeft) -
+                    static_cast<S32>(comparedRight);
+                return true;
+            }
+            if (!leftValue) {
+                return true;
+            }
+            ++index;
+            if ((limited && index >= limit) ||
+                index >= 16 * 1024 * 1024) {
+                return true;
+            }
+        }
+    }
+
+    static void callbackUcrtStrdup(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_strdup");
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 0);
+        U32 length = 0;
+        if (!session->guestCStringLength(source, length) ||
+            length == std::numeric_limits<U32>::max()) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 destination =
+            session->allocateGuestHeap(length + 1, false);
+        if (destination) {
+            session->memory->memcpy(
+                destination,
+                source,
+                length + 1);
+        }
+        cpu->reg[0].u32 = destination;
+    }
+
+    static void callbackUcrtStrlen(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!strlen");
+        if (!session) {
+            return;
+        }
+        U32 length = 0;
+        if (!session->guestCStringLength(
+                argument(cpu, 0),
+                length)) {
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        cpu->reg[0].u32 = length;
+    }
+
+    static void callbackUcrtStringCompare(
+        CPU* cpu,
+        const char* api,
+        bool limited,
+        bool ignoreCase) {
+        SugarbombRuntimeSession* session = current(cpu, api);
+        if (!session) {
+            return;
+        }
+        S32 result = 0;
+        if (compareGuestCrtStrings(
+                session,
+                cpu,
+                argument(cpu, 0),
+                argument(cpu, 1),
+                limited ? argument(cpu, 2) : 0,
+                limited,
+                ignoreCase,
+                result)) {
+            cpu->reg[0].u32 =
+                static_cast<U32>(result);
+        }
+    }
+
+    static void callbackUcrtStrcmp(CPU* cpu) {
+        callbackUcrtStringCompare(
+            cpu,
+            "UCRT!strcmp",
+            false,
+            false);
+    }
+
+    static void callbackUcrtStrncmp(CPU* cpu) {
+        callbackUcrtStringCompare(
+            cpu,
+            "UCRT!strncmp",
+            true,
+            false);
+    }
+
+    static void callbackUcrtStricmp(CPU* cpu) {
+        callbackUcrtStringCompare(
+            cpu,
+            "UCRT!_stricmp",
+            false,
+            true);
+    }
+
+    static void callbackUcrtStrnicmp(CPU* cpu) {
+        callbackUcrtStringCompare(
+            cpu,
+            "UCRT!_strnicmp",
+            true,
+            true);
+    }
+
+    static void callbackUcrtStrcpy(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!strcpy");
+        if (!session) {
+            return;
+        }
+        U32 destination = argument(cpu, 0);
+        U32 source = argument(cpu, 1);
+        U32 length = 0;
+        if (!session->guestCStringLength(source, length) ||
+            length == std::numeric_limits<U32>::max() ||
+            !destination ||
+            !session->memory->canWrite(
+                destination,
+                length + 1)) {
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        session->memory->memcpy(
+            destination,
+            source,
+            length + 1);
+        cpu->reg[0].u32 = destination;
+    }
+
+    static U32 copyGuestCrtStringSecure(
+        SugarbombRuntimeSession* session,
+        U32 destination,
+        U32 capacity,
+        U32 source,
+        bool append) {
+        if (!destination ||
+            !capacity ||
+            !session->memory->canWrite(destination, capacity)) {
+            return 22; // EINVAL
+        }
+        U32 sourceLength = 0;
+        if (!session->guestCStringLength(
+                source,
+                sourceLength)) {
+            session->memory->writeb(destination, 0);
+            return 22;
+        }
+        U32 destinationLength = 0;
+        if (append &&
+            !session->guestCStringLength(
+                destination,
+                destinationLength,
+                capacity)) {
+            session->memory->writeb(destination, 0);
+            return 22;
+        }
+        U64 required =
+            static_cast<U64>(destinationLength) +
+            sourceLength + 1;
+        if (required > capacity) {
+            session->memory->writeb(destination, 0);
+            return 34; // ERANGE
+        }
+        session->memory->memcpy(
+            destination + destinationLength,
+            source,
+            sourceLength + 1);
+        return 0;
+    }
+
+    static void callbackUcrtStrcpyS(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!strcpy_s");
+        if (session) {
+            cpu->reg[0].u32 =
+                copyGuestCrtStringSecure(
+                    session,
+                    argument(cpu, 0),
+                    argument(cpu, 1),
+                    argument(cpu, 2),
+                    false);
+        }
+    }
+
+    static void callbackUcrtStrcatS(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!strcat_s");
+        if (session) {
+            cpu->reg[0].u32 =
+                copyGuestCrtStringSecure(
+                    session,
+                    argument(cpu, 0),
+                    argument(cpu, 1),
+                    argument(cpu, 2),
+                    true);
+        }
+    }
+
+    enum class UcrtCtypeOperation {
+        IsLower,
+        IsUpper,
+        IsAlpha,
+        IsDigit,
+        IsAlnum,
+        IsSpace,
+        IsPunct,
+        IsPrint,
+        ToLower,
+        ToUpper
+    };
+
+    static void callbackUcrtCtype(
+        CPU* cpu,
+        const char* api,
+        UcrtCtypeOperation operation) {
+        if (!current(cpu, api)) {
+            return;
+        }
+        S32 input = static_cast<S32>(argument(cpu, 0));
+        if (input == -1 ||
+            input < 0 ||
+            input > 255) {
+            cpu->reg[0].u32 =
+                static_cast<U32>(input);
+            return;
+        }
+        U8 value = static_cast<U8>(input);
+        bool lower = value >= 'a' && value <= 'z';
+        bool upper = value >= 'A' && value <= 'Z';
+        bool digit = value >= '0' && value <= '9';
+        bool space =
+            value == ' ' ||
+            value == '\t' ||
+            value == '\n' ||
+            value == '\r' ||
+            value == '\f' ||
+            value == '\v';
+        bool printable = value >= 0x20 && value <= 0x7e;
+        switch (operation) {
+        case UcrtCtypeOperation::IsLower:
+            cpu->reg[0].u32 = lower;
+            break;
+        case UcrtCtypeOperation::IsUpper:
+            cpu->reg[0].u32 = upper;
+            break;
+        case UcrtCtypeOperation::IsAlpha:
+            cpu->reg[0].u32 = lower || upper;
+            break;
+        case UcrtCtypeOperation::IsDigit:
+            cpu->reg[0].u32 = digit;
+            break;
+        case UcrtCtypeOperation::IsAlnum:
+            cpu->reg[0].u32 = lower || upper || digit;
+            break;
+        case UcrtCtypeOperation::IsSpace:
+            cpu->reg[0].u32 = space;
+            break;
+        case UcrtCtypeOperation::IsPunct:
+            cpu->reg[0].u32 =
+                printable &&
+                !lower &&
+                !upper &&
+                !digit &&
+                !space;
+            break;
+        case UcrtCtypeOperation::IsPrint:
+            cpu->reg[0].u32 = printable;
+            break;
+        case UcrtCtypeOperation::ToLower:
+            cpu->reg[0].u32 = upper
+                ? value + ('a' - 'A')
+                : value;
+            break;
+        case UcrtCtypeOperation::ToUpper:
+            cpu->reg[0].u32 = lower
+                ? value - ('a' - 'A')
+                : value;
+            break;
+        }
+    }
+
+    static void callbackUcrtIsLower(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!islower",
+            UcrtCtypeOperation::IsLower);
+    }
+
+    static void callbackUcrtIsUpper(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!isupper",
+            UcrtCtypeOperation::IsUpper);
+    }
+
+    static void callbackUcrtIsAlpha(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!isalpha",
+            UcrtCtypeOperation::IsAlpha);
+    }
+
+    static void callbackUcrtIsDigit(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!isdigit",
+            UcrtCtypeOperation::IsDigit);
+    }
+
+    static void callbackUcrtIsAlnum(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!isalnum",
+            UcrtCtypeOperation::IsAlnum);
+    }
+
+    static void callbackUcrtIsSpace(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!isspace",
+            UcrtCtypeOperation::IsSpace);
+    }
+
+    static void callbackUcrtIsPunct(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!ispunct",
+            UcrtCtypeOperation::IsPunct);
+    }
+
+    static void callbackUcrtIsPrint(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!isprint",
+            UcrtCtypeOperation::IsPrint);
+    }
+
+    static void callbackUcrtToLower(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!tolower",
+            UcrtCtypeOperation::ToLower);
+    }
+
+    static void callbackUcrtToUpper(CPU* cpu) {
+        callbackUcrtCtype(
+            cpu,
+            "UCRT!toupper",
+            UcrtCtypeOperation::ToUpper);
+    }
+
+    static bool prepareGuestNumberString(
+        SugarbombRuntimeSession* session,
+        CPU* cpu,
+        U32 source,
+        std::string& value) {
+        U32 length = 0;
+        return readGuestCrtString(
+            session,
+            cpu,
+            source,
+            value,
+            length);
+    }
+
+    static void callbackUcrtParseInteger(
+        CPU* cpu,
+        const char* api,
+        bool signedValue,
+        bool wideResult) {
+        SugarbombRuntimeSession* session = current(cpu, api);
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 0);
+        U32 endPointer = argument(cpu, 1);
+        S32 base = static_cast<S32>(argument(cpu, 2));
+        std::string value;
+        if ((base != 0 && (base < 2 || base > 36)) ||
+            !prepareGuestNumberString(
+                session,
+                cpu,
+                source,
+                value)) {
+            session->setUcrtErrno(22);
+            cpu->reg[0].u32 = 0;
+            cpu->reg[2].u32 = 0;
+            return;
+        }
+        errno = 0;
+        char* end = nullptr;
+        U64 parsed = signedValue
+            ? static_cast<U64>(
+                std::strtoll(value.c_str(), &end, base))
+            : std::strtoull(value.c_str(), &end, base);
+        U32 consumed = static_cast<U32>(
+            end - value.c_str());
+        if (endPointer) {
+            if (!session->memory->canWrite(endPointer, 4)) {
+                session->setUcrtErrno(22);
+                cpu->reg[0].u32 = 0;
+                cpu->reg[2].u32 = 0;
+                return;
+            }
+            session->memory->writed(
+                endPointer,
+                source + consumed);
+        }
+        if (errno == ERANGE) {
+            session->setUcrtErrno(34);
+        }
+        if (!wideResult) {
+            if (signedValue) {
+                S64 signedParsed = static_cast<S64>(parsed);
+                if (signedParsed >
+                        std::numeric_limits<S32>::max()) {
+                    parsed = static_cast<U32>(
+                        std::numeric_limits<S32>::max());
+                    session->setUcrtErrno(34);
+                } else if (
+                    signedParsed <
+                        std::numeric_limits<S32>::min()) {
+                    parsed = static_cast<U32>(
+                        std::numeric_limits<S32>::min());
+                    session->setUcrtErrno(34);
+                }
+            } else if (
+                parsed >
+                    std::numeric_limits<U32>::max()) {
+                parsed =
+                    std::numeric_limits<U32>::max();
+                session->setUcrtErrno(34);
+            }
+        }
+        cpu->reg[0].u32 = static_cast<U32>(parsed);
+        cpu->reg[2].u32 = wideResult
+            ? static_cast<U32>(parsed >> 32)
+            : 0;
+    }
+
+    static void callbackUcrtStrtol(CPU* cpu) {
+        callbackUcrtParseInteger(
+            cpu,
+            "UCRT!strtol",
+            true,
+            false);
+    }
+
+    static void callbackUcrtStrtoll(CPU* cpu) {
+        callbackUcrtParseInteger(
+            cpu,
+            "UCRT!strtoll",
+            true,
+            true);
+    }
+
+    static void callbackUcrtStrtoul(CPU* cpu) {
+        callbackUcrtParseInteger(
+            cpu,
+            "UCRT!strtoul",
+            false,
+            false);
+    }
+
+    static void callbackUcrtParseDouble(
+        CPU* cpu,
+        const char* api,
+        bool hasEndPointer) {
+        SugarbombRuntimeSession* session = current(cpu, api);
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 0);
+        std::string value;
+        if (!prepareGuestNumberString(
+                session,
+                cpu,
+                source,
+                value)) {
+            returnGuestDouble(cpu, 0.0);
+            return;
+        }
+        errno = 0;
+        char* end = nullptr;
+        double parsed =
+            std::strtod(value.c_str(), &end);
+        if (hasEndPointer) {
+            U32 endPointer = argument(cpu, 1);
+            if (endPointer) {
+                if (!session->memory->canWrite(
+                        endPointer,
+                        4)) {
+                    session->setUcrtErrno(22);
+                    returnGuestDouble(cpu, 0.0);
+                    return;
+                }
+                session->memory->writed(
+                    endPointer,
+                    source + static_cast<U32>(
+                        end - value.c_str()));
+            }
+        }
+        if (errno == ERANGE) {
+            session->setUcrtErrno(34);
+        }
+        returnGuestDouble(cpu, parsed);
+    }
+
+    static void callbackUcrtStrtod(CPU* cpu) {
+        callbackUcrtParseDouble(
+            cpu,
+            "UCRT!strtod",
+            true);
+    }
+
+    static void callbackUcrtAtof(CPU* cpu) {
+        callbackUcrtParseDouble(
+            cpu,
+            "UCRT!atof",
+            false);
+    }
+
+    static void callbackUcrtAtoi(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!atoi");
+        if (!session) {
+            return;
+        }
+        std::string value;
+        if (!prepareGuestNumberString(
+                session,
+                cpu,
+                argument(cpu, 0),
+                value)) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        cpu->reg[0].u32 = static_cast<U32>(
+            static_cast<S32>(
+                std::strtoll(
+                    value.c_str(),
+                    nullptr,
+                    10)));
+    }
+
+    static void callbackUcrtErrno(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_errno");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->ensureUcrtErrno();
+        }
+    }
+
+    static bool readGuestPrintfFormat(
+        SugarbombRuntimeSession* session,
+        U32 address,
+        bool wide,
+        std::string& format) {
+        if (wide) {
+            return session->readGuestWideString(
+                address,
+                format);
+        }
+        U32 length = 0;
+        if (!session->guestCStringLength(
+                address,
+                length,
+                1024 * 1024)) {
+            return false;
+        }
+        format = session->readAnsi(address, length + 1);
+        return true;
+    }
+
+    static void callbackUcrtCommonVsprintf(
+        CPU* cpu,
+        const char* api,
+        bool secure,
+        bool wide) {
+        SugarbombRuntimeSession* session = current(cpu, api);
+        if (!session) {
+            return;
+        }
+        U32 destination = argument(cpu, 2);
+        U32 capacity = argument(cpu, 3);
+        U32 formatAddress = argument(cpu, 4);
+        U32 vaList = argument(cpu, 6);
+        std::string format;
+        std::string output;
+        bool success =
+            destination &&
+            capacity &&
+            readGuestPrintfFormat(
+                session,
+                formatAddress,
+                wide,
+                format) &&
+            session->formatGuestPrintf(
+                format,
+                vaList,
+                wide,
+                output);
+        if (success) {
+            U64 requiredUnits =
+                static_cast<U64>(output.size()) + 1;
+            U64 requiredBytes =
+                requiredUnits * (wide ? 2 : 1);
+            success =
+                (!secure || requiredUnits <= capacity) &&
+                requiredUnits <= capacity &&
+                requiredBytes <=
+                    std::numeric_limits<U32>::max() &&
+                session->memory->canWrite(
+                    destination,
+                    static_cast<U32>(requiredBytes));
+        }
+        if (!success) {
+            if (destination &&
+                session->memory->canWrite(
+                    destination,
+                    wide ? 2 : 1)) {
+                if (wide) {
+                    session->memory->writew(destination, 0);
+                } else {
+                    session->memory->writeb(destination, 0);
+                }
+            }
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        if (wide) {
+            for (U32 index = 0;
+                 index < output.size();
+                 ++index) {
+                session->memory->writew(
+                    destination + index * 2,
+                    static_cast<U8>(output[index]));
+            }
+            session->memory->writew(
+                destination +
+                    static_cast<U32>(output.size()) * 2,
+                0);
+        } else {
+            if (!output.empty()) {
+                session->memory->memcpy(
+                    destination,
+                    output.data(),
+                    static_cast<U32>(output.size()));
+            }
+            session->memory->writeb(
+                destination +
+                    static_cast<U32>(output.size()),
+                0);
+        }
+        if (++session->printfTraceCount <= 24) {
+            printf(
+                "Sugarbomb UCRT printf: \"%s\" -> \"%s\"\n",
+                format.c_str(),
+                output.c_str());
+        }
+        cpu->reg[0].u32 =
+            static_cast<U32>(output.size());
+    }
+
+    static void callbackUcrtStdioCommonVsprintfS(CPU* cpu) {
+        callbackUcrtCommonVsprintf(
+            cpu,
+            "UCRT!__stdio_common_vsprintf_s",
+            true,
+            false);
+    }
+
+    static void callbackUcrtStdioCommonVsprintf(CPU* cpu) {
+        callbackUcrtCommonVsprintf(
+            cpu,
+            "UCRT!__stdio_common_vsprintf",
+            false,
+            false);
+    }
+
+    static void callbackUcrtStdioCommonVswprintf(CPU* cpu) {
+        callbackUcrtCommonVsprintf(
+            cpu,
+            "UCRT!__stdio_common_vswprintf",
+            false,
+            true);
+    }
+
+    static void callbackUcrtCommonVfprintf(
+        CPU* cpu,
+        const char* api) {
+        SugarbombRuntimeSession* session = current(cpu, api);
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 2));
+        std::string format;
+        std::string output;
+        if (!stream ||
+            !readGuestPrintfFormat(
+                session,
+                argument(cpu, 3),
+                false,
+                format) ||
+            !session->formatGuestPrintf(
+                format,
+                argument(cpu, 5),
+                false,
+                output) ||
+            session->writeHostToGuestCFile(
+                *stream,
+                output) != output.size()) {
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        if (++session->printfTraceCount <= 24) {
+            printf(
+                "Sugarbomb UCRT fprintf: \"%s\" -> \"%s\"\n",
+                format.c_str(),
+                output.c_str());
+        }
+        cpu->reg[0].u32 =
+            static_cast<U32>(output.size());
+    }
+
+    static void callbackUcrtStdioCommonVfprintfS(CPU* cpu) {
+        callbackUcrtCommonVfprintf(
+            cpu,
+            "UCRT!__stdio_common_vfprintf_s");
+    }
+
+    static void callbackUcrtStdioCommonVfprintf(CPU* cpu) {
+        callbackUcrtCommonVfprintf(
+            cpu,
+            "UCRT!__stdio_common_vfprintf");
+    }
+
+    static void callbackUcrtStdioCommonVsscanf(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!__stdio_common_vsscanf");
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 2);
+        U32 sourceLimit = argument(cpu, 3);
+        U32 sourceLength = 0;
+        bool sourceValid = source != 0;
+        if (sourceValid &&
+            sourceLimit == 0xffffffff) {
+            sourceValid = session->guestCStringLength(
+                source,
+                sourceLength,
+                16 * 1024 * 1024);
+        } else if (sourceValid) {
+            while (sourceLength < sourceLimit &&
+                   sourceLength < 16 * 1024 * 1024) {
+                if (source >
+                        std::numeric_limits<U32>::max() -
+                            sourceLength ||
+                    !session->memory->canRead(
+                        source + sourceLength,
+                        1)) {
+                    sourceValid = false;
+                    break;
+                }
+                if (!session->memory->readb(
+                        source + sourceLength)) {
+                    break;
+                }
+                ++sourceLength;
+            }
+            if (sourceLength == 16 * 1024 * 1024 &&
+                sourceLength < sourceLimit) {
+                sourceValid = false;
+            }
+        }
+        std::string format;
+        std::string input;
+        S32 result = -1;
+        if (sourceValid &&
+            readGuestPrintfFormat(
+                session,
+                argument(cpu, 4),
+                false,
+                format)) {
+            input = session->readAnsi(
+                source,
+                sourceLength + 1);
+            session->formatGuestScanf(
+                input,
+                format,
+                argument(cpu, 6),
+                result);
+        }
+        if (++session->printfTraceCount <= 24) {
+            printf(
+                "Sugarbomb UCRT scanf: \"%s\" <- \"%s\" "
+                "(%d assignment%s)\n",
+                format.c_str(),
+                input.c_str(),
+                result,
+                result == 1 ? "" : "s");
+        }
+        cpu->reg[0].u32 = static_cast<U32>(result);
+    }
+
+    static void callbackUcrtFsopen(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_fsopen");
+        if (session) {
+            cpu->reg[0].u32 = session->openGuestCFile(
+                session->readAnsi(argument(cpu, 0), 4096),
+                session->readAnsi(argument(cpu, 1), 64));
+        }
+    }
+
+    static void callbackUcrtFopenS(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fopen_s");
+        if (!session) {
+            return;
+        }
+        U32 destination = argument(cpu, 0);
+        if (!destination ||
+            !session->memory->canWrite(destination, 4)) {
+            cpu->reg[0].u32 = 22; // EINVAL
+            return;
+        }
+        U32 stream = session->openGuestCFile(
+            session->readAnsi(argument(cpu, 1), 4096),
+            session->readAnsi(argument(cpu, 2), 64));
+        session->memory->writed(destination, stream);
+        cpu->reg[0].u32 = stream ? 0 : 2; // ENOENT
+    }
+
+    static void callbackUcrtFclose(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fclose");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->closeGuestCFile(argument(cpu, 0))
+                ? 0
+                : 0xffffffff;
+        }
+    }
+
+    static void callbackUcrtFread(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fread");
+        if (!session) {
+            return;
+        }
+        U32 elementSize = argument(cpu, 1);
+        U32 elementCount = argument(cpu, 2);
+        U64 requested =
+            static_cast<U64>(elementSize) * elementCount;
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 3));
+        if (!elementSize ||
+            !elementCount) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        if (!stream ||
+            requested > std::numeric_limits<U32>::max()) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 bytes = session->readGuestCFile(
+            *stream,
+            argument(cpu, 0),
+            static_cast<U32>(requested));
+        cpu->reg[0].u32 = bytes / elementSize;
+    }
+
+    static void callbackUcrtFwrite(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fwrite");
+        if (!session) {
+            return;
+        }
+        U32 elementSize = argument(cpu, 1);
+        U32 elementCount = argument(cpu, 2);
+        U64 requested =
+            static_cast<U64>(elementSize) * elementCount;
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 3));
+        if (!elementSize ||
+            !elementCount) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        if (!stream ||
+            requested > std::numeric_limits<U32>::max()) {
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 bytes = session->writeGuestCFile(
+            *stream,
+            argument(cpu, 0),
+            static_cast<U32>(requested));
+        cpu->reg[0].u32 = bytes / elementSize;
+    }
+
+    static void callbackUcrtFgetc(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fgetc");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        cpu->reg[0].u32 = stream
+            ? static_cast<U32>(
+                session->readGuestCFileByte(*stream))
+            : 0xffffffff;
+    }
+
+    static void callbackUcrtFputc(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fputc");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 1));
+        U8 value = static_cast<U8>(argument(cpu, 0));
+        cpu->reg[0].u32 =
+            stream &&
+            session->writeGuestCFileByte(*stream, value)
+            ? value
+            : 0xffffffff;
+    }
+
+    static void callbackUcrtFputs(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fputs");
+        if (!session) {
+            return;
+        }
+        U32 source = argument(cpu, 0);
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 1));
+        U32 length = 0;
+        if (!stream ||
+            !session->guestCStringLength(source, length)) {
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        cpu->reg[0].u32 =
+            session->writeGuestCFile(
+                *stream,
+                source,
+                length) == length
+            ? 0
+            : 0xffffffff;
+    }
+
+    static void callbackUcrtFflush(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fflush");
+        if (!session) {
+            return;
+        }
+        U32 streamAddress = argument(cpu, 0);
+        if (!streamAddress) {
+            fflush(stdout);
+            fflush(stderr);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        cpu->reg[0].u32 =
+            session->findGuestCFile(streamAddress)
+            ? 0
+            : 0xffffffff;
+    }
+
+    static void callbackUcrtFseeki64(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_fseeki64");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        if (!stream || stream->standardIndex >= 0) {
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        U64 rawDistance =
+            static_cast<U64>(argument(cpu, 1)) |
+            (static_cast<U64>(argument(cpu, 2)) << 32);
+        U64 position = 0;
+        bool success = session->setGuestFilePointer(
+            stream->guestFileHandle,
+            static_cast<S64>(rawDistance),
+            argument(cpu, 3),
+            position);
+        if (success) {
+            stream->endOfFile = false;
+            stream->ungot = -1;
+        }
+        cpu->reg[0].u32 =
+            success ? 0 : 0xffffffff;
+    }
+
+    static void callbackUcrtFgetpos(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fgetpos");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        U32 destination = argument(cpu, 1);
+        auto file = stream
+            ? session->guestFiles.find(stream->guestFileHandle)
+            : session->guestFiles.end();
+        if (!stream ||
+            file == session->guestFiles.end() ||
+            !destination ||
+            !session->memory->canWrite(destination, 8)) {
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        session->memory->writeq(
+            destination,
+            file->second.position);
+        cpu->reg[0].u32 = 0;
+    }
+
+    static void callbackUcrtFsetpos(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!fsetpos");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        U32 source = argument(cpu, 1);
+        if (!stream ||
+            stream->standardIndex >= 0 ||
+            !source ||
+            !session->memory->canRead(source, 8)) {
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        U64 position = 0;
+        U64 raw = session->memory->readq(source);
+        bool success =
+            raw <= static_cast<U64>(
+                std::numeric_limits<S64>::max()) &&
+            session->setGuestFilePointer(
+                stream->guestFileHandle,
+                static_cast<S64>(raw),
+                0,
+                position);
+        if (success) {
+            stream->endOfFile = false;
+            stream->ungot = -1;
+        }
+        cpu->reg[0].u32 =
+            success ? 0 : 0xffffffff;
+    }
+
+    static void callbackUcrtSetvbuf(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!setvbuf");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        if (!stream ||
+            !session->memory->canWrite(
+                stream->objectAddress,
+                12)) {
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        session->memory->memset(
+            stream->objectAddress,
+            0,
+            12);
+        cpu->reg[0].u32 = 0;
+    }
+
+    static void callbackUcrtUngetc(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!ungetc");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 1));
+        U32 character = argument(cpu, 0);
+        if (!stream ||
+            character == 0xffffffff ||
+            stream->ungot >= 0) {
+            cpu->reg[0].u32 = 0xffffffff;
+            return;
+        }
+        stream->ungot = static_cast<U8>(character);
+        stream->endOfFile = false;
+        cpu->reg[0].u32 =
+            static_cast<U8>(character);
+    }
+
+    static void callbackUcrtLockFile(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_lock_file");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        if (!stream) {
+            return;
+        }
+        if (!session->enterCriticalSection(
+                stream->lockAddress)) {
+            GuestThreadState* state =
+                session->findGuestThread(cpu->thread->id);
+            if (state) {
+                session->parkGuestThreadOnCriticalSection(
+                    *state,
+                    stream->lockAddress);
+            }
+        }
+    }
+
+    static void callbackUcrtUnlockFile(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_unlock_file");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        if (stream) {
+            session->leaveCriticalSection(
+                stream->lockAddress);
+        }
+    }
+
+    static void callbackUcrtGetStreamBufferPointers(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_get_stream_buffer_pointers");
+        if (!session) {
+            return;
+        }
+        GuestCFile* stream =
+            session->findGuestCFile(argument(cpu, 0));
+        U32 base = argument(cpu, 1);
+        U32 current = argument(cpu, 2);
+        U32 count = argument(cpu, 3);
+        if (!stream ||
+            !base ||
+            !current ||
+            !count ||
+            !session->memory->canWrite(base, 4) ||
+            !session->memory->canWrite(current, 4) ||
+            !session->memory->canWrite(count, 4)) {
+            return;
+        }
+        session->memory->writed(
+            base,
+            stream->objectAddress);
+        session->memory->writed(
+            current,
+            stream->objectAddress + 4);
+        session->memory->writed(
+            count,
+            stream->objectAddress + 8);
+    }
+
+    static void callbackUcrtIobFunction(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!__acrt_iob_func");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->standardGuestCFile(
+                    argument(cpu, 0));
+        }
+    }
+
+    U32 msvcpLockAddress(U32 kind) {
+        auto found = msvcpLockAddresses.find(kind);
+        if (found != msvcpLockAddresses.end()) {
+            return found->second;
+        }
+        U32 address = allocateGuestHeap(24, true);
+        if (!address) {
+            return 0;
+        }
+        initializeCriticalSection(address, 0);
+        msvcpLockAddresses[kind] = address;
+        return address;
+    }
+
+    static void callbackMsvcpLockitConstruct(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "MSVCP140!_Lockit::_Lockit");
+        if (!session) {
+            return;
+        }
+        U32 object = cpu->reg[1].u32; // this in ECX
+        U32 kind = argument(cpu, 0);
+        U32 lock = session->msvcpLockAddress(kind);
+        if (!object ||
+            !lock ||
+            !session->memory->canWrite(object, 4)) {
+            session->setLastError(8);
+            session->runtimeStopping = true;
+            cpu->thread->terminating = true;
+            return;
+        }
+        session->memory->writed(object, kind);
+        session->msvcpLockitObjects[object] = kind;
+        if (!session->enterCriticalSection(lock)) {
+            GuestThreadState* state =
+                session->findGuestThread(cpu->thread->id);
+            if (!state) {
+                session->runtimeStopping = true;
+                cpu->thread->terminating = true;
+                return;
+            }
+            session->parkGuestThreadOnCriticalSection(
+                *state,
+                lock);
+        }
+        cpu->reg[0].u32 = object;
+    }
+
+    static void callbackMsvcpLockitDestruct(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "MSVCP140!_Lockit::~_Lockit");
+        if (!session) {
+            return;
+        }
+        U32 object = cpu->reg[1].u32; // this in ECX
+        auto instance =
+            session->msvcpLockitObjects.find(object);
+        if (instance == session->msvcpLockitObjects.end()) {
+            return;
+        }
+        auto lock =
+            session->msvcpLockAddresses.find(
+                instance->second);
+        if (lock != session->msvcpLockAddresses.end()) {
+            session->leaveCriticalSection(lock->second);
+        }
+        session->msvcpLockitObjects.erase(instance);
+    }
+
     static void callbackVirtualAlloc(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!VirtualAlloc");
         if (session) {
@@ -9471,6 +13718,21 @@ private:
         }
     }
 
+    static void callbackVirtualProtect(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!VirtualProtect");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->virtualProtect(
+                    argument(cpu, 0),
+                    argument(cpu, 1),
+                    argument(cpu, 2),
+                    argument(cpu, 3))
+                ? 1
+                : 0;
+        }
+    }
+
     static void callbackVirtualQuery(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!VirtualQuery");
         if (session) {
@@ -9478,6 +13740,29 @@ private:
                 argument(cpu, 0),
                 argument(cpu, 1),
                 argument(cpu, 2));
+        }
+    }
+
+    static void callbackFlushInstructionCache(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!FlushInstructionCache");
+        if (session) {
+            const U32 processHandle = argument(cpu, 0);
+            const U32 baseAddress = argument(cpu, 1);
+            const U32 size = argument(cpu, 2);
+            if (++session->flushInstructionCacheTraceCount <= 16) {
+                printf(
+                    "Sugarbomb Win32 memory: FlushInstructionCache("
+                    "0x%08X, 0x%08X, 0x%08X)\n",
+                    processHandle,
+                    baseAddress,
+                    size);
+            }
+
+            // Guest writes already invalidate BoxedWine's translated code through
+            // the memory write path. Clearing the complete operation cache here
+            // would release the translated block that is executing this callback.
+            cpu->reg[0].u32 = 1;
         }
     }
 
@@ -9831,6 +14116,26 @@ private:
         }
     }
 
+    static void callbackGuestModuleInitializerReturn(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(
+                cpu,
+                "SUGARBOMB!GuestModuleInitializerReturn");
+        if (session) {
+            session->completeGuestModuleInitializer(cpu);
+        }
+    }
+
+    static void callbackGuestFunctionArrayReturn(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(
+                cpu,
+                "SUGARBOMB!GuestFunctionArrayReturn");
+        if (session) {
+            session->completeGuestFunctionArray(cpu);
+        }
+    }
+
     static void callbackUnresolvedImport(CPU* cpu) {
         std::string module;
         std::string symbol;
@@ -9843,11 +14148,23 @@ private:
         }
         fprintf(
             stderr,
-            "Sugarbomb: stopped at unresolved Win32 import %s!%s (callback %u, tid %u)\n",
+            "Sugarbomb: stopped at unresolved Win32 import %s!%s "
+            "(callback %u, tid %u, return=0x%08X, "
+            "args=[0x%08X,0x%08X,0x%08X,0x%08X,"
+            "0x%08X,0x%08X,0x%08X,0x%08X])\n",
             module.c_str(),
             symbol.c_str(),
             callbackIndex,
-            cpu->thread->id);
+            cpu->thread->id,
+            cpu->peek32(1),
+            cpu->peek32(2),
+            cpu->peek32(3),
+            cpu->peek32(4),
+            cpu->peek32(5),
+            cpu->peek32(6),
+            cpu->peek32(7),
+            cpu->peek32(8),
+            cpu->peek32(9));
         cpu->reg[0].u32 = 0xc0000139; // STATUS_ENTRYPOINT_NOT_FOUND
         cpu->thread->terminating = true;
     }
@@ -9864,6 +14181,16 @@ private:
         U64 size = 0;
         bool readable = false;
         bool writable = false;
+    };
+
+    struct GuestCFile {
+        U32 guestFileHandle = 0;
+        U32 objectAddress = 0;
+        U32 lockAddress = 0;
+        S32 standardIndex = -1;
+        S32 ungot = -1;
+        bool endOfFile = false;
+        bool error = false;
     };
 
     struct FindState {
@@ -10112,6 +14439,332 @@ private:
             return true;
         }
         return false;
+    }
+
+    GuestCFile* findGuestCFile(U32 stream) {
+        auto found = guestCFiles.find(stream);
+        return found == guestCFiles.end()
+            ? nullptr
+            : &found->second;
+    }
+
+    U32 createGuestCFileObject(
+        U32 guestFileHandle,
+        S32 standardIndex) {
+        U32 object = allocateGuestHeap(64, true);
+        U32 lock = allocateGuestHeap(24, true);
+        if (!object || !lock) {
+            if (object) {
+                freeGuestHeap(object);
+            }
+            if (lock) {
+                freeGuestHeap(lock);
+            }
+            if (guestFileHandle) {
+                closeGuestFile(guestFileHandle);
+            }
+            return 0;
+        }
+        initializeCriticalSection(lock, 0);
+        GuestCFile stream;
+        stream.guestFileHandle = guestFileHandle;
+        stream.objectAddress = object;
+        stream.lockAddress = lock;
+        stream.standardIndex = standardIndex;
+        guestCFiles[object] = stream;
+        memory->writed(object + 12, guestFileHandle);
+        return object;
+    }
+
+    U32 openGuestCFile(
+        const std::string& guestPath,
+        const std::string& mode) {
+        if (guestPath.empty() || mode.empty()) {
+            setLastError(87);
+            return 0;
+        }
+        bool update = mode.find('+') != std::string::npos;
+        bool exclusive = mode.find('x') != std::string::npos;
+        bool append = mode[0] == 'a';
+        U32 desiredAccess = 0;
+        U32 disposition = 0;
+        switch (mode[0]) {
+        case 'r':
+            desiredAccess =
+                0x80000000 | (update ? 0x40000000 : 0);
+            disposition = 3; // OPEN_EXISTING
+            break;
+        case 'w':
+            desiredAccess =
+                0x40000000 | (update ? 0x80000000 : 0);
+            disposition = exclusive ? 1 : 2;
+            break;
+        case 'a':
+            desiredAccess =
+                0x40000000 | (update ? 0x80000000 : 0);
+            disposition = exclusive ? 1 : 4;
+            break;
+        default:
+            setLastError(87);
+            return 0;
+        }
+        U32 handle = createGuestFile(
+            guestPath,
+            desiredAccess,
+            disposition);
+        if (handle == 0xffffffff) {
+            return 0;
+        }
+        if (append) {
+            U64 position = 0;
+            if (!setGuestFilePointer(handle, 0, 2, position)) {
+                closeGuestFile(handle);
+                return 0;
+            }
+        }
+        U32 stream = createGuestCFileObject(handle, -1);
+        if (stream) {
+            printf(
+                "Sugarbomb UCRT file: fopen(%s, %s) -> 0x%08X\n",
+                guestPath.c_str(),
+                mode.c_str(),
+                stream);
+        }
+        return stream;
+    }
+
+    U32 standardGuestCFile(U32 index) {
+        if (index >= 3) {
+            setLastError(87);
+            return 0;
+        }
+        if (!standardCFiles[index]) {
+            standardCFiles[index] =
+                createGuestCFileObject(
+                    0,
+                    static_cast<S32>(index));
+        }
+        return standardCFiles[index];
+    }
+
+    U32 readGuestCFile(
+        GuestCFile& stream,
+        U32 destination,
+        U32 requested) {
+        if (!requested) {
+            return 0;
+        }
+        if (!destination ||
+            !memory->canWrite(destination, requested) ||
+            stream.standardIndex >= 0) {
+            stream.endOfFile = true;
+            return 0;
+        }
+        U32 total = 0;
+        if (stream.ungot >= 0) {
+            memory->writeb(
+                destination,
+                static_cast<U8>(stream.ungot));
+            stream.ungot = -1;
+            ++total;
+        }
+        auto file =
+            guestFiles.find(stream.guestFileHandle);
+        if (file == guestFiles.end()) {
+            stream.error = true;
+            return total;
+        }
+        U64 before = file->second.position;
+        if (total < requested &&
+            !readGuestFile(
+                stream.guestFileHandle,
+                destination + total,
+                requested - total,
+                0)) {
+            stream.error = true;
+            return total;
+        }
+        file = guestFiles.find(stream.guestFileHandle);
+        if (file != guestFiles.end()) {
+            total += static_cast<U32>(
+                file->second.position - before);
+        }
+        stream.endOfFile = total < requested;
+        return total;
+    }
+
+    U32 writeGuestCFile(
+        GuestCFile& stream,
+        U32 source,
+        U32 requested) {
+        if (!requested) {
+            return 0;
+        }
+        if (!source ||
+            !memory->canRead(source, requested)) {
+            stream.error = true;
+            return 0;
+        }
+        if (stream.standardIndex >= 0) {
+            FILE* output =
+                stream.standardIndex == 2 ? stderr : stdout;
+            for (U32 index = 0; index < requested; ++index) {
+                fputc(memory->readb(source + index), output);
+            }
+            fflush(output);
+            return requested;
+        }
+        if (!writeGuestFile(
+                stream.guestFileHandle,
+                source,
+                requested,
+                0)) {
+            stream.error = true;
+            return 0;
+        }
+        return requested;
+    }
+
+    U32 writeHostToGuestCFile(
+        GuestCFile& stream,
+        const std::string& source) {
+        if (source.empty()) {
+            return 0;
+        }
+        if (stream.standardIndex >= 0) {
+            FILE* output =
+                stream.standardIndex == 2 ? stderr : stdout;
+            std::size_t written = std::fwrite(
+                source.data(),
+                1,
+                source.size(),
+                output);
+            std::fflush(output);
+            if (written != source.size()) {
+                stream.error = true;
+            }
+            return static_cast<U32>(written);
+        }
+        auto found = guestFiles.find(stream.guestFileHandle);
+        if (found == guestFiles.end() ||
+            !found->second.writable ||
+            !found->second.overlay) {
+            stream.error = true;
+            return 0;
+        }
+        GuestFile& file = found->second;
+        U64 end = file.position + source.size();
+        if (end >
+            static_cast<U64>(
+                std::numeric_limits<std::size_t>::max())) {
+            stream.error = true;
+            return 0;
+        }
+        if (end > file.overlay->bytes.size()) {
+            file.overlay->bytes.resize(
+                static_cast<std::size_t>(end),
+                0);
+        }
+        std::copy(
+            source.begin(),
+            source.end(),
+            file.overlay->bytes.begin() +
+                static_cast<std::size_t>(file.position));
+        file.position = end;
+        file.size = std::max(file.size, end);
+        return static_cast<U32>(source.size());
+    }
+
+    S32 readGuestCFileByte(GuestCFile& stream) {
+        if (stream.ungot >= 0) {
+            S32 value = stream.ungot;
+            stream.ungot = -1;
+            stream.endOfFile = false;
+            return value;
+        }
+        if (stream.standardIndex >= 0) {
+            stream.endOfFile = true;
+            return -1;
+        }
+        auto found = guestFiles.find(stream.guestFileHandle);
+        if (found == guestFiles.end() ||
+            !found->second.readable) {
+            stream.error = true;
+            return -1;
+        }
+        GuestFile& file = found->second;
+        if (file.position >= file.size) {
+            stream.endOfFile = true;
+            return -1;
+        }
+        U8 value = 0;
+        if (file.overlay) {
+            value = file.overlay->bytes[
+                static_cast<std::size_t>(file.position)];
+        } else {
+            file.input->clear();
+            file.input->seekg(
+                static_cast<std::streamoff>(file.position),
+                std::ios::beg);
+            char byte = 0;
+            file.input->read(&byte, 1);
+            if (file.input->gcount() != 1) {
+                stream.endOfFile = true;
+                return -1;
+            }
+            value = static_cast<U8>(byte);
+        }
+        ++file.position;
+        stream.endOfFile = false;
+        return value;
+    }
+
+    bool writeGuestCFileByte(
+        GuestCFile& stream,
+        U8 value) {
+        if (stream.standardIndex >= 0) {
+            FILE* output =
+                stream.standardIndex == 2 ? stderr : stdout;
+            fputc(value, output);
+            return true;
+        }
+        auto found = guestFiles.find(stream.guestFileHandle);
+        if (found == guestFiles.end() ||
+            !found->second.writable ||
+            !found->second.overlay) {
+            stream.error = true;
+            return false;
+        }
+        GuestFile& file = found->second;
+        if (file.position >= file.overlay->bytes.size()) {
+            file.overlay->bytes.resize(
+                static_cast<std::size_t>(file.position) + 1,
+                0);
+        }
+        file.overlay->bytes[
+            static_cast<std::size_t>(file.position++)] = value;
+        file.size = std::max(file.size, file.position);
+        return true;
+    }
+
+    bool closeGuestCFile(U32 streamAddress) {
+        auto found = guestCFiles.find(streamAddress);
+        if (found == guestCFiles.end()) {
+            return false;
+        }
+        GuestCFile stream = found->second;
+        guestCFiles.erase(found);
+        if (stream.standardIndex >= 0 &&
+            stream.standardIndex < 3) {
+            standardCFiles[stream.standardIndex] = 0;
+        }
+        if (stream.guestFileHandle) {
+            closeGuestFile(stream.guestFileHandle);
+        }
+        criticalSections.erase(stream.lockAddress);
+        freeGuestHeap(stream.lockAddress);
+        freeGuestHeap(stream.objectAddress);
+        return true;
     }
 
     bool writeFindData(U32 destination, const std::filesystem::path& path) {
@@ -10424,21 +15077,36 @@ private:
         return allocation;
     }
 
-    bool createDirectory(U32 pathAddress) {
-        if (!pathAddress) {
+    bool createDirectory(const std::string& guestPath) {
+        if (guestPath.empty()) {
             setLastError(87);
             return false;
         }
-        virtualDirectories.insert(lowerAscii(resolveGuestPath(readAnsi(pathAddress)).string()));
+        std::filesystem::path path =
+            resolveGuestPath(guestPath);
+        std::string normalized =
+            lowerAscii(path.string());
+        if (virtualDirectories.find(normalized) !=
+                virtualDirectories.end() ||
+            std::filesystem::is_directory(path)) {
+            setLastError(183); // ERROR_ALREADY_EXISTS
+            return false;
+        }
+        virtualDirectories.insert(normalized);
+        printf(
+            "Sugarbomb Win32 directory overlay: "
+            "CreateDirectory(%s)\n",
+            path.string().c_str());
         return true;
     }
 
-    bool deleteFile(U32 pathAddress) {
-        if (!pathAddress) {
+    bool deleteFile(const std::string& guestPath) {
+        if (guestPath.empty()) {
             setLastError(87);
             return false;
         }
-        std::filesystem::path path = resolveGuestPath(readAnsi(pathAddress));
+        std::filesystem::path path =
+            resolveGuestPath(guestPath);
         std::string normalized = lowerAscii(path.string());
         bool exists =
             virtualFileContents.find(normalized) != virtualFileContents.end() ||
@@ -10454,12 +15122,13 @@ private:
         return true;
     }
 
-    U32 getFileAttributes(U32 pathAddress) {
-        if (!pathAddress) {
+    U32 getFileAttributes(const std::string& guestPath) {
+        if (guestPath.empty()) {
             setLastError(87);
             return 0xffffffff;
         }
-        std::filesystem::path path = resolveGuestPath(readAnsi(pathAddress));
+        std::filesystem::path path =
+            resolveGuestPath(guestPath);
         std::string normalized = lowerAscii(path.string());
         U32 attributes = 0xffffffff;
         if (virtualDirectories.find(normalized) != virtualDirectories.end() ||
@@ -10474,11 +15143,52 @@ private:
         }
         if (++fileAttributeTraceCount <= 16) {
             printf(
-                "Sugarbomb Win32 file: GetFileAttributesA(%s) -> 0x%08X\n",
+                "Sugarbomb Win32 file: GetFileAttributes(%s) -> 0x%08X\n",
                 path.string().c_str(),
                 attributes);
         }
         return attributes;
+    }
+
+    bool writeFileAttributesEx(
+        const std::string& guestPath,
+        U32 destination) {
+        if (!destination ||
+            !memory->canWrite(destination, 36)) {
+            setLastError(87);
+            return false;
+        }
+        U32 attributes = getFileAttributes(guestPath);
+        if (attributes == 0xffffffff) {
+            return false;
+        }
+        std::filesystem::path path =
+            resolveGuestPath(guestPath);
+        std::string normalized =
+            lowerAscii(path.string());
+        U64 size = 0;
+        auto overlay =
+            virtualFileContents.find(normalized);
+        if (overlay != virtualFileContents.end()) {
+            size = overlay->second->bytes.size();
+        } else if (attributes != 0x10) {
+            std::error_code fileError;
+            size = std::filesystem::file_size(
+                path,
+                fileError);
+            if (fileError) {
+                size = 0;
+            }
+        }
+        memory->memset(destination, 0, 36);
+        memory->writed(destination, attributes);
+        memory->writed(
+            destination + 28,
+            static_cast<U32>(size >> 32));
+        memory->writed(
+            destination + 32,
+            static_cast<U32>(size));
+        return true;
     }
 
     struct HeapAllocation {
@@ -10578,6 +15288,11 @@ private:
         U32 ownerThread = 0;
         U32 recursionCount = 0;
         U32 spinCount = 0;
+    };
+
+    struct SlimReaderWriterLockState {
+        U32 exclusiveOwner = 0;
+        U32 sharedCount = 0;
     };
 
     struct VirtualRegion {
@@ -11356,7 +16071,6 @@ private:
         state->stackSize = stackSize;
         state->environmentBase = environmentBase;
         state->tlsArray = environmentBase + CHILD_TLS_ARRAY_OFFSET;
-        state->staticTlsData = environmentBase + CHILD_STATIC_TLS_OFFSET;
         state->tebAddress = environmentBase + CHILD_TEB_OFFSET;
         state->suspendCount = (creationFlags & CREATE_SUSPENDED) ? 1 : 0;
 
@@ -11370,17 +16084,15 @@ private:
         memory->writed(state->tebAddress + 0x2c, state->tlsArray);
         memory->writed(state->tebAddress + 0x30, PEB_ADDRESS);
         memory->writed(state->tebAddress + 0x34, 0);
-        if (staticTlsRawSize || staticTlsZeroFillSize) {
-            memory->writed(state->tlsArray, state->staticTlsData);
-            if (staticTlsRawSize) {
-                memory->memcpy(state->staticTlsData, staticTlsRawStart, staticTlsRawSize);
+        if (!initializeThreadStaticTls(*state)) {
+            for (U32 block : state->staticTlsBlocks) {
+                freeGuestHeap(block);
             }
-            if (staticTlsZeroFillSize) {
-                memory->memset(
-                    state->staticTlsData + staticTlsRawSize,
-                    0,
-                    staticTlsZeroFillSize);
-            }
+            memory->unmap(environmentBase, CHILD_ENV_SIZE);
+            memory->unmap(stackBase, stackSize);
+            process->deleteThread(guestThread);
+            setLastError(8);
+            return 0;
         }
         initializeGuestThreadCpu(*state, startAddress, parameter);
 
@@ -11819,6 +16531,72 @@ private:
         }
     }
 
+    void parkGuestThreadOnSrwLock(
+        GuestThreadState& state,
+        U32 address,
+        bool exclusive) {
+        state.waitKind = GuestWaitKind::SlimReaderWriterLock;
+        state.waitSlimReaderWriterLockAddress = address;
+        state.waitSlimReaderWriterLockExclusive = exclusive;
+        state.waitDeadline = std::numeric_limits<U64>::max();
+        if (waitTraceCount < 24) {
+            printf(
+                "Sugarbomb scheduler: parked tid %u on %s "
+                "SRW lock 0x%08X\n",
+                state.thread->id,
+                exclusive ? "exclusive" : "shared",
+                address);
+            ++waitTraceCount;
+        }
+    }
+
+    void parkGuestThreadOnConditionVariable(
+        GuestThreadState& state,
+        U32 conditionVariable,
+        U32 lock,
+        bool exclusive,
+        U32 timeout) {
+        state.waitKind = GuestWaitKind::ConditionVariable;
+        state.waitConditionVariableAddress = conditionVariable;
+        state.waitConditionVariableSignaled = false;
+        state.waitSlimReaderWriterLockAddress = lock;
+        state.waitSlimReaderWriterLockExclusive = exclusive;
+        state.waitDeadline =
+            timeout == 0xffffffff
+            ? std::numeric_limits<U64>::max()
+            : KSystem::getMicroCounter() +
+                static_cast<U64>(timeout) * 1000;
+        if (waitTraceCount < 24) {
+            printf(
+                "Sugarbomb scheduler: parked tid %u on condition "
+                "variable 0x%08X with %s SRW lock 0x%08X\n",
+                state.thread->id,
+                conditionVariable,
+                exclusive ? "exclusive" : "shared",
+                lock);
+            ++waitTraceCount;
+        }
+    }
+
+    void wakeConditionVariable(U32 address, bool all) {
+        if (!address || !memory->canWrite(address, 4)) {
+            setLastError(87);
+            return;
+        }
+        for (auto& state : guestThreads) {
+            if (state->completed ||
+                state->waitKind !=
+                    GuestWaitKind::ConditionVariable ||
+                state->waitConditionVariableAddress != address) {
+                continue;
+            }
+            state->waitConditionVariableSignaled = true;
+            if (!all) {
+                break;
+            }
+        }
+    }
+
     U32 tryAcquireGuestWait(GuestThreadState& state) {
         U32 threadId = state.thread->id;
         if (state.waitAll) {
@@ -11874,6 +16652,40 @@ private:
                     wake = enterCriticalSection(address);
                     activeCpu = previousCpu;
                 }
+            } else if (
+                state->waitKind ==
+                GuestWaitKind::SlimReaderWriterLock) {
+                CPU* previousCpu = activeCpu;
+                activeCpu = state->thread->cpu;
+                wake = tryAcquireSrwLock(
+                    state->waitSlimReaderWriterLockAddress,
+                    state->waitSlimReaderWriterLockExclusive);
+                activeCpu = previousCpu;
+            } else if (
+                state->waitKind ==
+                GuestWaitKind::ConditionVariable) {
+                bool timedOut =
+                    !state->waitConditionVariableSignaled &&
+                    state->waitDeadline !=
+                        std::numeric_limits<U64>::max() &&
+                    now >= state->waitDeadline;
+                if (state->waitConditionVariableSignaled ||
+                    timedOut) {
+                    CPU* previousCpu = activeCpu;
+                    activeCpu = state->thread->cpu;
+                    wake = tryAcquireSrwLock(
+                        state->waitSlimReaderWriterLockAddress,
+                        state->waitSlimReaderWriterLockExclusive);
+                    activeCpu = previousCpu;
+                    if (wake) {
+                        result = timedOut ? 0 : 1;
+                        if (timedOut) {
+                            setThreadLastError(
+                                *state,
+                                1460); // ERROR_TIMEOUT
+                        }
+                    }
+                }
             } else {
                 result = tryAcquireGuestWait(*state);
                 wake = result != 258;
@@ -11894,6 +16706,10 @@ private:
             state->waitAll = false;
             state->waitDeadline = 0;
             state->waitCriticalSectionAddress = 0;
+            state->waitSlimReaderWriterLockAddress = 0;
+            state->waitSlimReaderWriterLockExclusive = false;
+            state->waitConditionVariableAddress = 0;
+            state->waitConditionVariableSignaled = false;
             if (waitTraceCount < 24) {
                 printf(
                     "Sugarbomb scheduler: woke tid %u with result 0x%08X\n",
@@ -11983,6 +16799,200 @@ private:
             base = scanFrom(GUEST_VIRTUAL_BASE);
         }
         return base;
+    }
+
+    static U32 peSectionWindowsProtection(
+        U32 characteristics) {
+        bool execute =
+            (characteristics & 0x20000000) != 0;
+        bool read =
+            (characteristics & 0x40000000) != 0;
+        bool write =
+            (characteristics & 0x80000000) != 0;
+        if (execute) {
+            if (write) {
+                return 0x40; // PAGE_EXECUTE_READWRITE
+            }
+            if (read) {
+                return 0x20; // PAGE_EXECUTE_READ
+            }
+            return 0x10; // PAGE_EXECUTE
+        }
+        if (write) {
+            return 0x04; // PAGE_READWRITE
+        }
+        if (read) {
+            return 0x02; // PAGE_READONLY
+        }
+        return 0x01; // PAGE_NOACCESS
+    }
+
+    static U32 peImageProtectionAt(
+        const Pe32MappedImage& mapped,
+        U32 address) {
+        U64 imageEnd =
+            static_cast<U64>(mapped.loadBase) +
+            mapped.info.sizeOfImage;
+        if (address < mapped.loadBase ||
+            address >= imageEnd) {
+            return 0;
+        }
+        if (address <
+            static_cast<U64>(mapped.loadBase) +
+                mapped.info.sizeOfHeaders) {
+            return 0x02;
+        }
+        U32 rva = address - mapped.loadBase;
+        for (const Pe32SectionInfo& section :
+             mapped.info.sections) {
+            U32 span = std::max(
+                section.virtualSize,
+                section.rawDataSize);
+            if (rva >= section.virtualAddress &&
+                static_cast<U64>(rva) <
+                    static_cast<U64>(
+                        section.virtualAddress) +
+                        span) {
+                return peSectionWindowsProtection(
+                    section.characteristics);
+            }
+        }
+        return 0x02;
+    }
+
+    U32 virtualProtectionAt(U32 address) const {
+        U32 page = address & ~K_PAGE_MASK;
+        auto overridden = pageProtections.find(page);
+        if (overridden != pageProtections.end()) {
+            return overridden->second;
+        }
+        for (const auto& entry : virtualRegions) {
+            const VirtualRegion& region = entry.second;
+            if (address >= region.base &&
+                static_cast<U64>(address) <
+                    static_cast<U64>(region.base) +
+                        region.size) {
+                return region.protection;
+            }
+        }
+        U32 imageProtection =
+            peImageProtectionAt(image, address);
+        if (imageProtection) {
+            return imageProtection;
+        }
+        for (const auto& entry : guestModules) {
+            imageProtection = peImageProtectionAt(
+                entry.second.image,
+                address);
+            if (imageProtection) {
+                return imageProtection;
+            }
+        }
+        for (const auto& entry : heapAllocations) {
+            if (address >= entry.first &&
+                static_cast<U64>(address) <
+                    static_cast<U64>(entry.first) +
+                        entry.second.mappedSize) {
+                return 0x04;
+            }
+        }
+        if ((address >= STACK_BASE &&
+             address < STACK_TOP) ||
+            (address >= ENV_BASE &&
+             address < ENV_BASE + ENV_SIZE)) {
+            return 0x04;
+        }
+        if (address >= THUNK_BASE &&
+            address < THUNK_BASE + THUNK_SIZE) {
+            return 0x20;
+        }
+        return memory->canRead(address, 1)
+            ? 0x04
+            : 0;
+    }
+
+    bool virtualProtect(
+        U32 address,
+        U32 size,
+        U32 protection,
+        U32 previousProtectionAddress) {
+        U32 baseProtection = protection & 0xff;
+        if (!address ||
+            !size ||
+            !previousProtectionAddress ||
+            !memory->canWrite(
+                previousProtectionAddress,
+                4) ||
+            (baseProtection != 0x01 &&
+             baseProtection != 0x02 &&
+             baseProtection != 0x04 &&
+             baseProtection != 0x08 &&
+             baseProtection != 0x10 &&
+             baseProtection != 0x20 &&
+             baseProtection != 0x40 &&
+             baseProtection != 0x80)) {
+            setLastError(87);
+            return false;
+        }
+        U64 requestedEnd =
+            static_cast<U64>(address) + size;
+        if (requestedEnd >
+            static_cast<U64>(
+                std::numeric_limits<U32>::max()) + 1) {
+            setLastError(487);
+            return false;
+        }
+        U32 alignedBase = address & ~K_PAGE_MASK;
+        U64 alignedEnd64 =
+            (requestedEnd + K_PAGE_MASK) &
+            ~static_cast<U64>(K_PAGE_MASK);
+        if (alignedEnd64 <= alignedBase ||
+            alignedEnd64 >
+                static_cast<U64>(
+                    std::numeric_limits<U32>::max()) + 1) {
+            setLastError(487);
+            return false;
+        }
+        U32 oldProtection =
+            virtualProtectionAt(address);
+        if (!oldProtection) {
+            setLastError(487);
+            return false;
+        }
+        U64 alignedSize64 = alignedEnd64 - alignedBase;
+        if (alignedSize64 >
+            std::numeric_limits<U32>::max()) {
+            setLastError(487);
+            return false;
+        }
+        U32 alignedSize = static_cast<U32>(alignedSize64);
+        if (memory->mprotect(
+                thread,
+                alignedBase,
+                alignedSize,
+                windowsProtectionToGuest(protection)) != 0) {
+            setLastError(487);
+            return false;
+        }
+        for (U64 page = alignedBase;
+             page < alignedEnd64;
+             page += K_PAGE_SIZE) {
+            pageProtections[
+                static_cast<U32>(page)] = protection;
+        }
+        memory->writed(
+            previousProtectionAddress,
+            oldProtection);
+        if (++virtualProtectTraceCount <= 24) {
+            printf(
+                "Sugarbomb Win32 memory: VirtualProtect("
+                "0x%08X, 0x%08X, 0x%08X) old=0x%08X\n",
+                address,
+                size,
+                protection,
+                oldProtection);
+        }
+        return true;
     }
 
     U32 virtualAlloc(U32 requestedAddress, U32 requestedSize, U32 allocationType, U32 protection) {
@@ -12195,6 +17205,71 @@ private:
         memory->writed(address + 12, state.ownerThread);
     }
 
+    void writeSrwLockState(
+        U32 address,
+        const SlimReaderWriterLockState& state) {
+        U32 value = 0;
+        if (state.exclusiveOwner) {
+            value = (state.exclusiveOwner << 2) | 1;
+        } else if (state.sharedCount) {
+            value = (state.sharedCount << 4) | 2;
+        }
+        memory->writed(address, value);
+    }
+
+    bool tryAcquireSrwLock(U32 address, bool exclusive) {
+        if (!address || !memory->canWrite(address, 4)) {
+            setLastError(87);
+            return false;
+        }
+        SlimReaderWriterLockState& state =
+            slimReaderWriterLocks[address];
+        if (exclusive) {
+            if (state.exclusiveOwner || state.sharedCount) {
+                return false;
+            }
+            state.exclusiveOwner = currentGuestThreadId();
+        } else {
+            if (state.exclusiveOwner ||
+                state.sharedCount ==
+                    std::numeric_limits<U32>::max()) {
+                return false;
+            }
+            ++state.sharedCount;
+        }
+        writeSrwLockState(address, state);
+        return true;
+    }
+
+    bool releaseSrwLock(U32 address, bool exclusive) {
+        auto found = slimReaderWriterLocks.find(address);
+        if (!address ||
+            !memory->canWrite(address, 4) ||
+            found == slimReaderWriterLocks.end()) {
+            setLastError(288); // ERROR_NOT_OWNER
+            return false;
+        }
+        SlimReaderWriterLockState& state = found->second;
+        if (exclusive) {
+            if (state.exclusiveOwner != currentGuestThreadId()) {
+                setLastError(288);
+                return false;
+            }
+            state.exclusiveOwner = 0;
+        } else {
+            if (!state.sharedCount || state.exclusiveOwner) {
+                setLastError(288);
+                return false;
+            }
+            --state.sharedCount;
+        }
+        writeSrwLockState(address, state);
+        if (!state.exclusiveOwner && !state.sharedCount) {
+            slimReaderWriterLocks.erase(found);
+        }
+        return true;
+    }
+
     U32 allocateGuestHeap(U32 requestedSize, bool zeroMemory) {
         U32 logicalSize = requestedSize ? requestedSize : 1;
         if (logicalSize > 0xfffff000) {
@@ -12269,6 +17344,21 @@ private:
         return true;
     }
 
+    U32 ensureUcrtErrno() {
+        if (!ucrtErrnoAddress) {
+            ucrtErrnoAddress =
+                allocateGuestHeap(4, true);
+        }
+        return ucrtErrnoAddress;
+    }
+
+    void setUcrtErrno(U32 value) {
+        U32 address = ensureUcrtErrno();
+        if (address) {
+            memory->writed(address, value);
+        }
+    }
+
     void setLastError(U32 errorCode) {
         U32 tebAddress = activeCpu ? activeCpu->seg[FS].address : TEB_ADDRESS;
         memory->writed(tebAddress + 0x34, errorCode);
@@ -12285,7 +17375,15 @@ private:
     }
 
     bool writeGuestOutput(U32 handle, U32 buffer, U32 length, U32 bytesWritten, bool wide) {
-        if (!isStandardHandle(handle) || !memory->canRead(buffer, wide ? length * 2 : length)) {
+        const U64 byteLength =
+            wide ? static_cast<U64>(length) * 2 : length;
+        if (!isStandardHandle(handle) ||
+            byteLength > std::numeric_limits<U32>::max() ||
+            !memory->canRead(
+                buffer,
+                static_cast<U32>(byteLength)) ||
+            (bytesWritten &&
+             !memory->canWrite(bytesWritten, 4))) {
             setLastError(6);
             return false;
         }
@@ -12307,9 +17405,35 @@ private:
         return true;
     }
 
+    bool guestCStringLength(
+        U32 address,
+        U32& length,
+        U32 limit = 16 * 1024 * 1024) {
+        length = 0;
+        if (!address) {
+            return false;
+        }
+        for (U32 index = 0; index < limit; ++index) {
+            if (index >
+                    std::numeric_limits<U32>::max() - address ||
+                !memory->canRead(address + index, 1)) {
+                return false;
+            }
+            if (!memory->readb(address + index)) {
+                length = index;
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::string readAnsi(U32 address, U32 limit = 512) {
         std::string result;
-        for (U32 index = 0; index < limit && memory->canRead(address + index, 1); ++index) {
+        for (U32 index = 0;
+             index < limit &&
+             index <= std::numeric_limits<U32>::max() - address &&
+             memory->canRead(address + index, 1);
+             ++index) {
             U8 value = memory->readb(address + index);
             if (!value) {
                 break;
@@ -12321,8 +17445,19 @@ private:
 
     std::string readWide(U32 address, U32 limit = 512) {
         std::string result;
-        for (U32 index = 0; index < limit && memory->canRead(address + index * 2, 2); ++index) {
-            U16 value = memory->readw(address + index * 2);
+        for (U32 index = 0; index < limit; ++index) {
+            const U64 characterAddress =
+                static_cast<U64>(address) +
+                static_cast<U64>(index) * 2;
+            if (characterAddress >
+                    std::numeric_limits<U32>::max() - 1ULL ||
+                !memory->canRead(
+                    static_cast<U32>(characterAddress),
+                    2)) {
+                break;
+            }
+            U16 value = memory->readw(
+                static_cast<U32>(characterAddress));
             if (!value) {
                 break;
             }
@@ -12342,14 +17477,17 @@ private:
     Pe32MappedImage image;
     std::unordered_map<U32, GuestModule> guestModules;
     std::unordered_map<std::string, U32> guestModuleHandles;
+    std::vector<U32> guestModuleLoadOrder;
+    std::vector<GuestModuleInitializer> guestModuleInitializers;
+    std::size_t guestModuleInitializerIndex = 0;
     U32 nextGuestModuleBase = 0x18000000;
     SugarbombThunkArena thunks;
     U32 entryReturnThunk = 0;
     U32 threadReturnThunk = 0;
     U32 wndProcReturnThunk = 0;
-    U32 staticTlsRawStart = 0;
-    U32 staticTlsRawSize = 0;
-    U32 staticTlsZeroFillSize = 0;
+    U32 moduleInitializerReturnThunk = 0;
+    U32 guestFunctionArrayReturnThunk = 0;
+    std::vector<StaticTlsTemplate> staticTlsTemplates;
     U32 nativeCallCount = 0;
     U64 runSlices = 0;
     U32 lastGuestEip = 0;
@@ -12402,20 +17540,32 @@ private:
     U32 nextHeapAddress = GUEST_HEAP_BASE;
     U32 nextVirtualAddress = GUEST_VIRTUAL_BASE;
     U32 nextTlsIndex = 0;
+    bool staticTlsInitialized = false;
+    U32 ucrtLocaleCodepageAddress = 0;
+    U32 ucrtErrnoAddress = 0;
     U32 nextChildStackTop = CHILD_STACK_FIRST_TOP;
     U32 nextChildEnvironmentBase = CHILD_ENV_FIRST_BASE;
     S32 cursorDisplayCount = 0;
     bool mouseButtonsSwapped = false;
+    bool fileApisAnsi = true;
     U32 standardHandles[3] = {STDIN_GUEST_HANDLE, STDOUT_GUEST_HANDLE, STDERR_GUEST_HANDLE};
     std::unordered_map<U32, HeapAllocation> heapAllocations;
     std::unordered_map<U32, CriticalSectionState> criticalSections;
+    std::unordered_map<U32, SlimReaderWriterLockState>
+        slimReaderWriterLocks;
+    std::unordered_map<U32, U32> msvcpLockAddresses;
+    std::unordered_map<U32, U32> msvcpLockitObjects;
     std::unordered_map<U32, VirtualRegion> virtualRegions;
+    std::unordered_map<U32, U32> pageProtections;
     std::unordered_map<U32, KernelObject> kernelObjects;
     std::unordered_map<std::string, U32> namedKernelObjects;
     std::unordered_map<std::string, U32> nativeApiCounts;
+    std::unordered_map<U32, GuestOnExitTable> onExitTables;
     std::unordered_map<std::string, IniDocument> iniDocuments;
     std::unordered_map<std::string, std::string> profileOverrides;
     std::unordered_map<U32, GuestFile> guestFiles;
+    std::unordered_map<U32, GuestCFile> guestCFiles;
+    U32 standardCFiles[3] = {};
     std::unordered_map<U32, FindState> findStates;
     std::unordered_map<U32, MmioFile> mmioFiles;
     std::unordered_map<U32, std::string> registryKeys;
@@ -12424,6 +17574,10 @@ private:
     std::deque<GuestMessage> guestMessageQueue;
     std::unordered_map<U32, std::vector<PendingWndProcDispatch>>
         pendingWndProcDispatches;
+    std::unordered_map<
+        U32,
+        std::vector<PendingGuestFunctionArray>>
+        pendingGuestFunctionArrays;
     std::unordered_map<U32, DirectInputObject> directInputObjects;
     std::unordered_map<U32, DirectInputComMethod> directInputComMethods;
     std::vector<U32> directInputVtable;
@@ -12442,6 +17596,11 @@ private:
     U32 directInputReadTraceCount = 0;
     U32 directInputStateCallTraceCount = 0;
     U32 directInputDataCallTraceCount = 0;
+    U32 processorFeatureTraceCount = 0;
+    U32 virtualProtectTraceCount = 0;
+    U32 flushInstructionCacheTraceCount = 0;
+    U32 guestFunctionArrayDispatchTraceCount = 0;
+    U32 printfTraceCount = 0;
     std::unordered_map<U32, DirectSoundObject> directSoundObjects;
     std::unordered_map<U32, DirectSoundComMethod> directSoundComMethods;
     std::vector<U32> directSoundVtable;

@@ -53,6 +53,17 @@ worker threads are parked on their normal kernel-object waits. Fallout's 32-bit
 guest `HWND` remains an integer in guest memory, while its corresponding native
 `HWND` and every native D3D pointer remain private to the 64-bit host.
 
+The staged xNVSE 6.4.8 runtime now also completes both of its PE TLS callbacks
+and its real DLL entry point in the same guest process. A bounded headless smoke
+run finishes all 909 UCRT initializer calls, registers 79 exit handlers, reads
+`Data/NVSE/nvse_config.ini`, identifies the Fallout image at `0x00400000`,
+applies its executable patches through `VirtualProtect`, and emits xNVSE's
+runtime-ready diagnostics. Fallout then continues through archive/plugin
+discovery, window and DirectInput creation, audio and DirectShow setup, D3D9
+device/resource creation, and 45 complete presentation cycles before the
+five-million-slice diagnostic budget expires. No Wine process, `nvse_loader.exe`,
+unresolved import, or host crash is involved.
+
 The renderer checkpoint is no longer synthetic. Sugarbomb translates
 Fallout's render targets, surfaces, textures, texture locks, vertex/index
 buffers, declarations, shader bytecode, constants, render/sampler state, and
@@ -68,14 +79,16 @@ The runtime currently builds:
 
 - an 8 MiB 32-bit guest stack;
 - a minimal Windows PEB, TEB, process-parameters block, and `FS` TLS segment;
-- the executable's static PE TLS slot and 708-byte `.tls` template;
+- per-module, per-thread static PE TLS, including Fallout's 708-byte template
+  and xNVSE's 20,746-byte template plus its two process-attach callbacks;
 - dynamic TLS slots, process/CRT heaps, and logical `VirtualAlloc` reservations;
 - a read/execute-only import-thunk arena at `0x60000000`;
 - a guest DLL registry with collision-safe preferred-base mapping, HIGHLOW
   relocation, name/ordinal export lookup, incremental import thunks, and
   Kernel32 module APIs;
 - automatic staging of `nvse_1_4.dll` beside Fallout at its preferred
-  `0x10000000` base, with `StartNVSE` discovered from the real export table;
+  `0x10000000` base, with `StartNVSE` discovered from the real export table and
+  gated TLS/PE-entry initialization available for deterministic diagnostics;
 - a cooperative x86 guest scheduler with suspended/runnable/completed thread
   states, timed sleeps, and semaphore/event/mutex/thread waits;
 - filesystem, profile/INI, registry, Shell32, USER32, GDI32, input, audio,
@@ -97,6 +110,14 @@ The runtime currently builds:
   registration fallback;
 - initial Kernel32 timing, process, heap, locale, console, exception, atomic,
   critical-section, memory-status, and virtual-memory services;
+- the UCRT/MSVCP surface exercised by xNVSE startup, including initializer and
+  on-exit tables, guest `FILE*` streams, formatting/scanning, locale, string,
+  character-classification, parsing, math, heap, SRW-lock, and condition-variable
+  operations;
+- executable-page protection tracking for xNVSE patching. Guest memory writes
+  synchronously invalidate translated code, so Win32
+  `FlushInstructionCache` does not destroy the block currently returning
+  through the native callback bridge;
 - version-keyed Fallout 1.4 bootstrap objects for two startup-order races: the
   Bink manager and Havok memory system. The Havok bridge initializes the
   game's per-thread memory router and allocates from the tracked 32-bit guest
@@ -204,10 +225,13 @@ dependency order and validate each group with small guest fixtures:
 1. **Process core:** PEB/TEB, static and dynamic TLS, virtual memory, heap,
    timing, exceptions, module lookup, console handles, Unicode conversion,
    critical sections, kernel objects, guest threads, and cooperative waits.
-2. **NVSE bootstrap:** DLL export parsing, import binding, module lookup, and
-   preferred-base staging are implemented. Remaining work includes per-module
-   TLS, CRT entry points, `DllMain`/`StartNVSE` sequencing, plugin enumeration,
-   and NVSE messaging/interfaces.
+2. **NVSE bootstrap:** DLL export parsing, import binding, module lookup,
+   preferred-base staging, per-module/per-thread static TLS, CRT startup, TLS
+   callbacks, and the real DLL entry point are implemented. The staged xNVSE
+   runtime reaches its runtime-ready state and Fallout continues afterward.
+   Remaining work includes making this initialization policy unconditional for
+   ordinary launches, mapping `Data/NVSE/Plugins/*.dll`, and implementing the
+   NVSE plugin-query/load, messaging, and interface contracts.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
    message-loop behavior. The guest/native HWND bridge and host message pump
    create visible output. `PeekMessageA`, `DispatchMessageA`, and `SendMessageA`
@@ -261,6 +285,7 @@ change the guest ABI:
 $env:SUGARBOMB_MAX_RUN_SLICES = '2600000'
 $env:SUGARBOMB_MAX_RUN_MILLISECONDS = '20000'
 $env:SUGARBOMB_NO_HOST_WINDOW = '1' # optional for unattended runs
+$env:SUGARBOMB_RUN_NVSE_ENTRY = '1' # run staged xNVSE TLS callbacks and DllMain
 $env:SUGARBOMB_CAPTURE_FRAME = 'D:\captures\fallout-present.png'
 $env:SUGARBOMB_CAPTURE_AFTER_PRESENTS = '100'
 $env:SUGARBOMB_CAPTURE_FINAL_FRAME = 'D:\captures\fallout-final-target.png'
@@ -291,8 +316,9 @@ USER32, D3D9, audio, DirectShow, Bink, and startup-order singleton boundaries.
 The 64-bit host owns the window and real D3D9 objects, translates Fallout's
 32-bit graphics workload, delivers host and lifecycle messages through
 Fallout's own 32-bit WndProc, and reaches the correctly textured main menu
-without exposing native pointers to the guest. The next major work is to
-verify deterministic menu interaction through the new native-focus/DirectInput
-path, persist remaining virtual-file operations, initialize the staged
-`nvse_1_4.dll` through per-module TLS and its guest entry point, then map and
-initialize NVSE plugins in the same guest process.
+without exposing native pointers to the guest. xNVSE now initializes through
+its real static-TLS and DLL-entry sequence and patches the same guest Fallout
+image before the game continues. The next major work is to verify deterministic
+menu interaction through the new native-focus/DirectInput path, persist
+remaining virtual-file operations, and map and initialize NVSE plugins in the
+same guest process.
