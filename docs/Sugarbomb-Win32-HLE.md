@@ -63,6 +63,16 @@ worker threads are parked on their normal kernel-object waits. Fallout's 32-bit
 guest `HWND` remains an integer in guest memory, while its corresponding native
 `HWND` and every native D3D pointer remain private to the 64-bit host.
 
+The presentation surface is now an ordinary top-level Windows application
+window, owned by a dedicated native UI thread and message loop. It has a normal
+title bar, taskbar and Alt-Tab presence, and Windows controls its foreground
+and focus state. A visible 3840x2160 validation reached the main menu, accepted
+two extended Down-arrow scan-code events through the foreground native `HWND`,
+reported the corresponding DirectInput `DIK_DOWN` (`0xD0`) press/release
+records, and visibly advanced the Fallout menu highlight from no selection to
+`Continue` and then `New`. Focus changes caused by desktop capture were also
+released and reacquired normally rather than being forced by the runtime.
+
 The staged xNVSE 6.4.8 runtime now initializes automatically at Fallout's real
 WinMain boundary. A bounded headless smoke run completes both PE TLS callbacks,
 the DLL entry point, all 909 UCRT initializer calls, and 79 exit-handler
@@ -76,6 +86,22 @@ and seven complete presentation cycles in a 1.5-million-slice run. The former
 R6030 “CRT not initialized” failure is gone because plugin Load now occurs after
 Fallout's executable CRT startup. No Wine process, `nvse_loader.exe`, unresolved
 import, or host crash is involved.
+
+Dynamic guest DLL placement now treats logical `MEM_RESERVE` regions as
+occupied even when their pages have not been committed. This prevents an NVSE
+plugin from being placed in a hole that Fallout later commits from one of its
+large reserved arenas. With that rule, MLF relocates to
+`0x18800000-0x18807000` instead of overlapping the arena at `0x18000000`.
+The guest heap also coalesces and reuses freed page ranges instead of consuming
+a fresh page-aligned address for every small CRT allocation. A 210-second
+headless Fallout+xNVSE+MLF smoke run completed 156,422,420 CPU slices,
+148,437,498 native API calls, and 21,588 D3D9 presents, stopping only at the
+configured wall-clock budget. Across 144,134 allocations it reused 17,712
+freed ranges and kept its high-water address at `0x44E52000`, well below the
+`0x5F000000` heap boundary. It exercised guest-only
+`RtlCaptureStackBackTrace` without an unresolved import, guest page fault, or
+allocation failure. The debug-UCRT `_callnewh` no-handler path is implemented
+as the ABI-correct fallback but was not needed during the verified run.
 
 The renderer checkpoint is no longer synthetic. Sugarbomb translates
 Fallout's render targets, surfaces, textures, texture locks, vertex/index
@@ -94,11 +120,12 @@ The runtime currently builds:
 - a minimal Windows PEB, TEB, process-parameters block, and `FS` TLS segment;
 - per-module, per-thread static PE TLS, including Fallout's 708-byte template
   and xNVSE's 20,746-byte template plus its two process-attach callbacks;
-- dynamic TLS slots, process/CRT heaps, and logical `VirtualAlloc` reservations;
+- dynamic TLS slots, reusable/coalescing process and CRT heaps, and logical
+  `VirtualAlloc` reservations;
 - a read/execute-only import-thunk arena at `0x60000000`;
 - a guest DLL registry with collision-safe preferred-base mapping, HIGHLOW
-  relocation, name/ordinal export lookup, incremental import thunks, and
-  Kernel32 module APIs;
+  relocation, logical-reservation-aware placement, name/ordinal export lookup,
+  incremental import thunks, and Kernel32 module APIs;
 - automatic staging of `nvse_1_4.dll` beside Fallout at its preferred
   `0x10000000` base, with `StartNVSE` discovered from the real export table and
   automatic TLS/PE-entry initialization from an xNVSE-compatible hook at
@@ -133,7 +160,9 @@ The runtime currently builds:
 - the UCRT/MSVCP surface exercised by xNVSE startup, including initializer and
   on-exit tables, guest `FILE*` streams, formatting/scanning, locale, string,
   character-classification, parsing, math, heap, SRW-lock, and condition-variable
-  operations;
+  operations, plus the no-handler `_callnewh` contract;
+- guest-only `RtlCaptureStackBackTrace`/`CaptureStackBackTrace`, which returns
+  validated 32-bit guest return addresses without exposing host stack pointers;
 - executable-page protection tracking for xNVSE patching. Guest memory writes
   synchronously invalidate translated code, so Win32
   `FlushInstructionCache` does not destroy the block currently returning
@@ -146,7 +175,8 @@ The runtime currently builds:
 Large `MEM_RESERVE` calls remain logical until committed, so Fallout can see its
 normal 32-bit address layout without forcing the 64-bit host to back every
 reserved guest page. In the verified trace it reserves 200 MiB and 64 MiB
-arenas, then commits only the ranges it touches.
+arenas, then commits only the ranges it touches. Dynamic DLL allocation checks
+both committed pages and these logical reservations before choosing a base.
 
 Focused tests verify:
 
@@ -267,8 +297,9 @@ dependency order and validate each group with small guest fixtures:
    buffered menu events. Raw mouse motion and exclusive foreground capture
    follow the native window lifecycle; focus loss, capture revocation, and
    cancel-mode transitions release ownership so Fallout can reacquire it
-   normally. Remaining work includes cursor-coordinate validation,
-   deterministic menu actions, and XInput device state.
+   normally. Deterministic native keyboard navigation through the main menu is
+   verified. Remaining work includes cursor-coordinate/click validation and
+   XInput device state.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
    Sugarbomb's renderer. The guest COM/resource model, native presentation
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
@@ -346,6 +377,6 @@ without exposing native pointers to the guest. xNVSE now initializes through
 its real static-TLS and DLL-entry sequence at the same CRT boundary used by the
 xNVSE loader, patches the same guest Fallout image, and loads a real NVSE plugin
 before the game continues. The next major work is to verify deterministic menu
-interaction through the native-focus/DirectInput path, persist remaining
-virtual-file operations, and expand plugin/API coverage from additional real
-NVSE workloads.
+click interaction and gameplay transition through the native-focus/DirectInput
+path, persist remaining virtual-file operations, and expand plugin/API coverage
+from additional real NVSE workloads.

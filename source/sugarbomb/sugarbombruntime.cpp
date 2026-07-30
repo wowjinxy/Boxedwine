@@ -28,6 +28,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -2298,6 +2299,21 @@ private:
                 wallClockBudgetExhausted ? "wall-clock" : "execution",
                 static_cast<unsigned long long>(runSlices),
                 nativeCallCount);
+            fprintf(
+                stderr,
+                "  guest heap: %zu live, %zu free ranges, "
+                "%llu allocations, %llu reuses, %llu frees, "
+                "next=0x%08X high-water=0x%08X\n",
+                heapAllocations.size(),
+                freeHeapRanges.size(),
+                static_cast<unsigned long long>(
+                    heapAllocationCount),
+                static_cast<unsigned long long>(
+                    heapReuseCount),
+                static_cast<unsigned long long>(
+                    heapFreeCount),
+                nextHeapAddress,
+                heapHighWaterAddress);
             for (const auto& state : guestThreads) {
                 if (!state->thread) {
                     continue;
@@ -2592,6 +2608,31 @@ private:
         return true;
     }
 
+    bool guestRangeOverlapsVirtualRegion(
+        U32 base,
+        U32 size) const {
+        const U64 requestedEnd =
+            static_cast<U64>(base) + size;
+        for (const auto& entry : virtualRegions) {
+            const U64 reservedBase =
+                entry.second.base;
+            const U64 reservedEnd =
+                reservedBase + entry.second.size;
+            if (base < reservedEnd &&
+                requestedEnd > reservedBase) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool guestRangeIsAvailableForModule(
+        U32 base,
+        U32 size) const {
+        return guestRangeIsFree(base, size) &&
+            !guestRangeOverlapsVirtualRegion(base, size);
+    }
+
     U32 findFreeGuestModuleBase(U32 size) {
         U64 alignedSize =
             (static_cast<U64>(size) + 0xffff) &
@@ -2601,7 +2642,7 @@ private:
             ~static_cast<U64>(0xffff);
         while (candidate >= 0x18000000 &&
                candidate + alignedSize <= GUEST_VIRTUAL_LIMIT) {
-            if (guestRangeIsFree(
+            if (guestRangeIsAvailableForModule(
                     static_cast<U32>(candidate),
                     static_cast<U32>(alignedSize))) {
                 nextGuestModuleBase =
@@ -2780,7 +2821,7 @@ private:
             return false;
         }
 
-        U32 loadBase = guestRangeIsFree(
+        U32 loadBase = guestRangeIsAvailableForModule(
             inspected.imageBase,
             inspected.sizeOfImage)
             ? inspected.imageBase
@@ -3681,6 +3722,8 @@ private:
                 callback = callbackUcrtCallocDebug;
             } else if (symbol == "_free_dbg") {
                 callback = callbackUcrtFreeDebug;
+            } else if (symbol == "_callnewh") {
+                callback = callbackUcrtCallNewHandler;
             }
             return;
         }
@@ -3904,6 +3947,11 @@ private:
         } else if (symbol == "OutputDebugStringA") {
             callback = callbackOutputDebugStringA;
             stackCleanupBytes = 4;
+        } else if (
+            symbol == "RtlCaptureStackBackTrace" ||
+            symbol == "CaptureStackBackTrace") {
+            callback = callbackCaptureStackBackTrace;
+            stackCleanupBytes = 16;
         } else if (symbol == "GlobalMemoryStatusEx") {
             callback = callbackGlobalMemoryStatusEx;
             stackCleanupBytes = 4;
@@ -12423,6 +12471,91 @@ private:
         }
     }
 
+    static void callbackCaptureStackBackTrace(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!RtlCaptureStackBackTrace");
+        if (!session) {
+            return;
+        }
+        U32 framesToSkip = argument(cpu, 0);
+        U32 framesToCapture =
+            std::min<U32>(argument(cpu, 1), 62);
+        U32 destination = argument(cpu, 2);
+        U32 hashAddress = argument(cpu, 3);
+        if ((framesToCapture &&
+             (!destination ||
+              !session->memory->canWrite(
+                  destination,
+                  framesToCapture * sizeof(U32)))) ||
+            (hashAddress &&
+             !session->memory->canWrite(hashAddress, 4))) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+
+        const std::size_t targetFrameCount =
+            static_cast<std::size_t>(
+                std::min<U64>(
+                    256,
+                    static_cast<U64>(framesToCapture) +
+                        framesToSkip));
+        std::vector<U32> frames;
+        frames.reserve(targetFrameCount);
+        U32 returnAddress = cpu->peek32(1);
+        if (returnAddress) {
+            frames.push_back(returnAddress);
+        }
+        U32 framePointer = cpu->reg[5].u32;
+        for (U32 walked = 0;
+             walked < 256 &&
+             frames.size() < targetFrameCount;
+             ++walked) {
+            if (!framePointer ||
+                !session->memory->canRead(
+                    framePointer,
+                    8)) {
+                break;
+            }
+            U32 nextFrame =
+                session->memory->readd(framePointer);
+            U32 frameReturn =
+                session->memory->readd(framePointer + 4);
+            if (frameReturn &&
+                (frames.empty() ||
+                 frames.back() != frameReturn)) {
+                frames.push_back(frameReturn);
+            }
+            if (nextFrame <= framePointer ||
+                nextFrame - framePointer >
+                    16 * 1024 * 1024) {
+                break;
+            }
+            framePointer = nextFrame;
+        }
+
+        U32 captured = 0;
+        U32 hash = 0;
+        for (std::size_t index = framesToSkip;
+             index < frames.size() &&
+             captured < framesToCapture;
+             ++index) {
+            const U32 address = frames[index];
+            session->memory->writed(
+                destination + captured * sizeof(U32),
+                address);
+            hash =
+                (hash << 5) |
+                (hash >> 27);
+            hash += address;
+            ++captured;
+        }
+        if (hashAddress) {
+            session->memory->writed(hashAddress, hash);
+        }
+        cpu->reg[0].u32 = captured;
+    }
+
     static void callbackGlobalMemoryStatusEx(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!GlobalMemoryStatusEx");
         if (!session) {
@@ -12915,6 +13048,16 @@ private:
             current(cpu, "UCRT!_free_dbg");
         if (session) {
             session->freeGuestHeap(argument(cpu, 0));
+        }
+    }
+
+    static void callbackUcrtCallNewHandler(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_callnewh");
+        if (session) {
+            // No guest new-handler has been registered. The UCRT contract
+            // returns zero so the caller can report allocation failure.
+            cpu->reg[0].u32 = 0;
         }
     }
 
@@ -18194,6 +18337,11 @@ private:
                 bool overlaps = false;
                 U64 nextCandidate = candidate;
                 const U64 candidateEnd = candidate + roundedSize;
+                if (candidate < GUEST_HEAP_LIMIT &&
+                    candidateEnd > GUEST_HEAP_BASE) {
+                    overlaps = true;
+                    nextCandidate = GUEST_HEAP_LIMIT;
+                }
                 for (const auto& entry : virtualRegions) {
                     const U64 existingBase = entry.second.base;
                     const U64 existingEnd = existingBase + entry.second.size;
@@ -18706,12 +18854,37 @@ private:
             return 0;
         }
         U32 mappedSize = K_ROUND_UP_TO_PAGE(logicalSize);
-        if (nextHeapAddress > GUEST_HEAP_LIMIT ||
-            mappedSize > GUEST_HEAP_LIMIT - nextHeapAddress) {
+        auto reusable = freeHeapRanges.end();
+        for (auto candidate = freeHeapRanges.begin();
+             candidate != freeHeapRanges.end();
+             ++candidate) {
+            if (candidate->second >= mappedSize &&
+                guestRangeIsFree(candidate->first, mappedSize) &&
+                !guestRangeOverlapsVirtualRegion(
+                    candidate->first,
+                    mappedSize)) {
+                reusable = candidate;
+                break;
+            }
+        }
+
+        U32 address = reusable != freeHeapRanges.end()
+            ? reusable->first
+            : nextHeapAddress;
+        while (reusable == freeHeapRanges.end() &&
+               (address <= GUEST_HEAP_LIMIT &&
+                mappedSize <= GUEST_HEAP_LIMIT - address) &&
+               (!guestRangeIsFree(address, mappedSize) ||
+                guestRangeOverlapsVirtualRegion(
+                    address,
+                    mappedSize))) {
+            address += K_PAGE_SIZE;
+        }
+        if (address > GUEST_HEAP_LIMIT ||
+            mappedSize > GUEST_HEAP_LIMIT - address) {
             setLastError(8);
             return 0;
         }
-        U32 address = nextHeapAddress;
         if (memory->mmap(
                 thread,
                 address,
@@ -18723,7 +18896,23 @@ private:
             setLastError(8);
             return 0;
         }
-        nextHeapAddress += mappedSize;
+        if (reusable != freeHeapRanges.end()) {
+            U32 remaining =
+                reusable->second - mappedSize;
+            freeHeapRanges.erase(reusable);
+            if (remaining) {
+                freeHeapRanges[
+                    address + mappedSize] = remaining;
+            }
+            ++heapReuseCount;
+        } else {
+            nextHeapAddress = address + mappedSize;
+            heapHighWaterAddress =
+                std::max(
+                    heapHighWaterAddress,
+                    nextHeapAddress);
+        }
+        ++heapAllocationCount;
         HeapAllocation allocation;
         allocation.requestedSize = requestedSize;
         allocation.mappedSize = mappedSize;
@@ -18759,6 +18948,36 @@ private:
         return replacement;
     }
 
+    void addFreeHeapRange(U32 address, U32 size) {
+        auto next = freeHeapRanges.lower_bound(address);
+        if (next != freeHeapRanges.begin()) {
+            auto previous = std::prev(next);
+            if (static_cast<U64>(previous->first) +
+                    previous->second ==
+                address) {
+                address = previous->first;
+                size += previous->second;
+                freeHeapRanges.erase(previous);
+            }
+        }
+        next = freeHeapRanges.lower_bound(address);
+        if (next != freeHeapRanges.end() &&
+            static_cast<U64>(address) + size ==
+                next->first) {
+            size += next->second;
+            freeHeapRanges.erase(next);
+        }
+        freeHeapRanges[address] = size;
+
+        auto tail = std::prev(freeHeapRanges.end());
+        if (static_cast<U64>(tail->first) +
+                tail->second ==
+            nextHeapAddress) {
+            nextHeapAddress = tail->first;
+            freeHeapRanges.erase(tail);
+        }
+    }
+
     bool freeGuestHeap(U32 address) {
         if (!address) {
             return true;
@@ -18768,8 +18987,11 @@ private:
             setLastError(87);
             return false;
         }
-        memory->unmap(address, found->second.mappedSize);
+        U32 mappedSize = found->second.mappedSize;
+        memory->unmap(address, mappedSize);
         heapAllocations.erase(found);
+        addFreeHeapRange(address, mappedSize);
+        ++heapFreeCount;
         return true;
     }
 
@@ -18971,7 +19193,11 @@ private:
     U32 guestPresentCount = 0;
     U32 nextHeapHandle = PROCESS_HEAP_HANDLE + 1;
     U32 nextHeapAddress = GUEST_HEAP_BASE;
+    U32 heapHighWaterAddress = GUEST_HEAP_BASE;
     U32 nextVirtualAddress = GUEST_VIRTUAL_BASE;
+    U64 heapAllocationCount = 0;
+    U64 heapReuseCount = 0;
+    U64 heapFreeCount = 0;
     U32 nextTlsIndex = 0;
     bool staticTlsInitialized = false;
     U32 ucrtLocaleCodepageAddress = 0;
@@ -18983,6 +19209,7 @@ private:
     bool fileApisAnsi = true;
     U32 standardHandles[3] = {STDIN_GUEST_HANDLE, STDOUT_GUEST_HANDLE, STDERR_GUEST_HANDLE};
     std::unordered_map<U32, HeapAllocation> heapAllocations;
+    std::map<U32, U32> freeHeapRanges;
     std::unordered_map<U32, CriticalSectionState> criticalSections;
     std::unordered_map<U32, SlimReaderWriterLockState>
         slimReaderWriterLocks;
