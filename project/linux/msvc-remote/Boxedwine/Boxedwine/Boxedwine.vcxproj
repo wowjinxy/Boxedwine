@@ -1354,6 +1354,11 @@
     <ClCompile Include="..\..\..\..\..\source\sdl\multiThreaded\threadedMainloop.cpp" />
     <ClCompile Include="..\..\..\..\..\source\sdl\singleThreaded\mainloop.cpp" />
     <ClCompile Include="..\..\..\..\..\source\sdl\startupArgs.cpp" />
+    <ClCompile Include="..\..\..\..\..\source\sugarbomb\pe32loader.cpp" />
+    <ClCompile Include="..\..\..\..\..\source\sugarbomb\sugarbombbridge.cpp" />
+    <ClCompile Include="..\..\..\..\..\source\sugarbomb\sugarbombhostd3d9.cpp" />
+    <ClCompile Include="..\..\..\..\..\source\sugarbomb\sugarbombhostwindow.cpp" />
+    <ClCompile Include="..\..\..\..\..\source\sugarbomb\sugarbombruntime.cpp" />
     <ClCompile Include="..\..\..\..\..\source\testOld\testCPU.cpp" />
     <ClCompile Include="..\..\..\..\..\source\testOld\testFPU.cpp" />
     <ClCompile Include="..\..\..\..\..\source\testOld\testMMX.cpp" />
@@ -1640,6 +1645,7 @@
     <ClInclude Include="..\..\..\..\..\include\kunixsocket.h" />
     <ClInclude Include="..\..\..\..\..\include\kvulkan.h" />
     <ClInclude Include="..\..\..\..\..\include\loader.h" />
+    <ClInclude Include="..\..\..\..\..\include\pe32loader.h" />
     <ClInclude Include="..\..\..\..\..\include\log.h" />
     <ClInclude Include="..\..\..\..\..\include\meminfo.h" />
     <ClInclude Include="..\..\..\..\..\include\pixelformat.h" />
@@ -1652,6 +1658,8 @@
     <ClInclude Include="..\..\..\..\..\include\recorder.h" />
     <ClInclude Include="..\..\..\..\..\include\syscpumaxfreq.h" />
     <ClInclude Include="..\..\..\..\..\include\syscpuonline.h" />
+    <ClInclude Include="..\..\..\..\..\include\sugarbombbridge.h" />
+    <ClInclude Include="..\..\..\..\..\include\sugarbombruntime.h" />
     <ClInclude Include="..\..\..\..\..\include\syscpuscalingcurfreq.h" />
     <ClInclude Include="..\..\..\..\..\include\syscpuscalingmaxfreq.h" />
     <ClInclude Include="..\..\..\..\..\include\uptime.h" />

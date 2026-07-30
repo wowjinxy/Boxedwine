@@ -226,6 +226,17 @@ void OPCALL normal_int9B(CPU* cpu, DecodedOp* op) {
 #endif
     NEXT();
 }
+void OPCALL normal_int9C(CPU* cpu, DecodedOp* op) {
+    START_OP(cpu, op);
+    U32 originalEip = cpu->eip.u32;
+    U32 index = cpu->peek32(0);
+    callSugarbomb(cpu, index);
+    if (cpu->eip.u32 != originalEip) {
+        NEXT_DONE_JUMP_OR_CALL();
+        return;
+    }
+    NEXT();
+}
 void OPCALL normal_int3(CPU* cpu, DecodedOp* op) {
     START_OP(cpu, op);
     cpu->thread->signalTrap(1);// 1=TRAP_BRKPT

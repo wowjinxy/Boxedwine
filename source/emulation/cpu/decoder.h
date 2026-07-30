@@ -485,6 +485,7 @@ enum Instruction {
     Int99,
     Int9A,
     Int9B,
+    Int9C,
     IntIb,
     IntO,
     Iret,

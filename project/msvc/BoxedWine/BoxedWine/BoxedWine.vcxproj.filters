@@ -70,6 +70,24 @@
     <ClCompile Include="..\..\..\..\source\kernel\loader\loader.cpp">
       <Filter>source\kernel\loader</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\pe32loader.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombbridge.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostd3d9.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostinput.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostwindow.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombruntime.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\..\..\source\kernel\devs\devdsp.cpp">
       <Filter>source\kernel\devs</Filter>
     </ClCompile>
@@ -276,6 +294,9 @@
     </ClCompile>
     <ClCompile Include="..\..\..\..\source\test\testMain.cpp">
       <Filter>source\test</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\..\source\test\sugarbomb\testPe32Loader.cpp">
+      <Filter>source\test\sugarbomb</Filter>
     </ClCompile>
     <ClCompile Include="..\..\..\..\source\test\cpu\testAdc.cpp">
       <Filter>source\test\cpu</Filter>
@@ -1221,6 +1242,15 @@
     <ClInclude Include="..\..\..\..\include\loader.h">
       <Filter>include</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\..\..\include\pe32loader.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\..\include\sugarbombbridge.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\..\include\sugarbombruntime.h">
+      <Filter>include</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\..\..\include\log.h">
       <Filter>include</Filter>
     </ClInclude>
@@ -1241,6 +1271,9 @@
     </ClInclude>
     <ClInclude Include="..\..\..\..\include\ktimer.h">
       <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\..\source\test\sugarbomb\testPe32Loader.h">
+      <Filter>source\test\sugarbomb</Filter>
     </ClInclude>
     <ClInclude Include="..\..\..\..\source\emulation\softmmu\soft_file_map.h">
       <Filter>source\emulation\softmmu</Filter>
@@ -2398,6 +2431,12 @@
     </Filter>
     <Filter Include="source\test">
       <UniqueIdentifier>{49a28c26-9cbd-4f73-95ef-5ca1ccf76907}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="source\sugarbomb">
+      <UniqueIdentifier>{c9c50d19-250c-4d03-83b7-3ce0f7545c49}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="source\test\sugarbomb">
+      <UniqueIdentifier>{c74d2ea6-a0d1-441b-aa4c-ef850dbd59de}</UniqueIdentifier>
     </Filter>
     <Filter Include="source\test\cpu">
       <UniqueIdentifier>{22aaa7cb-e4a1-49e8-9844-58102a85f567}</UniqueIdentifier>
