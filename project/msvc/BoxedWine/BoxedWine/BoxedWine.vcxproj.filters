@@ -79,6 +79,9 @@
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostd3d9.cpp">
       <Filter>source\sugarbomb</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostinput.cpp">
+      <Filter>source\sugarbomb</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostwindow.cpp">
       <Filter>source\sugarbomb</Filter>
     </ClCompile>

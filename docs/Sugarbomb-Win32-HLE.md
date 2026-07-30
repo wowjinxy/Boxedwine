@@ -87,6 +87,19 @@ released exclusive capture, and ordinary reactivation caused Fallout to create,
 configure, acquire, and capture its replacement mouse device against the same
 guest HWND. No runtime foreground override was used.
 
+The normal app path now goes one step further and backs those guest DirectInput
+objects with the native x64 `IDirectInput8A` implementation. Sugarbomb creates
+real system keyboard and mouse devices, maps Fallout's guest cooperative-level
+`HWND` to the top-level native window, selects the matching native keyboard or
+mouse data format, and translates `DIDEVICEOBJECTDATA` back to its 32-bit guest
+layout. Windows is consequently the authority for exclusive/foreground
+`Acquire`, input loss, and reacquisition. A clean launch made the ordinary app
+window foreground, then returned `DI_OK` from Fallout's own native keyboard and
+mouse `Acquire` calls without any activation helper or injected input.
+`SUGARBOMB_MESSAGE_INPUT=1` retains the previous message-backed implementation
+as an explicit fallback; presentation-disabled diagnostics also use it because
+there is no native `HWND` to own a DirectInput cooperative level.
+
 An earlier keyboard validation accepted two extended Down-arrow scan-code
 events through the foreground native `HWND`, reported the corresponding
 DirectInput `DIK_DOWN` (`0xD0`) press/release records, and visibly advanced the
@@ -106,6 +119,18 @@ started that process from the background, Windows displayed it with
 ordinary click or Alt-Tab is consequently the sole activation boundary, just as
 for another Windows application; once activated, the existing native focus
 messages control DirectInput acquire, capture, loss, and reacquisition.
+
+The first `New`-game transition is also complete. Fallout accepted its own
+confirmation dialog, entered the world-loading path, and crossed the former
+`libvorbisfile.dll!ov_open_callbacks` unresolved-import boundary. Sugarbomb now
+maps the bundled 32-bit `libogg.dll`, `libvorbis.dll`, and
+`libvorbisfile.dll` into guest memory, binds their real guest exports, creates
+their static TLS, and calls their process-attach entry points in dependency
+order before Fallout's executable entry point. Both decoder DLLs completed
+initialization successfully, and the subsequent run created numerous
+DirectSound buffers from the real guest Vorbis path. The next deterministic
+world-loading boundary is a D3D9 invalid-call resource failure followed by a
+guest null dereference, rather than an unresolved decoder import.
 
 The staged xNVSE 6.4.8 runtime now initializes automatically at Fallout's real
 WinMain boundary. A bounded headless smoke run completes both PE TLS callbacks,
@@ -185,10 +210,12 @@ The runtime currently builds:
 - a GUI-subsystem x64 Release executable and exact guest-to-native `ShowWindow`
   command translation, retaining Windows activation policy instead of hiding a
   console or forcing foreground ownership;
-- host-backed DirectInput keyboard and mouse state, relative axes, wheel and
-  button state, buffered `DIDEVICEOBJECTDATA`, and idempotent device
-  acquire/unacquire behavior, including foreground cooperative-level loss and
-  reacquisition across native focus changes;
+- native x64 DirectInput keyboard and mouse devices bound to the real
+  application `HWND`, including exact cooperative-level and acquire/unacquire
+  results, keyboard/mouse device-state formats, and 64-to-32-bit
+  `DIDEVICEOBJECTDATA` translation;
+- a message-backed DirectInput fallback with relative axes, wheel, button and
+  buffered event state for headless diagnostics and explicit recovery mode;
 - native raw-mouse deltas, exclusive foreground capture and clipping, and
   guest-driven host cursor visibility, with legacy `WM_MOUSEMOVE` retained as a
   registration fallback;
@@ -338,25 +365,32 @@ dependency order and validate each group with small guest fixtures:
    `SetFocus`, and `SetForegroundWindow` are reflected through the real window.
    Queries inspect the HWND directly rather than depending on the asynchronous
    guest activation mirror, eliminating the null-active-window startup race.
-   The same host event stream feeds keyboard and mouse DirectInput state plus
-   buffered menu events. Raw mouse motion and exclusive foreground capture
-   follow the native window lifecycle; focus loss, capture revocation, and
-   cancel-mode transitions release ownership so Fallout can reacquire it
-   normally. Mouse coordinates are scaled between a resized native client and
-   Fallout's guest client, while guest D3D9 cursor positions take the inverse
-   route back to native screen space. Deterministic native keyboard navigation,
-   raw relative mouse motion, button delivery, reacquisition, hover selection,
+   Real x64 DirectInput keyboard and mouse devices now consume Fallout's normal
+   cooperative-level, data-format, buffer-size, acquire, state and buffered-data
+   calls against the mapped HWND. Windows therefore owns foreground priority
+   and exclusive input loss; native events are translated back into 32-bit
+   guest layouts. The earlier host event stream remains available as a
+   headless/recovery fallback and continues to feed USER32 plus
+   `GetAsyncKeyState`. Mouse coordinates are scaled between a resized native
+   client and Fallout's guest client, while guest D3D9 cursor positions take the
+   inverse route back to native screen space. Deterministic native keyboard
+   navigation, raw relative mouse motion, button delivery, reacquisition,
+   hover selection,
    and a mouse-click transition from the main menu into `Settings` are verified.
-   Remaining work includes the `New`-game transition and XInput device state.
+   `New` and its confirmation now enter world loading through the same app
+   lifecycle. Remaining work includes XInput device state and broader
+   focus/input validation during gameplay.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
    Sugarbomb's renderer. The guest COM/resource model, native presentation
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
    and surface-copy paths are in place. Remaining work includes less common
    resource methods, volume textures, D3DX shader helpers, reset/lost-device
    edge cases, and frame-by-frame validation beyond the main menu.
-5. **Audio/video:** DirectSound, WinMM, DirectShow, and Bink integration. The
-   current facades preserve guest contracts and timing but do not decode or
-   emit media yet.
+5. **Audio/video:** DirectSound, WinMM, DirectShow, Bink, and bundled guest
+   Vorbis integration. The native facades preserve guest contracts and timing;
+   the real 32-bit Ogg/Vorbis decoder DLLs now execute in guest memory and feed
+   Fallout past its first `New`-game audio load. Remaining work includes native
+   output fidelity and wider media coverage.
 6. **Services:** COM, registry, sockets, shell helpers, and the small Steam API
    surface the game actually exercises.
 
@@ -388,6 +422,7 @@ change the guest ABI:
 $env:SUGARBOMB_MAX_RUN_SLICES = '2600000'
 $env:SUGARBOMB_MAX_RUN_MILLISECONDS = '20000'
 $env:SUGARBOMB_NO_HOST_WINDOW = '1' # optional for unattended runs
+$env:SUGARBOMB_MESSAGE_INPUT = '1' # optional native DirectInput fallback
 $env:SUGARBOMB_FALLOUT_UNPACKED_IMAGE = 'D:\path\to\verified\FalloutNV.unpacked.exe'
 $env:SUGARBOMB_NVSE_PLUGIN_PATHS = 'D:\mods\PluginA.dll;D:\mods\NVSE\Plugins'
 $env:SUGARBOMB_DISABLE_NVSE = '1' # optional diagnostic opt-out
@@ -423,12 +458,14 @@ The 64-bit host owns the window and real D3D9 objects, translates Fallout's
 Fallout's own 32-bit WndProc, and reaches the correctly textured main menu
 without exposing native pointers to the guest. The app-mode HWND is DPI aware,
 is hosted by a GUI-subsystem executable, preserves guest `ShowWindow` policy,
-is the immediate authority for guest activation/focus queries, and owns
-foreground DirectInput capture under normal Windows rules. Keyboard navigation
-and the first mouse-click menu transition are both verified. xNVSE now
+is the immediate authority for guest activation/focus queries, and owns real
+x64 DirectInput devices under normal Windows foreground and exclusive-access
+rules. Keyboard navigation and the first mouse-click menu transition are both
+verified, while `New` now
+crosses into world loading through real guest Ogg/Vorbis code. xNVSE now
 initializes through its real static-TLS and DLL-entry sequence at the same CRT
 boundary used by the xNVSE loader, patches the same guest Fallout image, and
 loads a real NVSE plugin before the game continues. The next major work is to
-advance through `New` into gameplay through the native-focus/DirectInput path,
-persist remaining virtual-file operations, and expand plugin/API coverage from
+repair the D3D9 invalid-call resource path exposed during world loading, persist
+remaining virtual-file operations, and expand plugin/API coverage from
 additional real NVSE workloads.

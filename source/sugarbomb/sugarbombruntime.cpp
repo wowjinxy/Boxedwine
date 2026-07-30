@@ -12,6 +12,7 @@
 #include "pe32loader.h"
 #include "sugarbombbridge.h"
 #include "sugarbombhostd3d9.h"
+#include "sugarbombhostinput.h"
 #include "sugarbombhostwindow.h"
 #include "sugarbombruntime.h"
 
@@ -178,6 +179,34 @@ public:
         SugarbombNativeCallback callback = nullptr;
         U16 stackCleanupBytes = 0;
         session->findNativeCallback(moduleName, symbolName, callback, stackCleanupBytes);
+        if (!callback &&
+            session->isBundledGuestImportModule(moduleName)) {
+            U32 moduleHandle = 0;
+            if (!session->mapGuestModule(
+                    module.name,
+                    moduleHandle,
+                    nullptr,
+                    true)) {
+                return false;
+            }
+            guestAddress = session->guestModuleProcAddress(
+                moduleHandle,
+                symbol.byOrdinal ? std::string() : symbol.name,
+                symbol.byOrdinal ? symbol.ordinal : 0);
+            if (!guestAddress) {
+                session->error =
+                    "Guest DLL " + module.name +
+                    " does not export " + symbolName;
+                return false;
+            }
+            printf(
+                "Sugarbomb Win32 loader: bound %s!%s to guest "
+                "export 0x%08X\n",
+                module.name.c_str(),
+                symbolName.c_str(),
+                guestAddress);
+            return true;
+        }
         if (!callback) {
             callback = callbackUnresolvedImport;
         }
@@ -247,6 +276,7 @@ private:
         U32 moduleHandle = 0;
         std::vector<GuestModuleInitializer> initializers;
         std::size_t nextInitializer = 0;
+        bool startupSequence = false;
     };
 
     struct GuestOnExitTable {
@@ -270,6 +300,7 @@ private:
         Pe32MappedImage image;
         U32 references = 1;
         bool initialized = false;
+        bool startupDependency = false;
     };
 
     struct GuestWindowClass {
@@ -345,6 +376,7 @@ private:
         U32 cooperativeFlags = 0;
         U32 eventHandle = 0;
         U32 bufferSize = 0;
+        SugarbombHostInput::DeviceHandle nativeDevice = 0;
         bool acquired = false;
         S32 mouseDeltaX = 0;
         S32 mouseDeltaY = 0;
@@ -977,6 +1009,14 @@ private:
             fprintf(
                 stderr,
                 "Sugarbomb could not initialize PE static TLS modules: %s\n",
+                error.c_str());
+            return false;
+        }
+        if (!beginStartupGuestModuleInitialization(cpu)) {
+            fprintf(
+                stderr,
+                "Sugarbomb could not initialize statically imported "
+                "guest DLLs: %s\n",
                 error.c_str());
             return false;
         }
@@ -1838,6 +1878,16 @@ private:
         } else if (!success) {
             setLastError(1114); // ERROR_DLL_INIT_FAILED
         }
+        if (!success && pending.startupSequence) {
+            error = "A statically imported guest DLL failed process initialization";
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 loader: startup dependency "
+                "initialization failed\n");
+            runtimeStopping = true;
+            guestCpu->thread->terminating = true;
+            return true;
+        }
         guestCpu->reg[4].u32 =
             pending.nativeThunkStackPointer;
         guestCpu->eip.u32 =
@@ -1845,11 +1895,18 @@ private:
         guestCpu->reg[0].u32 =
             success ? pending.moduleHandle : 0;
         guestCpu->nextOp = nullptr;
-        printf(
-            "Sugarbomb Win32 loader: dynamic module 0x%08X "
-            "%s process initialization\n",
-            pending.moduleHandle,
-            success ? "completed" : "failed");
+        if (pending.startupSequence) {
+            printf(
+                "Sugarbomb Win32 loader: startup dependency "
+                "sequence %s process initialization\n",
+                success ? "completed" : "failed");
+        } else {
+            printf(
+                "Sugarbomb Win32 loader: dynamic module 0x%08X "
+                "%s process initialization\n",
+                pending.moduleHandle,
+                success ? "completed" : "failed");
+        }
         return true;
     }
 
@@ -1911,25 +1968,20 @@ private:
         return true;
     }
 
-    bool beginDynamicGuestModuleLoad(
-        CPU* guestCpu,
+    bool appendGuestModuleInitializers(
+        PendingDynamicModuleLoad& pending,
         U32 moduleHandle) {
         auto module = guestModules.find(moduleHandle);
         if (module == guestModules.end()) {
-            error = "Dynamic guest module handle is invalid";
+            error = "Guest module initializer handle is invalid";
             return false;
         }
         if (module->second.initialized) {
-            guestCpu->reg[0].u32 = moduleHandle;
             return true;
         }
 
-        PendingDynamicModuleLoad pending;
-        pending.nativeThunkStackPointer =
-            guestCpu->reg[4].u32;
-        pending.nativeThunkResumeEip =
-            guestCpu->eip.u32 + 2;
-        pending.moduleHandle = moduleHandle;
+        const std::size_t firstInitializer =
+            pending.initializers.size();
         const std::string moduleName =
             std::filesystem::path(
                 module->second.path).filename().string();
@@ -1965,8 +2017,42 @@ private:
             pending.initializers.push_back(
                 std::move(initializer));
         }
-        if (pending.initializers.empty()) {
+        if (pending.initializers.size() ==
+            firstInitializer) {
             module->second.initialized = true;
+        } else if (
+            !module->second.image.info.entryPointRva) {
+            pending.initializers.back()
+                .marksModuleInitialized = true;
+        }
+        return true;
+    }
+
+    bool beginDynamicGuestModuleLoad(
+        CPU* guestCpu,
+        U32 moduleHandle) {
+        auto module = guestModules.find(moduleHandle);
+        if (module == guestModules.end()) {
+            error = "Dynamic guest module handle is invalid";
+            return false;
+        }
+        if (module->second.initialized) {
+            guestCpu->reg[0].u32 = moduleHandle;
+            return true;
+        }
+
+        PendingDynamicModuleLoad pending;
+        pending.nativeThunkStackPointer =
+            guestCpu->reg[4].u32;
+        pending.nativeThunkResumeEip =
+            guestCpu->eip.u32 + 2;
+        pending.moduleHandle = moduleHandle;
+        if (!appendGuestModuleInitializers(
+                pending,
+                moduleHandle)) {
+            return false;
+        }
+        if (pending.initializers.empty()) {
             guestCpu->reg[0].u32 = moduleHandle;
             return true;
         }
@@ -1974,6 +2060,52 @@ private:
         pendingDynamicModuleLoads[guestCpu->thread->id]
             .push_back(std::move(pending));
         if (!scheduleNextDynamicModuleInitializer(guestCpu)) {
+            pendingDynamicModuleLoads[guestCpu->thread->id]
+                .pop_back();
+            if (pendingDynamicModuleLoads[
+                    guestCpu->thread->id].empty()) {
+                pendingDynamicModuleLoads.erase(
+                    guestCpu->thread->id);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool beginStartupGuestModuleInitialization(
+        CPU* guestCpu) {
+        PendingDynamicModuleLoad pending;
+        pending.nativeThunkStackPointer =
+            guestCpu->reg[4].u32;
+        pending.nativeThunkResumeEip =
+            image.entryPoint;
+        pending.startupSequence = true;
+
+        for (U32 moduleHandle : guestModuleLoadOrder) {
+            auto module = guestModules.find(moduleHandle);
+            if (module == guestModules.end() ||
+                !module->second.startupDependency ||
+                module->second.initialized) {
+                continue;
+            }
+            if (!appendGuestModuleInitializers(
+                    pending,
+                    moduleHandle)) {
+                return false;
+            }
+        }
+        if (pending.initializers.empty()) {
+            return true;
+        }
+
+        printf(
+            "Sugarbomb Win32 loader: scheduling %zu startup "
+            "dependency initializer(s) before Fallout entry\n",
+            pending.initializers.size());
+        pendingDynamicModuleLoads[guestCpu->thread->id]
+            .push_back(std::move(pending));
+        if (!scheduleNextDynamicModuleInitializer(
+                guestCpu)) {
             pendingDynamicModuleLoads[guestCpu->thread->id]
                 .pop_back();
             if (pendingDynamicModuleLoads[
@@ -2029,6 +2161,14 @@ private:
                 guestCpu->thread->terminating = true;
             }
             return;
+        }
+        if (initializer.marksModuleInitialized) {
+            auto module =
+                guestModules.find(
+                    initializer.moduleBase);
+            if (module != guestModules.end()) {
+                module->second.initialized = true;
+            }
         }
         ++pending.nextInitializer;
         if (!scheduleNextDynamicModuleInitializer(guestCpu)) {
@@ -2413,6 +2553,11 @@ private:
     }
 
     void cleanup() {
+        for (auto& entry : directInputObjects) {
+            hostDirectInput.releaseDevice(
+                entry.second.nativeDevice);
+        }
+        hostDirectInput.shutdown();
         shutdownHostWindow();
         if (process) {
             KThread::setCurrentThread(nullptr);
@@ -2456,6 +2601,15 @@ private:
             key += ".dll";
         }
         return lowerAscii(key);
+    }
+
+    bool isBundledGuestImportModule(
+        const std::string& requestedName) const {
+        const std::string key =
+            guestModuleKey(requestedName);
+        return key == "libvorbisfile.dll" ||
+            key == "libvorbis.dll" ||
+            key == "libogg.dll";
     }
 
     U32 hleModuleHandle(
@@ -2788,7 +2942,8 @@ private:
     bool mapGuestModule(
         const std::string& requestedPath,
         U32& moduleHandle,
-        bool* newlyMapped = nullptr) {
+        bool* newlyMapped = nullptr,
+        bool startupDependency = false) {
         moduleHandle = 0;
         if (newlyMapped) {
             *newlyMapped = false;
@@ -2804,6 +2959,9 @@ private:
             GuestModule& existing =
                 guestModules[existingName->second];
             ++existing.references;
+            existing.startupDependency =
+                existing.startupDependency ||
+                startupDependency;
             moduleHandle = existing.image.loadBase;
             return true;
         }
@@ -2865,6 +3023,8 @@ private:
         module.key = key;
         module.path = path;
         module.image = mapped;
+        module.startupDependency =
+            startupDependency;
         moduleHandle = mapped.loadBase;
         guestModuleHandles[key] = moduleHandle;
         guestModules[moduleHandle] = std::move(module);
@@ -3763,6 +3923,9 @@ private:
             stackCleanupBytes = 4;
         } else if (symbol == "GetStartupInfoA") {
             callback = callbackGetStartupInfoA;
+            stackCleanupBytes = 4;
+        } else if (symbol == "GetVersionExA") {
+            callback = callbackGetVersionExA;
             stackCleanupBytes = 4;
         } else if (symbol == "GetCommandLineA") {
             callback = callbackGetCommandLineA;
@@ -6951,6 +7114,23 @@ private:
         DirectInputObject object;
         object.kind = kind;
         object.deviceGuidData1 = deviceGuidData1;
+        if (kind == DirectInputObjectKind::Device &&
+            hostDirectInput.ready() &&
+            hostWindow.nativeHandle()) {
+            const U32 nativeResult =
+                hostDirectInput.createDevice(
+                    deviceGuidData1,
+                    object.nativeDevice);
+            if (!object.nativeDevice) {
+                fprintf(
+                    stderr,
+                    "Sugarbomb native DirectInput: CreateDevice "
+                    "for GUID.Data1=0x%08X returned 0x%08X; "
+                    "using the message fallback for this device\n",
+                    deviceGuidData1,
+                    nativeResult);
+            }
+        }
         directInputObjects[objectAddress] = object;
         memory->writed(
             objectAddress,
@@ -7010,6 +7190,7 @@ private:
         for (auto& entry : directInputObjects) {
             DirectInputObject& object = entry.second;
             if (object.kind != DirectInputObjectKind::Device ||
+                !object.acquired ||
                 !(object.cooperativeFlags & DISCL_FOREGROUND)) {
                 continue;
             }
@@ -7018,6 +7199,10 @@ private:
             if (cooperativeTopLevel &&
                 cooperativeTopLevel != lostTopLevel) {
                 continue;
+            }
+            if (object.nativeDevice) {
+                hostDirectInput.unacquire(
+                    object.nativeDevice);
             }
             object.acquired = false;
             object.mouseDeltaX = 0;
@@ -7034,8 +7219,13 @@ private:
         for (auto& entry : directInputObjects) {
             DirectInputObject& object = entry.second;
             if (!isDirectInputMouse(object) ||
+                !object.acquired ||
                 !(object.cooperativeFlags & DISCL_EXCLUSIVE)) {
                 continue;
+            }
+            if (object.nativeDevice) {
+                hostDirectInput.unacquire(
+                    object.nativeDevice);
             }
             object.acquired = false;
             object.mouseDeltaX = 0;
@@ -7052,6 +7242,7 @@ private:
         for (const auto& entry : directInputObjects) {
             const DirectInputObject& object = entry.second;
             if (isDirectInputMouse(object) &&
+                !object.nativeDevice &&
                 object.acquired &&
                 (object.cooperativeFlags & DISCL_EXCLUSIVE) &&
                 hasDirectInputForegroundPriority(object)) {
@@ -7067,7 +7258,8 @@ private:
         U32 offset,
         U32 data,
         U32 timestamp) {
-        if (!object.acquired) {
+        if (!object.acquired ||
+            object.nativeDevice) {
             return;
         }
         DirectInputDeviceEvent event;
@@ -7169,7 +7361,9 @@ private:
             }
             for (auto& entry : directInputObjects) {
                 DirectInputObject& object = entry.second;
-                if (!isDirectInputMouse(object) || !object.acquired) {
+                if (!isDirectInputMouse(object) ||
+                    object.nativeDevice ||
+                    !object.acquired) {
                     continue;
                 }
                 if (deltaX) {
@@ -7294,7 +7488,9 @@ private:
                 !directInputRawMouseAvailable) {
                 for (auto& entry : directInputObjects) {
                     DirectInputObject& object = entry.second;
-                    if (!isDirectInputMouse(object) || !object.acquired) {
+                    if (!isDirectInputMouse(object) ||
+                        object.nativeDevice ||
+                        !object.acquired) {
                         continue;
                     }
                     if (deltaX) {
@@ -7384,7 +7580,9 @@ private:
                 (event.wordParameter >> 16) & 0xffff);
             for (auto& entry : directInputObjects) {
                 DirectInputObject& object = entry.second;
-                if (!isDirectInputMouse(object) || !object.acquired) {
+                if (!isDirectInputMouse(object) ||
+                    object.nativeDevice ||
+                    !object.acquired) {
                     continue;
                 }
                 U32 offset =
@@ -7462,6 +7660,8 @@ private:
                 object.kind == DirectInputObjectKind::Device) {
                 object.acquired = false;
                 object.events.clear();
+                hostDirectInput.releaseDevice(
+                    object.nativeDevice);
                 if (isDirectInputMouse(object)) {
                     updateHostDirectInputMouseCapture();
                 }
@@ -7562,6 +7762,13 @@ private:
                 memory->canRead(header, 20)) { // DIPROP_BUFFERSIZE
                 object.bufferSize =
                     std::min<U32>(memory->readd(header + 16), 4096);
+                if (object.nativeDevice) {
+                    cpu->reg[0].u32 =
+                        hostDirectInput.setBufferSize(
+                            object.nativeDevice,
+                            object.bufferSize);
+                    return;
+                }
                 while (object.events.size() > object.bufferSize) {
                     object.events.pop_front();
                 }
@@ -7572,6 +7779,25 @@ private:
         case 7: { // Acquire
             pumpHostMessages();
             bool wasAcquired = object.acquired;
+            if (object.nativeDevice) {
+                const U32 result =
+                    hostDirectInput.acquire(
+                        object.nativeDevice);
+                object.acquired =
+                    !(result & 0x80000000);
+                if (object.acquired && !wasAcquired) {
+                    printf(
+                        "Sugarbomb DirectInput: native Acquire(%s "
+                        "0x%08X) -> 0x%08X\n",
+                        isDirectInputKeyboard(object)
+                            ? "keyboard"
+                            : "mouse",
+                        objectAddress,
+                        result);
+                }
+                cpu->reg[0].u32 = result;
+                return;
+            }
             if (!wasAcquired &&
                 !hasDirectInputForegroundPriority(object)) {
                 cpu->reg[0].u32 = DIERR_OTHERAPPHASPRIO;
@@ -7597,6 +7823,24 @@ private:
         }
         case 8: { // Unacquire
             bool wasAcquired = object.acquired;
+            if (object.nativeDevice) {
+                const U32 result =
+                    hostDirectInput.unacquire(
+                        object.nativeDevice);
+                object.acquired = false;
+                if (wasAcquired) {
+                    printf(
+                        "Sugarbomb DirectInput: native Unacquire(%s "
+                        "0x%08X) -> 0x%08X\n",
+                        isDirectInputKeyboard(object)
+                            ? "keyboard"
+                            : "mouse",
+                        objectAddress,
+                        result);
+                }
+                cpu->reg[0].u32 = result;
+                return;
+            }
             object.acquired = false;
             if (wasAcquired) {
                 object.mouseDeltaX = 0;
@@ -7644,6 +7888,24 @@ private:
                     objectAddress,
                     size,
                     object.acquired ? 1 : 0);
+            }
+            if (object.nativeDevice) {
+                std::vector<U8> state(size);
+                const U32 result =
+                    hostDirectInput.getDeviceState(
+                        object.nativeDevice,
+                        state.data(),
+                        size);
+                if (!(result & 0x80000000)) {
+                    memory->memcpy(
+                        destination,
+                        state.data(),
+                        size);
+                } else {
+                    object.acquired = false;
+                }
+                cpu->reg[0].u32 = result;
+                return;
             }
             memory->memset(destination, 0, size);
             if (isDirectInputKeyboard(object)) {
@@ -7721,6 +7983,92 @@ private:
                 return;
             }
             U32 requested = memory->readd(elementCount);
+            if (object.nativeDevice) {
+                std::vector<
+                    SugarbombHostInput::DeviceEvent>
+                    nativeEvents;
+                U32 nativeFlags = flags;
+                if (!destination) {
+                    nativeFlags |= 1; // DIGDD_PEEK
+                }
+                const U32 result =
+                    hostDirectInput.getDeviceData(
+                        object.nativeDevice,
+                        requested,
+                        nativeFlags,
+                        nativeEvents);
+                if (result & 0x80000000) {
+                    object.acquired = false;
+                    memory->writed(elementCount, 0);
+                    cpu->reg[0].u32 = result;
+                    return;
+                }
+                const U32 count =
+                    static_cast<U32>(
+                        nativeEvents.size());
+                if (destination) {
+                    const U64 destinationBytes =
+                        static_cast<U64>(count) *
+                        elementSize;
+                    if (destinationBytes >
+                            std::numeric_limits<U32>::max() ||
+                        !memory->canWrite(
+                            destination,
+                            static_cast<U32>(
+                                destinationBytes))) {
+                        cpu->reg[0].u32 = E_POINTER;
+                        return;
+                    }
+                    for (U32 index = 0;
+                         index < count;
+                         ++index) {
+                        const U32 output =
+                            destination +
+                            index * elementSize;
+                        const auto& event =
+                            nativeEvents[index];
+                        memory->memset(
+                            output,
+                            0,
+                            elementSize);
+                        memory->writed(
+                            output,
+                            event.offset);
+                        memory->writed(
+                            output + 4,
+                            event.data);
+                        memory->writed(
+                            output + 8,
+                            event.timestamp);
+                        memory->writed(
+                            output + 12,
+                            event.sequence);
+                        if (elementSize >= 20) {
+                            memory->writed(
+                                output + 16,
+                                static_cast<U32>(
+                                    event.applicationData));
+                        }
+                    }
+                }
+                memory->writed(elementCount, count);
+                if (++directInputDataCallTraceCount <= 16) {
+                    printf(
+                        "Sugarbomb DirectInput: native "
+                        "GetDeviceData(%s 0x%08X, "
+                        "requested=%u) -> %u event(s), "
+                        "HRESULT 0x%08X\n",
+                        isDirectInputKeyboard(object)
+                            ? "keyboard"
+                            : "mouse",
+                        objectAddress,
+                        requested,
+                        count,
+                        result);
+                }
+                cpu->reg[0].u32 = result;
+                return;
+            }
             U32 available = static_cast<U32>(object.events.size());
             U32 count = requested == 0xffffffff
                 ? available
@@ -7789,6 +8137,14 @@ private:
                 return;
             }
             object.dataFormatSize = dataSize;
+            if (object.nativeDevice) {
+                cpu->reg[0].u32 =
+                    hostDirectInput.setDataFormat(
+                        object.nativeDevice,
+                        object.deviceGuidData1,
+                        dataSize);
+                return;
+            }
             cpu->reg[0].u32 = DI_OK;
             return;
         }
@@ -7806,6 +8162,14 @@ private:
                 objectAddress,
                 object.cooperativeWindow,
                 object.cooperativeFlags);
+            if (object.nativeDevice) {
+                cpu->reg[0].u32 =
+                    hostDirectInput.setCooperativeLevel(
+                        object.nativeDevice,
+                        hostWindow.nativeHandle(),
+                        object.cooperativeFlags);
+                return;
+            }
             if (isDirectInputMouse(object) && object.acquired) {
                 updateHostDirectInputMouseCapture();
             }
@@ -7891,6 +8255,7 @@ private:
             cpu->reg[0].u32 = 0x80070057;
             return;
         }
+        session->hostDirectInput.initialize(version);
         U32 directInput = session->createDirectInputObject(
             DirectInputObjectKind::Interface);
         session->memory->writed(resultAddress, directInput);
@@ -11218,6 +11583,53 @@ private:
             session->memory->memset(startupInfo, 0, 68);
             session->memory->writed(startupInfo, 68);
         }
+    }
+
+    static void callbackGetVersionExA(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!GetVersionExA");
+        if (!session) {
+            return;
+        }
+        constexpr U32 OSVERSIONINFOA_SIZE = 148;
+        constexpr U32 OSVERSIONINFOEXA_SIZE = 156;
+        U32 destination = argument(cpu, 0);
+        if (!destination ||
+            !session->memory->canRead(destination, 4)) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+        U32 size = session->memory->readd(destination);
+        if ((size != OSVERSIONINFOA_SIZE &&
+             size != OSVERSIONINFOEXA_SIZE) ||
+            !session->memory->canWrite(destination, size)) {
+            session->setLastError(87);
+            cpu->reg[0].u32 = 0;
+            return;
+        }
+
+        session->memory->memset(destination, 0, size);
+        session->memory->writed(destination, size);
+        session->memory->writed(destination + 4, 6);
+        session->memory->writed(destination + 8, 1);
+        session->memory->writed(destination + 12, 7601);
+        session->memory->writed(destination + 16, 2);
+        session->memory->strcpy(
+            destination + 20,
+            "Service Pack 1");
+        if (size == OSVERSIONINFOEXA_SIZE) {
+            session->memory->writew(destination + 148, 1);
+            session->memory->writew(destination + 150, 0);
+            session->memory->writew(destination + 152, 0);
+            session->memory->writeb(destination + 154, 1);
+            session->memory->writeb(destination + 155, 0);
+        }
+        printf(
+            "Sugarbomb Win32 version: GetVersionExA(size=%u) -> "
+            "Windows 6.1 build 7601\n",
+            size);
+        cpu->reg[0].u32 = 1;
     }
 
     static void callbackGetCommandLineA(CPU* cpu) {
@@ -19309,6 +19721,7 @@ private:
     U32 direct3DVertexProfileAddress = 0;
     U32 direct3DPixelProfileAddress = 0;
     SugarbombHostD3D9 hostDirect3D;
+    SugarbombHostInput hostDirectInput;
     SugarbombHostWindow hostWindow;
     std::vector<U32> hostPresentPixels;
     bool hostFrameCaptured = false;

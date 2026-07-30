@@ -3825,6 +3825,7 @@
     <ClCompile Include="..\..\..\..\source\sugarbomb\pe32loader.cpp" />
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombbridge.cpp" />
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostd3d9.cpp" />
+    <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostinput.cpp" />
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombhostwindow.cpp" />
     <ClCompile Include="..\..\..\..\source\sugarbomb\sugarbombruntime.cpp" />
     <ClCompile Include="..\..\..\..\source\test\testMain.cpp" />
