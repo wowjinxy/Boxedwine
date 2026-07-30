@@ -4305,6 +4305,24 @@ private:
         updateHostDirectInputMouseCapture();
     }
 
+    void loseExclusiveDirectInputMouse() {
+        constexpr U32 DISCL_EXCLUSIVE = 0x00000001;
+        directInputMouseButtons.fill(0);
+        for (auto& entry : directInputObjects) {
+            DirectInputObject& object = entry.second;
+            if (!isDirectInputMouse(object) ||
+                !(object.cooperativeFlags & DISCL_EXCLUSIVE)) {
+                continue;
+            }
+            object.acquired = false;
+            object.mouseDeltaX = 0;
+            object.mouseDeltaY = 0;
+            object.mouseWheelDelta = 0;
+            object.events.clear();
+        }
+        updateHostDirectInputMouseCapture();
+    }
+
     void updateHostDirectInputMouseCapture() {
         constexpr U32 DISCL_EXCLUSIVE = 0x00000001;
         bool capture = false;
@@ -4398,6 +4416,8 @@ private:
         constexpr U32 WM_SETFOCUS_GUEST = 0x0007;
         constexpr U32 WM_KILLFOCUS_GUEST = 0x0008;
         constexpr U32 WM_ACTIVATEAPP_GUEST = 0x001c;
+        constexpr U32 WM_CANCELMODE_GUEST = 0x001f;
+        constexpr U32 WM_CAPTURECHANGED_GUEST = 0x0215;
         constexpr U32 WM_KEYDOWN_GUEST = 0x0100;
         constexpr U32 WM_KEYUP_GUEST = 0x0101;
         constexpr U32 WM_SYSKEYDOWN_GUEST = 0x0104;
@@ -4446,6 +4466,12 @@ private:
                         event.time);
                 }
             }
+            return;
+        }
+
+        if (event.message == WM_CANCELMODE_GUEST ||
+            event.message == WM_CAPTURECHANGED_GUEST) {
+            loseExclusiveDirectInputMouse();
             return;
         }
 

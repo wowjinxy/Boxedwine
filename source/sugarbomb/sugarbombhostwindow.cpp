@@ -57,6 +57,7 @@ bool isGuestInputOrFocusMessage(UINT message) {
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
     case WM_ACTIVATEAPP:
+    case WM_CANCELMODE:
     case WM_KEYDOWN:
     case WM_KEYUP:
     case WM_CHAR:
@@ -82,6 +83,7 @@ bool isGuestInputOrFocusMessage(UINT message) {
 #ifdef WM_MOUSEHWHEEL
     case WM_MOUSEHWHEEL:
 #endif
+    case WM_CAPTURECHANGED:
         return true;
     default:
         return false;
@@ -111,6 +113,8 @@ void queueGuestEvent(
         event.wordParameter = 0;
     } else if (message == WM_ACTIVATE ||
                message == WM_ACTIVATEAPP) {
+        event.longParameter = 0;
+    } else if (message == WM_CAPTURECHANGED) {
         event.longParameter = 0;
     }
     impl->pendingEvents.push_back(event);
@@ -169,6 +173,28 @@ void releaseNativeMouseCapture(SugarbombHostWindow::Impl* impl) {
     }
     ClipCursor(nullptr);
     impl->mouseCaptured = false;
+}
+
+bool clipNativeMouseToClient(SugarbombHostWindow::Impl* impl) {
+    if (!impl || !impl->window) {
+        return false;
+    }
+    RECT client = {};
+    if (!GetClientRect(impl->window, &client)) {
+        return false;
+    }
+    POINT upperLeft = {client.left, client.top};
+    POINT lowerRight = {client.right, client.bottom};
+    if (!ClientToScreen(impl->window, &upperLeft) ||
+        !ClientToScreen(impl->window, &lowerRight)) {
+        return false;
+    }
+    RECT screen = {
+        upperLeft.x,
+        upperLeft.y,
+        lowerRight.x,
+        lowerRight.y};
+    return ClipCursor(&screen) != FALSE;
 }
 
 bool presentationDisabled() {
@@ -265,8 +291,22 @@ LRESULT CALLBACK hostWindowProcedure(
                 releaseNativeMouseCapture(impl);
             }
             break;
+        case WM_CANCELMODE:
+            releaseNativeMouseCapture(impl);
+            break;
+        case WM_CAPTURECHANGED:
+            if (reinterpret_cast<HWND>(longParameter) != impl->window) {
+                releaseNativeMouseCapture(impl);
+            }
+            break;
         case WM_KILLFOCUS:
             releaseNativeMouseCapture(impl);
+            break;
+        case WM_WINDOWPOSCHANGED:
+            if (impl->mouseCaptured &&
+                !clipNativeMouseToClient(impl)) {
+                releaseNativeMouseCapture(impl);
+            }
             break;
         case WM_SETCURSOR:
             if (!impl->cursorVisible) {
@@ -526,24 +566,9 @@ bool SugarbombHostWindow::setMouseCapture(bool captured) {
         return false;
     }
     bool wasCaptured = impl->mouseCaptured;
-    RECT client = {};
-    if (!GetClientRect(impl->window, &client)) {
-        return false;
-    }
-    POINT upperLeft = {client.left, client.top};
-    POINT lowerRight = {client.right, client.bottom};
-    if (!ClientToScreen(impl->window, &upperLeft) ||
-        !ClientToScreen(impl->window, &lowerRight)) {
-        return false;
-    }
-    RECT screen = {
-        upperLeft.x,
-        upperLeft.y,
-        lowerRight.x,
-        lowerRight.y};
     SetCapture(impl->window);
     if (GetCapture() != impl->window ||
-        !ClipCursor(&screen)) {
+        !clipNativeMouseToClient(impl)) {
         if (GetCapture() == impl->window) {
             ReleaseCapture();
         }

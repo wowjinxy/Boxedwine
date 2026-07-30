@@ -212,9 +212,13 @@ dependency order and validate each group with small guest fixtures:
    message-loop behavior. The guest/native HWND bridge and host message pump
    create visible output. `PeekMessageA`, `DispatchMessageA`, and `SendMessageA`
    now deliver lifecycle plus native keyboard/mouse/focus events to Fallout's
-   guest WndProc. The same host event stream now feeds keyboard and mouse
-   DirectInput state plus buffered menu events. Raw mouse motion and exclusive
-   foreground capture now follow the native window lifecycle. Remaining work
+   guest WndProc. The native top-level window is the focus authority: ordinary
+   Windows activation, clicking, and Alt-Tab determine whether Fallout's
+   foreground DirectInput devices may be acquired. The same host event stream
+   feeds keyboard and mouse DirectInput state plus buffered menu events. Raw
+   mouse motion and exclusive foreground capture follow the native window
+   lifecycle; focus loss, capture revocation, and cancel-mode transitions
+   release ownership so Fallout can reacquire it normally. Remaining work
    includes cursor-coordinate validation, deterministic menu actions, and
    XInput device state.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
