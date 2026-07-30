@@ -60,9 +60,10 @@ draw calls to a native x64 `IDirect3DDevice9`. It also forwards the surface-copy
 operations used by the engine and can capture the active render target or
 swap-chain backbuffer for deterministic diagnostics. A verified 1920x1080
 backbuffer capture contains Fallout's fully rendered main menu with the logo,
-Sunset Sarsaparilla sign, cursor, and all seven menu entries. Raw/DirectInput
-event fidelity, audio output, and video decoding are still incomplete, so the
-visible menu is not yet a playable build.
+Sunset Sarsaparilla sign, cursor, and all seven menu entries. Raw-input and
+cursor/capture fidelity, deterministic menu-action validation, audio output,
+and video decoding are still incomplete, so the visible menu is not yet a
+playable build.
 
 The runtime currently builds:
 
@@ -80,6 +81,13 @@ The runtime currently builds:
 - distinct top-level and child-window activation semantics, preserving
   Fallout's top-level active `HWND` while its child device window owns D3D9
   presentation;
+- native foreground/focus ownership for normal application runs, with
+  activation loss and reacquisition forwarded to Fallout instead of synthesized
+  by the guest runtime;
+- host-backed DirectInput keyboard and mouse state, relative axes, wheel and
+  button state, buffered `DIDEVICEOBJECTDATA`, and idempotent device
+  acquire/unacquire behavior, including foreground cooperative-level loss and
+  reacquisition across native focus changes;
 - initial Kernel32 timing, process, heap, locale, console, exception, atomic,
   critical-section, memory-status, and virtual-memory services;
 - version-keyed Fallout 1.4 bootstrap objects for two startup-order races: the
@@ -193,9 +201,10 @@ dependency order and validate each group with small guest fixtures:
    message-loop behavior. The guest/native HWND bridge and host message pump
    create visible output. `PeekMessageA`, `DispatchMessageA`, and `SendMessageA`
    now deliver lifecycle plus native keyboard/mouse/focus events to Fallout's
-   guest WndProc. Remaining work includes raw input, richer cursor/capture
-   behavior, and feeding real device state/events through DirectInput and
-   XInput.
+   guest WndProc. The same host event stream now feeds keyboard and mouse
+   DirectInput state plus buffered menu events. Remaining work includes raw
+   input, richer cursor/capture behavior, deterministic menu-action validation,
+   and XInput device state.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
    Sugarbomb's renderer. The guest COM/resource model, native presentation
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
@@ -226,8 +235,10 @@ From the repository root:
 .\project\msvc\BoxedWine\x64\Release\BoxedWine.exe --sugarbomb-run 'D:\path\to\FalloutNV.exe'
 ```
 
+Ordinary launches run until the guest exits or the native window is closed.
 For deterministic diagnostics, the runtime accepts optional environment
-variables. They do not change the guest ABI:
+variables that impose explicit execution or wall-clock budgets. They do not
+change the guest ABI:
 
 ```powershell
 $env:SUGARBOMB_MAX_RUN_SLICES = '2600000'
@@ -263,7 +274,7 @@ USER32, D3D9, audio, DirectShow, Bink, and startup-order singleton boundaries.
 The 64-bit host owns the window and real D3D9 objects, translates Fallout's
 32-bit graphics workload, delivers host and lifecycle messages through
 Fallout's own 32-bit WndProc, and reaches the correctly textured main menu
-without exposing native pointers to the guest. The next major work is to feed
-native keyboard and mouse device state/events through DirectInput, verify
-deterministic menu interaction, persist remaining virtual-file operations, and
-map and initialize `nvse_1_4.dll` plus NVSE plugins in the same guest process.
+without exposing native pointers to the guest. The next major work is to
+verify deterministic menu interaction through the new native-focus/DirectInput
+path, persist remaining virtual-file operations, and map and initialize
+`nvse_1_4.dll` plus NVSE plugins in the same guest process.

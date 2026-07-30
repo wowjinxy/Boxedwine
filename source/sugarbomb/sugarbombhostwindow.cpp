@@ -33,6 +33,7 @@ struct SugarbombHostWindow::Impl {
     bool userClosed = false;
     bool intentionalDestroy = false;
     bool shuttingDown = false;
+    bool visible = false;
     std::vector<std::uint32_t> framePixels;
     std::vector<SugarbombHostWindow::Event> pendingEvents;
 #ifdef _WIN32
@@ -259,6 +260,20 @@ SugarbombHostWindow::~SugarbombHostWindow() {
     delete impl;
 }
 
+void SugarbombHostWindow::hideOwnedConsoleWindow() {
+#ifdef _WIN32
+    HWND console = GetConsoleWindow();
+    if (!console) {
+        return;
+    }
+    DWORD ownerProcess = 0;
+    GetWindowThreadProcessId(console, &ownerProcess);
+    if (ownerProcess == GetCurrentProcessId()) {
+        ShowWindow(console, SW_HIDE);
+    }
+#endif
+}
+
 void SugarbombHostWindow::syncGuestWindow(
     std::uint32_t guestHandle,
     const std::string& title,
@@ -333,8 +348,24 @@ void SugarbombHostWindow::syncGuestWindow(
         rectangle.right - rectangle.left,
         rectangle.bottom - rectangle.top,
         SWP_NOACTIVATE | SWP_NOZORDER);
-    ShowWindow(impl->window, visible ? SW_SHOW : SW_HIDE);
-    if (visible) {
+    bool becameVisible = visible && !impl->visible;
+    bool becameHidden = !visible && impl->visible;
+    if (becameVisible) {
+        ShowWindow(impl->window, SW_SHOW);
+        BOOL foreground = SetForegroundWindow(impl->window);
+        bool ownsForeground =
+            foreground || GetForegroundWindow() == impl->window;
+        std::printf(
+            "Sugarbomb host presentation: requested native activation "
+            "for guest HWND 0x%08X (foreground=%u, owned=%u)\n",
+            guestHandle,
+            foreground ? 1 : 0,
+            ownsForeground ? 1 : 0);
+    } else if (becameHidden) {
+        ShowWindow(impl->window, SW_HIDE);
+    }
+    impl->visible = visible;
+    if (impl->visible) {
         UpdateWindow(impl->window);
     }
 #else
@@ -348,6 +379,19 @@ void SugarbombHostWindow::syncGuestWindow(
 #endif
 }
 
+bool SugarbombHostWindow::activateGuestWindow(std::uint32_t guestHandle) {
+#ifdef _WIN32
+    if (!impl->window || impl->guestHandle != guestHandle) {
+        return false;
+    }
+    BOOL foreground = SetForegroundWindow(impl->window);
+    return foreground || GetForegroundWindow() == impl->window;
+#else
+    (void)guestHandle;
+    return true;
+#endif
+}
+
 void SugarbombHostWindow::destroyGuestWindow(std::uint32_t guestHandle) {
 #ifdef _WIN32
     if (!impl->window || impl->guestHandle != guestHandle) {
@@ -358,6 +402,7 @@ void SugarbombHostWindow::destroyGuestWindow(std::uint32_t guestHandle) {
     impl->intentionalDestroy = false;
     impl->userClosed = false;
     impl->guestHandle = 0;
+    impl->visible = false;
     impl->framePixels.clear();
 #else
     (void)guestHandle;
@@ -436,4 +481,5 @@ void SugarbombHostWindow::shutdown() {
 #endif
     impl->framePixels.clear();
     impl->pendingEvents.clear();
+    impl->visible = false;
 }

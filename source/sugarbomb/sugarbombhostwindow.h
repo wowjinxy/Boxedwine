@@ -33,6 +33,7 @@ public:
     SugarbombHostWindow(const SugarbombHostWindow&) = delete;
     SugarbombHostWindow& operator=(const SugarbombHostWindow&) = delete;
 
+    void hideOwnedConsoleWindow();
     void syncGuestWindow(
         std::uint32_t guestHandle,
         const std::string& title,
@@ -41,6 +42,7 @@ public:
         std::int32_t clientWidth,
         std::int32_t clientHeight,
         bool visible);
+    bool activateGuestWindow(std::uint32_t guestHandle);
     void destroyGuestWindow(std::uint32_t guestHandle);
     bool pumpMessages(std::vector<Event>* events = nullptr);
     std::uintptr_t nativeHandle() const;

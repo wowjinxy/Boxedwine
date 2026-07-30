@@ -16,6 +16,7 @@
 #include "sugarbombruntime.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -65,7 +66,6 @@ constexpr U32 TEB_ADDRESS = 0x7ffde000;
 constexpr U32 PEB_ADDRESS = 0x7ffdf000;
 constexpr U32 WINDOWS_TEB_SELECTOR = (TLS_ENTRY_START_INDEX << 3) | 3;
 constexpr U64 WINDOWS_TO_UNIX_EPOCH_100NS = 116444736000000000ULL;
-constexpr U32 MAX_RUN_SLICES = 20000000;
 constexpr U32 GUEST_THREAD_QUANTUM_SLICES = 32;
 constexpr U32 PROCESS_HEAP_HANDLE = 0x50000000;
 constexpr U32 KERNEL32_MODULE_HANDLE = 0x51000000;
@@ -117,6 +117,7 @@ class SugarbombRuntimeSession {
 public:
     int run(const char* imagePath) {
         setvbuf(stdout, nullptr, _IONBF, 0);
+        hostWindow.hideOwnedConsoleWindow();
         this->imagePath = imagePath ? imagePath : "";
         this->commandLine = "\"" + this->imagePath + "\"";
 
@@ -247,10 +248,27 @@ private:
         Device
     };
 
+    struct DirectInputDeviceEvent {
+        U32 offset = 0;
+        U32 data = 0;
+        U32 timestamp = 0;
+        U32 sequence = 0;
+    };
+
     struct DirectInputObject {
         DirectInputObjectKind kind = DirectInputObjectKind::Interface;
         U32 references = 1;
         U32 deviceGuidData1 = 0;
+        U32 dataFormatSize = 0;
+        U32 cooperativeWindow = 0;
+        U32 cooperativeFlags = 0;
+        U32 eventHandle = 0;
+        U32 bufferSize = 0;
+        bool acquired = false;
+        S32 mouseDeltaX = 0;
+        S32 mouseDeltaY = 0;
+        S32 mouseWheelDelta = 0;
+        std::deque<DirectInputDeviceEvent> events;
     };
 
     struct DirectInputComMethod {
@@ -506,12 +524,41 @@ private:
         hostWindow.destroyGuestWindow(guestHandle);
     }
 
+    void updateGuestActivationFromHostEvent(
+        const SugarbombHostWindow::Event& event) {
+        constexpr U32 WM_ACTIVATE_GUEST = 0x0006;
+        constexpr U32 WM_SETFOCUS_GUEST = 0x0007;
+        constexpr U32 WM_ACTIVATEAPP_GUEST = 0x001c;
+        if (event.message != WM_ACTIVATE_GUEST &&
+            event.message != WM_SETFOCUS_GUEST &&
+            event.message != WM_ACTIVATEAPP_GUEST) {
+            return;
+        }
+        bool activated =
+            event.message == WM_SETFOCUS_GUEST ||
+            (event.message == WM_ACTIVATE_GUEST &&
+             (event.wordParameter & 0xffff)) ||
+            (event.message == WM_ACTIVATEAPP_GUEST &&
+             event.wordParameter);
+        U32 topLevel = topLevelGuestWindow(event.guestHandle);
+        if (!topLevel) {
+            return;
+        }
+        if (activated) {
+            activeWindow = topLevel;
+        } else if (activeWindow == topLevel) {
+            activeWindow = 0;
+        }
+    }
+
     void pumpHostMessages() {
         std::vector<SugarbombHostWindow::Event> events;
         if (!hostWindow.pumpMessages(&events)) {
             runtimeStopping = true;
         }
         for (const SugarbombHostWindow::Event& event : events) {
+            updateGuestActivationFromHostEvent(event);
+            updateDirectInputFromHostEvent(event);
             enqueueGuestMessage(
                 event.guestHandle,
                 event.message,
@@ -524,7 +571,9 @@ private:
     }
 
     void presentHostBackBuffer() {
-        auto guestWindow = guestWindows.find(activeWindow);
+        U32 presentationWindow = topLevelGuestWindow(
+            direct3DDeviceWindow ? direct3DDeviceWindow : activeWindow);
+        auto guestWindow = guestWindows.find(presentationWindow);
         if (guestWindow == guestWindows.end()) {
             return;
         }
@@ -1431,18 +1480,17 @@ private:
 
     bool execute() {
         printf("Sugarbomb: entering FalloutNV.exe as an x86 guest in the %zu-bit host\n", sizeof(void*) * 8);
-        U32 runSliceLimit = MAX_RUN_SLICES;
+        U64 runSliceLimit = std::numeric_limits<U64>::max();
         if (const char* configuredLimit = std::getenv("SUGARBOMB_MAX_RUN_SLICES")) {
             char* end = nullptr;
             unsigned long long parsed = std::strtoull(configuredLimit, &end, 10);
             if (end != configuredLimit &&
                 !*end &&
-                parsed > 0 &&
-                parsed <= std::numeric_limits<U32>::max()) {
-                runSliceLimit = static_cast<U32>(parsed);
+                parsed > 0) {
+                runSliceLimit = static_cast<U64>(parsed);
                 printf(
-                    "Sugarbomb: diagnostic execution budget overridden to %u CPU slices\n",
-                    runSliceLimit);
+                    "Sugarbomb: diagnostic execution budget set to %llu CPU slices\n",
+                    static_cast<unsigned long long>(runSliceLimit));
             }
         }
         U64 runDeadline = std::numeric_limits<U64>::max();
@@ -1521,9 +1569,9 @@ private:
             fprintf(
                 stderr,
                 "Sugarbomb stopped after the diagnostic %s budget was exhausted "
-                "(%u slices, %u native API calls)\n",
+                "(%llu slices, %u native API calls)\n",
                 wallClockBudgetExhausted ? "wall-clock" : "execution",
-                runSlices,
+                static_cast<unsigned long long>(runSlices),
                 nativeCallCount);
             for (const auto& state : guestThreads) {
                 if (!state->thread) {
@@ -1588,7 +1636,11 @@ private:
                 "USER32!PeekMessageA",
                 "USER32!DispatchMessageA",
                 "USER32!SendMessageA",
+                "USER32!GetAsyncKeyState",
                 "SUGARBOMB!GuestWndProcReturn",
+                "DINPUT8!IDirectInputDevice8A::Acquire",
+                "DINPUT8!IDirectInputDevice8A::GetDeviceState",
+                "DINPUT8!IDirectInputDevice8A::GetDeviceData",
                 "BINKW32!BinkOpen",
                 "BINKW32!BinkWait",
                 "BINKW32!BinkDoFrame",
@@ -1610,8 +1662,8 @@ private:
             return false;
         }
         printf(
-            "Sugarbomb: guest stopped after %u CPU slices and %u native API calls at EIP=0x%08X\n",
-            runSlices,
+            "Sugarbomb: guest stopped after %llu CPU slices and %u native API calls at EIP=0x%08X\n",
+            static_cast<unsigned long long>(runSlices),
             nativeCallCount,
             lastGuestEip);
         return true;
@@ -1887,7 +1939,7 @@ private:
                 callback = callbackSendInput;
                 stackCleanupBytes = 12;
             } else if (symbol == "GetAsyncKeyState") {
-                callback = callbackUser32ReturnZero;
+                callback = callbackGetAsyncKeyState;
                 stackCleanupBytes = 4;
             } else if (symbol == "EnumChildWindows") {
                 callback = callbackUser32ReturnTrue;
@@ -2801,6 +2853,15 @@ private:
             bool previous = session->mouseButtonsSwapped;
             session->mouseButtonsSwapped = argument(cpu, 0) != 0;
             cpu->reg[0].u32 = previous ? 1 : 0;
+        }
+    }
+
+    static void callbackGetAsyncKeyState(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "USER32!GetAsyncKeyState");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->getAsyncKeyState(argument(cpu, 0));
         }
     }
 
@@ -3937,9 +3998,339 @@ private:
         return 0x11; // DI8DEVTYPE_DEVICE
     }
 
+    bool isDirectInputMouse(const DirectInputObject& object) const {
+        return object.kind == DirectInputObjectKind::Device &&
+            object.deviceGuidData1 == 0x6f1d2b60;
+    }
+
+    bool isDirectInputKeyboard(const DirectInputObject& object) const {
+        return object.kind == DirectInputObjectKind::Device &&
+            object.deviceGuidData1 == 0x6f1d2b61;
+    }
+
+    bool hasDirectInputForegroundPriority(
+        const DirectInputObject& object) const {
+        constexpr U32 DISCL_FOREGROUND = 0x00000004;
+        if (!(object.cooperativeFlags & DISCL_FOREGROUND)) {
+            return true;
+        }
+        U32 cooperativeTopLevel =
+            topLevelGuestWindow(object.cooperativeWindow);
+        U32 activeTopLevel = topLevelGuestWindow(activeWindow);
+        return activeTopLevel &&
+            (!cooperativeTopLevel ||
+             cooperativeTopLevel == activeTopLevel);
+    }
+
+    void loseForegroundDirectInputDevices(U32 guestHandle) {
+        constexpr U32 DISCL_FOREGROUND = 0x00000004;
+        U32 lostTopLevel = topLevelGuestWindow(guestHandle);
+        for (auto& entry : directInputObjects) {
+            DirectInputObject& object = entry.second;
+            if (object.kind != DirectInputObjectKind::Device ||
+                !(object.cooperativeFlags & DISCL_FOREGROUND)) {
+                continue;
+            }
+            U32 cooperativeTopLevel =
+                topLevelGuestWindow(object.cooperativeWindow);
+            if (cooperativeTopLevel &&
+                cooperativeTopLevel != lostTopLevel) {
+                continue;
+            }
+            object.acquired = false;
+            object.mouseDeltaX = 0;
+            object.mouseDeltaY = 0;
+            object.mouseWheelDelta = 0;
+            object.events.clear();
+        }
+    }
+
+    void queueDirectInputEvent(
+        DirectInputObject& object,
+        U32 offset,
+        U32 data,
+        U32 timestamp) {
+        if (!object.acquired) {
+            return;
+        }
+        DirectInputDeviceEvent event;
+        event.offset = offset;
+        event.data = data;
+        event.timestamp = timestamp;
+        event.sequence = nextDirectInputSequence++;
+        if (!nextDirectInputSequence) {
+            nextDirectInputSequence = 1;
+        }
+        U32 capacity = object.bufferSize
+            ? std::min<U32>(object.bufferSize, 4096)
+            : 256;
+        while (object.events.size() >= capacity) {
+            object.events.pop_front();
+        }
+        object.events.push_back(event);
+    }
+
+    void clearDirectInputState(U32 timestamp) {
+        for (U32 key = 0; key < directInputKeyboardState.size(); ++key) {
+            if (!(directInputKeyboardState[key] & 0x80)) {
+                continue;
+            }
+            directInputKeyboardState[key] = 0;
+            for (auto& entry : directInputObjects) {
+                if (isDirectInputKeyboard(entry.second)) {
+                    queueDirectInputEvent(entry.second, key, 0, timestamp);
+                }
+            }
+        }
+        for (U32 button = 0; button < directInputMouseButtons.size(); ++button) {
+            if (!(directInputMouseButtons[button] & 0x80)) {
+                continue;
+            }
+            directInputMouseButtons[button] = 0;
+            for (auto& entry : directInputObjects) {
+                if (isDirectInputMouse(entry.second)) {
+                    queueDirectInputEvent(
+                        entry.second,
+                        12 + button,
+                        0,
+                        timestamp);
+                }
+            }
+        }
+        directInputVirtualKeyState.fill(0);
+        directInputVirtualKeyPressedSinceRead.fill(0);
+        directInputMousePositionKnown = false;
+    }
+
+    U32 directInputScanCode(U32 virtualKey, U32 longParameter) const {
+        U32 scanCode = (longParameter >> 16) & 0xff;
+        if (longParameter & 0x01000000) {
+            scanCode |= 0x80;
+        }
+        if (virtualKey == 0x13) { // VK_PAUSE / DIK_PAUSE
+            return 0xc5;
+        }
+        if (virtualKey == 0x2c) { // VK_SNAPSHOT / DIK_SYSRQ
+            return 0xb7;
+        }
+        return scanCode;
+    }
+
+    void updateDirectInputFromHostEvent(
+        const SugarbombHostWindow::Event& event) {
+        constexpr U32 WM_ACTIVATE_GUEST = 0x0006;
+        constexpr U32 WM_SETFOCUS_GUEST = 0x0007;
+        constexpr U32 WM_KILLFOCUS_GUEST = 0x0008;
+        constexpr U32 WM_ACTIVATEAPP_GUEST = 0x001c;
+        constexpr U32 WM_KEYDOWN_GUEST = 0x0100;
+        constexpr U32 WM_KEYUP_GUEST = 0x0101;
+        constexpr U32 WM_SYSKEYDOWN_GUEST = 0x0104;
+        constexpr U32 WM_SYSKEYUP_GUEST = 0x0105;
+        constexpr U32 WM_MOUSEMOVE_GUEST = 0x0200;
+        constexpr U32 WM_LBUTTONDOWN_GUEST = 0x0201;
+        constexpr U32 WM_LBUTTONUP_GUEST = 0x0202;
+        constexpr U32 WM_RBUTTONDOWN_GUEST = 0x0204;
+        constexpr U32 WM_RBUTTONUP_GUEST = 0x0205;
+        constexpr U32 WM_MBUTTONDOWN_GUEST = 0x0207;
+        constexpr U32 WM_MBUTTONUP_GUEST = 0x0208;
+        constexpr U32 WM_MOUSEWHEEL_GUEST = 0x020a;
+        constexpr U32 WM_XBUTTONDOWN_GUEST = 0x020b;
+        constexpr U32 WM_XBUTTONUP_GUEST = 0x020c;
+        constexpr U32 WM_MOUSEHWHEEL_GUEST = 0x020e;
+
+        bool focusLost =
+            event.message == WM_KILLFOCUS_GUEST ||
+            (event.message == WM_ACTIVATE_GUEST &&
+             !(event.wordParameter & 0xffff)) ||
+            (event.message == WM_ACTIVATEAPP_GUEST &&
+             !event.wordParameter);
+        if (focusLost) {
+            clearDirectInputState(event.time);
+            loseForegroundDirectInputDevices(event.guestHandle);
+            return;
+        }
+        if (event.message == WM_SETFOCUS_GUEST ||
+            (event.message == WM_ACTIVATE_GUEST &&
+             (event.wordParameter & 0xffff)) ||
+            (event.message == WM_ACTIVATEAPP_GUEST &&
+             event.wordParameter)) {
+            directInputMousePositionKnown = false;
+            return;
+        }
+
+        if (event.message == WM_KEYDOWN_GUEST ||
+            event.message == WM_KEYUP_GUEST ||
+            event.message == WM_SYSKEYDOWN_GUEST ||
+            event.message == WM_SYSKEYUP_GUEST) {
+            bool pressed =
+                event.message == WM_KEYDOWN_GUEST ||
+                event.message == WM_SYSKEYDOWN_GUEST;
+            U32 virtualKey = event.wordParameter & 0xff;
+            if (virtualKey < directInputVirtualKeyState.size()) {
+                if (pressed && !directInputVirtualKeyState[virtualKey]) {
+                    directInputVirtualKeyPressedSinceRead[virtualKey] = 1;
+                }
+                directInputVirtualKeyState[virtualKey] =
+                    pressed ? 0x80 : 0;
+            }
+            U32 scanCode =
+                directInputScanCode(event.wordParameter, event.longParameter);
+            if (scanCode >= directInputKeyboardState.size()) {
+                return;
+            }
+            U8 state = pressed ? 0x80 : 0;
+            if (directInputKeyboardState[scanCode] == state) {
+                return;
+            }
+            directInputKeyboardState[scanCode] = state;
+            if (++directInputHostEventTraceCount <= 32) {
+                printf(
+                    "Sugarbomb DirectInput: host keyboard DIK=0x%02X "
+                    "state=0x%02X\n",
+                    scanCode,
+                    state);
+            }
+            for (auto& entry : directInputObjects) {
+                if (isDirectInputKeyboard(entry.second)) {
+                    queueDirectInputEvent(
+                        entry.second,
+                        scanCode,
+                        state,
+                        event.time);
+                }
+            }
+            return;
+        }
+
+        if (event.message == WM_MOUSEMOVE_GUEST) {
+            S32 x = static_cast<S16>(event.longParameter & 0xffff);
+            S32 y = static_cast<S16>((event.longParameter >> 16) & 0xffff);
+            if (directInputMousePositionKnown) {
+                S32 deltaX = x - directInputMouseX;
+                S32 deltaY = y - directInputMouseY;
+                for (auto& entry : directInputObjects) {
+                    DirectInputObject& object = entry.second;
+                    if (!isDirectInputMouse(object) || !object.acquired) {
+                        continue;
+                    }
+                    if (deltaX) {
+                        object.mouseDeltaX += deltaX;
+                        queueDirectInputEvent(
+                            object,
+                            0, // DIMOFS_X
+                            static_cast<U32>(deltaX),
+                            event.time);
+                    }
+                    if (deltaY) {
+                        object.mouseDeltaY += deltaY;
+                        queueDirectInputEvent(
+                            object,
+                            4, // DIMOFS_Y
+                            static_cast<U32>(deltaY),
+                            event.time);
+                    }
+                }
+            }
+            directInputMouseX = x;
+            directInputMouseY = y;
+            directInputMousePositionKnown = true;
+            return;
+        }
+
+        U32 button = std::numeric_limits<U32>::max();
+        bool pressed = false;
+        switch (event.message) {
+        case WM_LBUTTONDOWN_GUEST:
+            button = 0;
+            pressed = true;
+            break;
+        case WM_LBUTTONUP_GUEST:
+            button = 0;
+            break;
+        case WM_RBUTTONDOWN_GUEST:
+            button = 1;
+            pressed = true;
+            break;
+        case WM_RBUTTONUP_GUEST:
+            button = 1;
+            break;
+        case WM_MBUTTONDOWN_GUEST:
+            button = 2;
+            pressed = true;
+            break;
+        case WM_MBUTTONUP_GUEST:
+            button = 2;
+            break;
+        case WM_XBUTTONDOWN_GUEST:
+        case WM_XBUTTONUP_GUEST:
+            button = ((event.wordParameter >> 16) & 0xffff) == 1 ? 3 : 4;
+            pressed = event.message == WM_XBUTTONDOWN_GUEST;
+            break;
+        default:
+            break;
+        }
+        if (button < directInputMouseButtons.size()) {
+            U8 state = pressed ? 0x80 : 0;
+            if (directInputMouseButtons[button] == state) {
+                return;
+            }
+            directInputMouseButtons[button] = state;
+            for (auto& entry : directInputObjects) {
+                if (isDirectInputMouse(entry.second)) {
+                    queueDirectInputEvent(
+                        entry.second,
+                        12 + button,
+                        state,
+                        event.time);
+                }
+            }
+            return;
+        }
+
+        if (event.message == WM_MOUSEWHEEL_GUEST ||
+            event.message == WM_MOUSEHWHEEL_GUEST) {
+            S32 delta = static_cast<S16>(
+                (event.wordParameter >> 16) & 0xffff);
+            for (auto& entry : directInputObjects) {
+                DirectInputObject& object = entry.second;
+                if (!isDirectInputMouse(object) || !object.acquired) {
+                    continue;
+                }
+                U32 offset =
+                    event.message == WM_MOUSEWHEEL_GUEST ? 8 : 0;
+                if (event.message == WM_MOUSEWHEEL_GUEST) {
+                    object.mouseWheelDelta += delta;
+                } else {
+                    object.mouseDeltaX += delta;
+                }
+                queueDirectInputEvent(
+                    object,
+                    offset,
+                    static_cast<U32>(delta),
+                    event.time);
+            }
+        }
+    }
+
+    U32 getAsyncKeyState(U32 virtualKey) {
+        pumpHostMessages();
+        if (virtualKey >= directInputVirtualKeyState.size()) {
+            return 0;
+        }
+        U32 result =
+            directInputVirtualKeyState[virtualKey] ? 0x8000 : 0;
+        if (directInputVirtualKeyPressedSinceRead[virtualKey]) {
+            result |= 1;
+            directInputVirtualKeyPressedSinceRead[virtualKey] = 0;
+        }
+        return result;
+    }
+
     void dispatchDirectInputComMethod(CPU* cpu, const DirectInputComMethod& method) {
         constexpr U32 DI_OK = 0;
         constexpr U32 DIERR_INVALIDPARAM = 0x80070057;
+        constexpr U32 DIERR_NOTACQUIRED = 0x8007000c;
+        constexpr U32 DIERR_OTHERAPPHASPRIO = 0x80070005;
         constexpr U32 E_POINTER = 0x80004003;
 
         U32 objectAddress = argument(cpu, 0);
@@ -4048,12 +4439,6 @@ private:
         }
         case 4: // EnumObjects
         case 5: // GetProperty
-        case 6: // SetProperty
-        case 7: // Acquire
-        case 8: // Unacquire
-        case 11: // SetDataFormat
-        case 12: // SetEventNotification
-        case 13: // SetCooperativeLevel
         case 16: // RunControlPanel
         case 17: // Initialize
         case 19: // EnumEffects
@@ -4066,27 +4451,239 @@ private:
         case 30: // SetActionMap
             cpu->reg[0].u32 = DI_OK;
             return;
-        case 9: { // GetDeviceState
-            U32 size = argument(cpu, 1);
-            U32 destination = argument(cpu, 2);
-            if (!destination) {
+        case 6: { // SetProperty
+            U32 property = argument(cpu, 1);
+            U32 header = argument(cpu, 2);
+            if (!header || !memory->canRead(header, 16)) {
                 cpu->reg[0].u32 = E_POINTER;
                 return;
             }
-            memory->memset(destination, 0, std::min<U32>(size, 4096));
+            if (property == 1 &&
+                memory->readd(header) >= 20 &&
+                memory->canRead(header, 20)) { // DIPROP_BUFFERSIZE
+                object.bufferSize =
+                    std::min<U32>(memory->readd(header + 16), 4096);
+                while (object.events.size() > object.bufferSize) {
+                    object.events.pop_front();
+                }
+            }
+            cpu->reg[0].u32 = DI_OK;
+            return;
+        }
+        case 7: { // Acquire
+            pumpHostMessages();
+            bool wasAcquired = object.acquired;
+            if (!wasAcquired &&
+                !hasDirectInputForegroundPriority(object)) {
+                cpu->reg[0].u32 = DIERR_OTHERAPPHASPRIO;
+                return;
+            }
+            object.acquired = true;
+            if (!wasAcquired) {
+                object.mouseDeltaX = 0;
+                object.mouseDeltaY = 0;
+                object.mouseWheelDelta = 0;
+                object.events.clear();
+                directInputMousePositionKnown = false;
+                printf(
+                    "Sugarbomb DirectInput: Acquire(%s 0x%08X)\n",
+                    isDirectInputKeyboard(object) ? "keyboard" : "mouse",
+                    objectAddress);
+            }
+            cpu->reg[0].u32 = wasAcquired ? 1 : DI_OK; // DI_NOEFFECT
+            return;
+        }
+        case 8: { // Unacquire
+            bool wasAcquired = object.acquired;
+            object.acquired = false;
+            if (wasAcquired) {
+                object.mouseDeltaX = 0;
+                object.mouseDeltaY = 0;
+                object.mouseWheelDelta = 0;
+                object.events.clear();
+                printf(
+                    "Sugarbomb DirectInput: Unacquire(%s 0x%08X)\n",
+                    isDirectInputKeyboard(object) ? "keyboard" : "mouse",
+                    objectAddress);
+            }
+            cpu->reg[0].u32 = wasAcquired ? DI_OK : 1; // DI_NOEFFECT
+            return;
+        }
+        case 9: { // GetDeviceState
+            U32 size = argument(cpu, 1);
+            U32 destination = argument(cpu, 2);
+            if (!destination ||
+                !size ||
+                size > 4096 ||
+                !memory->canWrite(destination, size)) {
+                cpu->reg[0].u32 = E_POINTER;
+                return;
+            }
+            pumpHostMessages();
+            if (!object.acquired) {
+                cpu->reg[0].u32 = DIERR_NOTACQUIRED;
+                return;
+            }
+            if (++directInputStateCallTraceCount <= 16) {
+                printf(
+                    "Sugarbomb DirectInput: GetDeviceState(%s 0x%08X, "
+                    "size=%u, acquired=%u)\n",
+                    isDirectInputKeyboard(object) ? "keyboard" : "mouse",
+                    objectAddress,
+                    size,
+                    object.acquired ? 1 : 0);
+            }
+            memory->memset(destination, 0, size);
+            if (isDirectInputKeyboard(object)) {
+                memory->memcpy(
+                    destination,
+                    directInputKeyboardState.data(),
+                    std::min<U32>(
+                        size,
+                        static_cast<U32>(directInputKeyboardState.size())));
+            } else if (isDirectInputMouse(object)) {
+                if (size >= 4) {
+                    memory->writed(
+                        destination,
+                        static_cast<U32>(object.mouseDeltaX));
+                }
+                if (size >= 8) {
+                    memory->writed(
+                        destination + 4,
+                        static_cast<U32>(object.mouseDeltaY));
+                }
+                if (size >= 12) {
+                    memory->writed(
+                        destination + 8,
+                        static_cast<U32>(object.mouseWheelDelta));
+                }
+                U32 buttonBytes = size > 12
+                    ? std::min<U32>(
+                        size - 12,
+                        static_cast<U32>(directInputMouseButtons.size()))
+                    : 0;
+                if (buttonBytes) {
+                    memory->memcpy(
+                        destination + 12,
+                        directInputMouseButtons.data(),
+                        buttonBytes);
+                }
+                object.mouseDeltaX = 0;
+                object.mouseDeltaY = 0;
+                object.mouseWheelDelta = 0;
+            }
             cpu->reg[0].u32 = DI_OK;
             return;
         }
         case 10: { // GetDeviceData
+            U32 elementSize = argument(cpu, 1);
+            U32 destination = argument(cpu, 2);
             U32 elementCount = argument(cpu, 3);
-            if (!elementCount) {
+            U32 flags = argument(cpu, 4);
+            if (!elementCount ||
+                !memory->canRead(elementCount, 4) ||
+                !memory->canWrite(elementCount, 4)) {
                 cpu->reg[0].u32 = E_POINTER;
                 return;
             }
-            memory->writed(elementCount, 0);
+            if (elementSize < 16 || elementSize > 256) {
+                cpu->reg[0].u32 = DIERR_INVALIDPARAM;
+                return;
+            }
+            pumpHostMessages();
+            if (!object.acquired) {
+                memory->writed(elementCount, 0);
+                cpu->reg[0].u32 = DIERR_NOTACQUIRED;
+                return;
+            }
+            U32 requested = memory->readd(elementCount);
+            U32 available = static_cast<U32>(object.events.size());
+            U32 count = requested == 0xffffffff
+                ? available
+                : std::min<U32>(requested, available);
+            if (++directInputDataCallTraceCount <= 16) {
+                printf(
+                    "Sugarbomb DirectInput: GetDeviceData(%s 0x%08X, "
+                    "requested=%u, available=%u, acquired=%u)\n",
+                    isDirectInputKeyboard(object) ? "keyboard" : "mouse",
+                    objectAddress,
+                    requested,
+                    available,
+                    object.acquired ? 1 : 0);
+            }
+            if (destination) {
+                U64 destinationBytes =
+                    static_cast<U64>(count) * elementSize;
+                if (destinationBytes > std::numeric_limits<U32>::max() ||
+                    !memory->canWrite(
+                        destination,
+                        static_cast<U32>(destinationBytes))) {
+                    cpu->reg[0].u32 = E_POINTER;
+                    return;
+                }
+                auto event = object.events.begin();
+                for (U32 index = 0; index < count; ++index, ++event) {
+                    U32 output = destination + index * elementSize;
+                    memory->memset(output, 0, elementSize);
+                    memory->writed(output, event->offset);
+                    memory->writed(output + 4, event->data);
+                    memory->writed(output + 8, event->timestamp);
+                    memory->writed(output + 12, event->sequence);
+                }
+            }
+            if (!(flags & 1)) { // DIGDD_PEEK
+                for (U32 index = 0; index < count; ++index) {
+                    object.events.pop_front();
+                }
+            }
+            memory->writed(elementCount, count);
+            if (count && ++directInputReadTraceCount <= 32) {
+                printf(
+                    "Sugarbomb DirectInput: GetDeviceData delivered %u "
+                    "%s event(s), %zu buffered\n",
+                    count,
+                    isDirectInputKeyboard(object) ? "keyboard" : "mouse",
+                    object.events.size());
+            }
             cpu->reg[0].u32 = DI_OK;
             return;
         }
+        case 11: { // SetDataFormat
+            U32 format = argument(cpu, 1);
+            if (!format || !memory->canRead(format, 24)) {
+                cpu->reg[0].u32 = E_POINTER;
+                return;
+            }
+            U32 structureSize = memory->readd(format);
+            U32 objectSize = memory->readd(format + 4);
+            U32 dataSize = memory->readd(format + 12);
+            if (structureSize < 24 ||
+                objectSize < 16 ||
+                !dataSize ||
+                dataSize > 4096) {
+                cpu->reg[0].u32 = DIERR_INVALIDPARAM;
+                return;
+            }
+            object.dataFormatSize = dataSize;
+            cpu->reg[0].u32 = DI_OK;
+            return;
+        }
+        case 12: // SetEventNotification
+            object.eventHandle = argument(cpu, 1);
+            cpu->reg[0].u32 = DI_OK;
+            return;
+        case 13: // SetCooperativeLevel
+            object.cooperativeWindow = argument(cpu, 1);
+            object.cooperativeFlags = argument(cpu, 2);
+            printf(
+                "Sugarbomb DirectInput: SetCooperativeLevel(%s 0x%08X, "
+                "HWND=0x%08X, flags=0x%08X)\n",
+                isDirectInputKeyboard(object) ? "keyboard" : "mouse",
+                objectAddress,
+                object.cooperativeWindow,
+                object.cooperativeFlags);
+            cpu->reg[0].u32 = DI_OK;
+            return;
         case 14: { // GetObjectInfo
             U32 info = argument(cpu, 1);
             if (!info) {
@@ -9639,9 +10236,11 @@ private:
             return;
         }
         bool childWindow = isGuestChildWindow(found->second);
+        bool synthesizeActivation =
+            !childWindow && !hostWindow.nativeHandle();
         if (visible) {
             enqueueGuestMessage(handle, 0x0018, 1, 0); // WM_SHOWWINDOW
-            if (!childWindow) {
+            if (synthesizeActivation) {
                 enqueueGuestMessage(handle, 0x001c, 1, 0); // WM_ACTIVATEAPP
                 enqueueGuestMessage(handle, 0x0006, 1, 0); // WM_ACTIVATE / WA_ACTIVE
                 enqueueGuestMessage(handle, 0x0007, 0, 0); // WM_SETFOCUS
@@ -9649,7 +10248,7 @@ private:
             queueGuestWindowSize(handle);
             enqueueGuestMessage(handle, 0x000f, 0, 0); // WM_PAINT
         } else {
-            if (!childWindow) {
+            if (synthesizeActivation) {
                 enqueueGuestMessage(handle, 0x0008, 0, 0); // WM_KILLFOCUS
                 enqueueGuestMessage(handle, 0x0006, 0, 0); // WM_ACTIVATE / WA_INACTIVE
                 enqueueGuestMessage(handle, 0x001c, 0, 0); // WM_ACTIVATEAPP
@@ -9919,10 +10518,11 @@ private:
         window.title = titleAddress ? readAnsi(titleAddress) : "";
         U32 handle = window.handle;
         guestWindows[handle] = window;
-        if (!isGuestChildWindow(window)) {
+        syncHostWindow(guestWindows[handle]);
+        if (!isGuestChildWindow(window) &&
+            !hostWindow.nativeHandle()) {
             activeWindow = handle;
         }
-        syncHostWindow(guestWindows[handle]);
         if (window.visible) {
             queueGuestWindowVisibility(handle, true);
         } else {
@@ -9965,11 +10565,12 @@ private:
         }
         bool wasVisible = found->second.visible;
         found->second.visible = command != 0;
+        syncHostWindow(found->second);
         if (found->second.visible &&
-            !isGuestChildWindow(found->second)) {
+            !isGuestChildWindow(found->second) &&
+            !hostWindow.nativeHandle()) {
             activeWindow = handle;
         }
-        syncHostWindow(found->second);
         if (wasVisible != found->second.visible) {
             queueGuestWindowVisibility(handle, found->second.visible);
         }
@@ -9993,6 +10594,9 @@ private:
             return false;
         }
         handle = topLevel;
+        if (hostWindow.nativeHandle()) {
+            return hostWindow.activateGuestWindow(handle);
+        }
         U32 previous = activeWindow;
         if (previous && previous != handle && guestWindows.count(previous)) {
             enqueueGuestMessage(previous, 0x0008, handle, 0); // WM_KILLFOCUS
@@ -10056,7 +10660,8 @@ private:
         }
         if (wasVisible != found->second.visible) {
             if (found->second.visible &&
-                !isGuestChildWindow(found->second)) {
+                !isGuestChildWindow(found->second) &&
+                !hostWindow.nativeHandle()) {
                 activeWindow = handle;
             }
             queueGuestWindowVisibility(handle, found->second.visible);
@@ -11273,7 +11878,7 @@ private:
     U32 staticTlsRawSize = 0;
     U32 staticTlsZeroFillSize = 0;
     U32 nativeCallCount = 0;
-    U32 runSlices = 0;
+    U64 runSlices = 0;
     U32 lastGuestEip = 0;
     U32 exitCode = 0;
     U32 unhandledExceptionFilter = 0;
@@ -11350,6 +11955,18 @@ private:
     std::unordered_map<U32, DirectInputComMethod> directInputComMethods;
     std::vector<U32> directInputVtable;
     std::vector<U32> directInputDeviceVtable;
+    std::array<U8, 256> directInputKeyboardState = {};
+    std::array<U8, 256> directInputVirtualKeyState = {};
+    std::array<U8, 256> directInputVirtualKeyPressedSinceRead = {};
+    std::array<U8, 8> directInputMouseButtons = {};
+    S32 directInputMouseX = 0;
+    S32 directInputMouseY = 0;
+    bool directInputMousePositionKnown = false;
+    U32 nextDirectInputSequence = 1;
+    U32 directInputHostEventTraceCount = 0;
+    U32 directInputReadTraceCount = 0;
+    U32 directInputStateCallTraceCount = 0;
+    U32 directInputDataCallTraceCount = 0;
     std::unordered_map<U32, DirectSoundObject> directSoundObjects;
     std::unordered_map<U32, DirectSoundComMethod> directSoundComMethods;
     std::vector<U32> directSoundVtable;
