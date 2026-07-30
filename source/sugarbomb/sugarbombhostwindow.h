@@ -12,10 +12,20 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 class SugarbombHostWindow {
 public:
     struct Impl;
+    struct Event {
+        std::uint32_t guestHandle = 0;
+        std::uint32_t message = 0;
+        std::uint32_t wordParameter = 0;
+        std::uint32_t longParameter = 0;
+        std::uint32_t time = 0;
+        std::int32_t pointX = 0;
+        std::int32_t pointY = 0;
+    };
 
     SugarbombHostWindow();
     ~SugarbombHostWindow();
@@ -32,7 +42,7 @@ public:
         std::int32_t clientHeight,
         bool visible);
     void destroyGuestWindow(std::uint32_t guestHandle);
-    bool pumpMessages();
+    bool pumpMessages(std::vector<Event>* events = nullptr);
     std::uintptr_t nativeHandle() const;
     void present(
         const std::uint32_t* pixels,

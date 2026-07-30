@@ -23,6 +23,9 @@ constexpr U32 TEST_RELOCATED_BASE = 0x00600000;
 constexpr U32 TEST_ENTRY_RVA = 0x00001000;
 constexpr U32 TEST_ENTRY_RESULT = 0x12345678;
 constexpr U32 TEST_BRIDGE_RESULT = 0x53425547;
+constexpr U32 TEST_BRIDGE_SKIPPED_RESULT = 0x0badc0de;
+constexpr U32 TEST_BRIDGE_TRANSFER_RESULT = 0x74726170;
+constexpr U32 TEST_BRIDGE_TRANSFER_TARGET = 15;
 constexpr U32 TEST_IMPORT_ADDRESS = 0x70001000;
 constexpr U32 TEST_THUNK_BASE = 0x60000000;
 
@@ -116,6 +119,10 @@ std::vector<U8> createTestPe32() {
 
 void testBridgeCallback(CPU* cpu) {
     cpu->reg[0].u32 = TEST_BRIDGE_RESULT;
+}
+
+void testBridgeControlTransferCallback(CPU* cpu) {
+    cpu->eip.u32 = TEST_BRIDGE_TRANSFER_TARGET;
 }
 
 bool resolveTestImport(
@@ -273,6 +280,33 @@ void testSugarbombNativeBridge() {
 
     if (testContext().cpu->reg[0].u32 != TEST_BRIDGE_RESULT) {
         testFail("Sugarbomb guest-to-native callback did not execute");
+    }
+    SugarbombBridge::clearForTests();
+}
+
+void testSugarbombNativeBridgeControlTransfer() {
+    SugarbombBridge::clearForTests();
+    U32 callbackIndex = SugarbombBridge::registerCallback(
+        "user32",
+        "GuestControlTransferTest",
+        testBridgeControlTransferCallback);
+
+    testNewInstruction(0);
+    testPushCode8(0x68); // push callback index
+    testPushCode32(callbackIndex);
+    testPushCode8(0xcd); // Sugarbomb native trap
+    testPushCode8(0x9c);
+    testPushCode8(0x83); // add esp, 4 (must be skipped by the redirect)
+    testPushCode8(0xc4);
+    testPushCode8(0x04);
+    testPushCode8(0xb8); // mov eax, TEST_BRIDGE_SKIPPED_RESULT
+    testPushCode32(TEST_BRIDGE_SKIPPED_RESULT);
+    testPushCode8(0xb8); // redirected target: mov eax, TEST_BRIDGE_TRANSFER_RESULT
+    testPushCode32(TEST_BRIDGE_TRANSFER_RESULT);
+    testRunCPU();
+
+    if (testContext().cpu->reg[0].u32 != TEST_BRIDGE_TRANSFER_RESULT) {
+        testFail("Sugarbomb callback did not transfer control to the requested guest EIP");
     }
     SugarbombBridge::clearForTests();
 }

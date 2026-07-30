@@ -22,7 +22,7 @@ Sugarbomb owns that loading step, so the deployed path does not run
 ## Verified milestone
 
 The Windows x64 host now enters the original FalloutNV 1.4.0.525 executable at
-`0x00ECC4DB` without Wine and continues through engine startup. A 20-second
+`0x00ECC4DB` without Wine and continues through engine startup. A 30-second
 diagnostic run executes about 17.2 million guest CPU slices and 9.9 million
 bridged native calls without an unresolved import or guest page fault. During
 that run Fallout:
@@ -30,6 +30,9 @@ that run Fallout:
 - opens the base BSA archives and enumerates installed ESM/NAM content;
 - registers both game windows and creates a real D3D9 device owned by the
   64-bit host;
+- drains a thread-owned USER32 queue and calls its registered 32-bit WndProc at
+  `0x0086A0A0` for show, activation, focus, size, paint, and native host mouse
+  messages;
 - creates textures, cube textures, render targets, depth surfaces, shaders,
   declarations, and vertex/index buffers while retaining 32-bit guest COM
   identities;
@@ -56,9 +59,9 @@ draw calls to a native x64 `IDirect3DDevice9`. It also forwards the surface-copy
 operations used by the engine and can capture the active render target or
 swap-chain backbuffer for deterministic diagnostics. A verified 1920x1080
 backbuffer capture contains Fallout's fully rendered Obsidian Entertainment
-startup splash. Audio output, video decoding, guest input messages, and enough
-remaining Win32 behavior to reach an interactive menu are still incomplete, so
-this is not yet a playable build.
+startup splash. Audio output, video decoding, raw/DirectInput event fidelity,
+and enough remaining Win32 behavior to reach an interactive menu are still
+incomplete, so this is not yet a playable build.
 
 The runtime currently builds:
 
@@ -71,6 +74,8 @@ The runtime currently builds:
   states, timed sleeps, and semaphore/event/mutex/thread waits;
 - filesystem, profile/INI, registry, Shell32, USER32, GDI32, input, audio,
   DirectShow, synthetic Bink, and a broad D3D9/D3DX compatibility surface;
+- a per-thread 32-bit `MSG` queue, creation-time window lifecycle messages, and
+  translation of native keyboard, character, mouse, and focus events;
 - initial Kernel32 timing, process, heap, locale, console, exception, atomic,
   critical-section, memory-status, and virtual-memory services;
 - version-keyed Fallout 1.4 bootstrap objects for two startup-order races: the
@@ -95,7 +100,9 @@ Focused tests verify:
 - PE TLS-directory metadata is retained for loader initialization;
 - stdcall import thunks contain the correct callback and stack-cleanup operands,
   preserve their module/symbol diagnostics, and become read/execute-only;
-- an x86 guest can call a registered 64-bit C++ function through `INT 9Ch`.
+- an x86 guest can call a registered 64-bit C++ function through `INT 9Ch`;
+- a native callback can redirect the x86 CPU to a requested guest EIP, which is
+  the control-transfer primitive used to enter guest callback functions.
 
 The PE inspector also parses the primary executable and its optional extension
 modules without Wine:
@@ -142,6 +149,10 @@ Vulkan, and X11 traps. The callback index is at the top of the guest stack.
 Sugarbomb generates 16-byte guest stubs with the appropriate `stdcall` cleanup
 and patches their addresses into the PE IAT. Unsupported calls stop at a named
 `module!symbol` boundary instead of jumping through an unresolved host pointer.
+Callbacks may also redirect the emulated EIP. USER32 uses that path to construct
+a 32-bit stdcall WndProc frame, enter Fallout's registered procedure, and return
+through a Sugarbomb thunk that restores the interrupted import frame. Pending
+returns are stacked per guest thread, so nested guest dispatch remains valid.
 
 On Windows x64 JIT builds, the direct runtime also installs BoxedWine's vectored
 host-exception handler. Guest page faults are therefore translated back into
@@ -173,8 +184,11 @@ dependency order and validate each group with small guest fixtures:
    enumeration, `DllMain`, and NVSE messaging/interfaces.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
    message-loop behavior. The guest/native HWND bridge and host message pump
-   now create visible output; input messages are not yet translated back into
-   the guest queue.
+   create visible output. `PeekMessageA`, `DispatchMessageA`, and `SendMessageA`
+   now deliver lifecycle plus native keyboard/mouse/focus events to Fallout's
+   guest WndProc. Remaining work includes raw input, richer cursor/capture
+   behavior, and feeding real device state/events through DirectInput and
+   XInput.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
    Sugarbomb's renderer. The guest COM/resource model, native presentation
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,
@@ -197,7 +211,7 @@ From the repository root:
 
 ```powershell
 .\tools\sugarbomb\build-win64.ps1 -Configuration Test
-.\project\msvc\BoxedWine\x64\Test\BoxedWine.exe 0 4 1
+.\project\msvc\BoxedWine\x64\Test\BoxedWine.exe 0 5 1
 
 .\tools\sugarbomb\build-win64.ps1 -Configuration Release
 .\tools\sugarbomb\inspect-pe32.ps1 'D:\path\to\FalloutNV.exe'
@@ -240,9 +254,9 @@ This is an executable compatibility-layer checkpoint, not a playable build.
 Fallout now survives the previously missing kernel-object, guest-thread,
 USER32, D3D9, audio, DirectShow, Bink, and startup-order singleton boundaries.
 The 64-bit host owns the window and real D3D9 objects, translates Fallout's
-32-bit graphics workload, and produces a correctly textured startup splash
-without exposing native pointers to the guest. The next major work is to
-translate the guest USER32 message/input queue, finish the remaining D3D9/D3DX
-and media behaviors needed to reach the interactive menu, persist remaining
-virtual-file operations, and load `nvse_1_4.dll` plus NVSE plugins in the same
-guest process.
+32-bit graphics workload, delivers host and lifecycle messages through
+Fallout's own 32-bit WndProc, and produces a correctly textured startup splash
+without exposing native pointers to the guest. The next major work is to find
+the remaining post-splash state gate, finish the D3D9/D3DX, input, and media
+behaviors needed to reach the interactive menu, persist remaining virtual-file
+operations, and load `nvse_1_4.dll` plus NVSE plugins in the same guest process.

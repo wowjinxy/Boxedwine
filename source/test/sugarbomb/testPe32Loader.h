@@ -14,5 +14,6 @@ void testPe32LoaderRejectsInvalidImage();
 void testPe32LoaderMapsAndExecutesImage();
 void testSugarbombThunkArena();
 void testSugarbombNativeBridge();
+void testSugarbombNativeBridgeControlTransfer();
 
 #endif

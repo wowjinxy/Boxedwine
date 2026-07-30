@@ -174,6 +174,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testPe32LoaderMapsAndExecutesImage, "Test Sugarbomb PE32 maps and executes an x86 image", TEST_ENTRY_SERIAL},
     {testSugarbombThunkArena, "Test Sugarbomb import thunk arena", TEST_ENTRY_SERIAL},
     {testSugarbombNativeBridge, "Test Sugarbomb guest-to-native bridge", TEST_ENTRY_SERIAL},
+    {testSugarbombNativeBridgeControlTransfer, "Test Sugarbomb native callback guest control transfer", TEST_ENTRY_SERIAL},
     {testDspAudioWriteMath, "Test DSP Audio Write Math"},
     {testFastModeSelectionHelpers, "Test fast mode selection helpers"},
 #ifdef BOXEDWINE_WASM_JIT

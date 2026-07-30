@@ -34,6 +34,7 @@ struct SugarbombHostWindow::Impl {
     bool intentionalDestroy = false;
     bool shuttingDown = false;
     std::vector<std::uint32_t> framePixels;
+    std::vector<SugarbombHostWindow::Event> pendingEvents;
 #ifdef _WIN32
     HWND window = nullptr;
 #endif
@@ -45,6 +46,71 @@ namespace {
 
 constexpr const char* HOST_WINDOW_CLASS =
     "SugarbombFalloutGuestHostWindow";
+
+bool isGuestInputOrFocusMessage(UINT message) {
+    switch (message) {
+    case WM_ACTIVATE:
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    case WM_ACTIVATEAPP:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_CHAR:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+    case WM_SYSCHAR:
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_MBUTTONDBLCLK:
+    case WM_MOUSEWHEEL:
+#ifdef WM_XBUTTONDOWN
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+#endif
+#ifdef WM_MOUSEHWHEEL
+    case WM_MOUSEHWHEEL:
+#endif
+        return true;
+    default:
+        return false;
+    }
+}
+
+void queueGuestEvent(
+    SugarbombHostWindow::Impl* impl,
+    UINT message,
+    WPARAM wordParameter,
+    LPARAM longParameter) {
+    if (!impl || !impl->guestHandle ||
+        !isGuestInputOrFocusMessage(message)) {
+        return;
+    }
+    SugarbombHostWindow::Event event;
+    event.guestHandle = impl->guestHandle;
+    event.message = static_cast<std::uint32_t>(message);
+    event.wordParameter = static_cast<std::uint32_t>(wordParameter);
+    event.longParameter = static_cast<std::uint32_t>(longParameter);
+    event.time = static_cast<std::uint32_t>(GetMessageTime());
+    DWORD point = GetMessagePos();
+    event.pointX = static_cast<std::int16_t>(LOWORD(point));
+    event.pointY = static_cast<std::int16_t>(HIWORD(point));
+    if (message == WM_SETFOCUS ||
+        message == WM_KILLFOCUS) {
+        event.wordParameter = 0;
+    } else if (message == WM_ACTIVATE ||
+               message == WM_ACTIVATEAPP) {
+        event.longParameter = 0;
+    }
+    impl->pendingEvents.push_back(event);
+}
 
 bool presentationDisabled() {
     const char* configured = std::getenv("SUGARBOMB_NO_HOST_WINDOW");
@@ -126,6 +192,11 @@ LRESULT CALLBACK hostWindowProcedure(
             reinterpret_cast<LONG_PTR>(impl));
     }
     if (impl) {
+        queueGuestEvent(
+            impl,
+            message,
+            wordParameter,
+            longParameter);
         switch (message) {
         case WM_ERASEBKGND:
             return 1;
@@ -293,15 +364,23 @@ void SugarbombHostWindow::destroyGuestWindow(std::uint32_t guestHandle) {
 #endif
 }
 
-bool SugarbombHostWindow::pumpMessages() {
+bool SugarbombHostWindow::pumpMessages(std::vector<Event>* events) {
 #ifdef _WIN32
     MSG message = {};
     while (PeekMessageA(&message, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&message);
         DispatchMessageA(&message);
     }
+    if (events && !impl->pendingEvents.empty()) {
+        events->insert(
+            events->end(),
+            impl->pendingEvents.begin(),
+            impl->pendingEvents.end());
+    }
+    impl->pendingEvents.clear();
     return !impl->userClosed;
 #else
+    (void)events;
     return true;
 #endif
 }
@@ -356,4 +435,5 @@ void SugarbombHostWindow::shutdown() {
     pumpMessages();
 #endif
     impl->framePixels.clear();
+    impl->pendingEvents.clear();
 }

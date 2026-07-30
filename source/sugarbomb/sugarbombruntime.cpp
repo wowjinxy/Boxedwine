@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -209,6 +210,7 @@ private:
 
     struct GuestWindow {
         U32 handle = 0;
+        U32 ownerThreadId = 0;
         U32 extendedStyle = 0;
         U32 style = 0;
         U32 instance = 0;
@@ -220,6 +222,24 @@ private:
         bool visible = false;
         std::string className;
         std::string title;
+    };
+
+    struct GuestMessage {
+        U32 threadId = 0;
+        U32 window = 0;
+        U32 message = 0;
+        U32 wordParameter = 0;
+        U32 longParameter = 0;
+        U32 time = 0;
+        S32 pointX = 0;
+        S32 pointY = 0;
+    };
+
+    struct PendingWndProcDispatch {
+        U32 nativeThunkStackPointer = 0;
+        U32 nativeThunkResumeEip = 0;
+        U32 window = 0;
+        U32 message = 0;
     };
 
     enum class DirectInputObjectKind {
@@ -487,8 +507,19 @@ private:
     }
 
     void pumpHostMessages() {
-        if (!hostWindow.pumpMessages()) {
+        std::vector<SugarbombHostWindow::Event> events;
+        if (!hostWindow.pumpMessages(&events)) {
             runtimeStopping = true;
+        }
+        for (const SugarbombHostWindow::Event& event : events) {
+            enqueueGuestMessage(
+                event.guestHandle,
+                event.message,
+                event.wordParameter,
+                event.longParameter,
+                event.time,
+                event.pointX,
+                event.pointY);
         }
     }
 
@@ -619,8 +650,13 @@ private:
             "sugarbomb",
             "ThreadEntryPointReturn",
             callbackThreadEntryPointReturn);
+        U32 wndProcReturnCallback = SugarbombBridge::registerCallback(
+            "sugarbomb",
+            "GuestWndProcReturn",
+            callbackGuestWndProcReturn);
         if (!thunks.createThunk(exitCallback, 0, entryReturnThunk, error) ||
             !thunks.createThunk(threadExitCallback, 0, threadReturnThunk, error) ||
+            !thunks.createThunk(wndProcReturnCallback, 0, wndProcReturnThunk, error) ||
             !initializeDirectInputComThunks() ||
             !initializeDirectSoundComThunks() ||
             !initializeDirectShowComThunks() ||
@@ -1798,10 +1834,10 @@ private:
                 callback = callbackUser32ReturnTrue;
                 stackCleanupBytes = 4;
             } else if (symbol == "DispatchMessageA") {
-                callback = callbackUser32ReturnZero;
+                callback = callbackDispatchMessageA;
                 stackCleanupBytes = 4;
             } else if (symbol == "SendMessageA") {
-                callback = callbackUser32ReturnZero;
+                callback = callbackSendMessageA;
                 stackCleanupBytes = 16;
             } else if (symbol == "DefWindowProcA") {
                 callback = callbackUser32ReturnZero;
@@ -2591,7 +2627,8 @@ private:
     static void callbackUpdateWindow(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "USER32!UpdateWindow");
         if (session) {
-            cpu->reg[0].u32 = session->guestWindows.count(argument(cpu, 0)) ? 1 : 0;
+            cpu->reg[0].u32 =
+                session->updateGuestWindow(argument(cpu, 0)) ? 1 : 0;
         }
     }
 
@@ -2632,12 +2669,8 @@ private:
     static void callbackSetForegroundWindow(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "USER32!SetForegroundWindow");
         if (session) {
-            U32 handle = argument(cpu, 0);
-            bool valid = session->guestWindows.count(handle) != 0;
-            if (valid) {
-                session->activeWindow = handle;
-            }
-            cpu->reg[0].u32 = valid ? 1 : 0;
+            cpu->reg[0].u32 =
+                session->activateGuestWindow(argument(cpu, 0)) ? 1 : 0;
         }
     }
 
@@ -2694,12 +2727,34 @@ private:
         if (!session) {
             return;
         }
-        U32 message = argument(cpu, 0);
-        if (message && session->memory->canWrite(message, 28)) {
-            session->memory->memset(message, 0, 28);
+        cpu->reg[0].u32 = session->peekGuestMessage(
+            cpu,
+            argument(cpu, 0),
+            argument(cpu, 1),
+            argument(cpu, 2),
+            argument(cpu, 3),
+            argument(cpu, 4)) ? 1 : 0;
+    }
+
+    static void callbackDispatchMessageA(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "USER32!DispatchMessageA");
+        if (session) {
+            session->dispatchGuestMessage(cpu, argument(cpu, 0));
         }
-        session->pumpHostMessages();
-        cpu->reg[0].u32 = 0;
+    }
+
+    static void callbackSendMessageA(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "USER32!SendMessageA");
+        if (session) {
+            session->dispatchGuestWindowProcedure(
+                cpu,
+                argument(cpu, 0),
+                argument(cpu, 1),
+                argument(cpu, 2),
+                argument(cpu, 3));
+        }
     }
 
     static void callbackShowCursor(CPU* cpu) {
@@ -8686,6 +8741,14 @@ private:
         }
     }
 
+    static void callbackGuestWndProcReturn(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "SUGARBOMB!GuestWndProcReturn");
+        if (session) {
+            session->completeGuestWndProcDispatch(cpu);
+        }
+    }
+
     static void callbackUnresolvedImport(CPU* cpu) {
         std::string module;
         std::string symbol;
@@ -9465,6 +9528,262 @@ private:
         memory->writeb(destination + length, 0);
     }
 
+    void enqueueGuestMessage(
+        U32 window,
+        U32 message,
+        U32 wordParameter = 0,
+        U32 longParameter = 0,
+        U32 time = 0,
+        S32 pointX = 0,
+        S32 pointY = 0) {
+        U32 threadId = currentGuestThreadId();
+        if (window) {
+            auto found = guestWindows.find(window);
+            if (found == guestWindows.end()) {
+                return;
+            }
+            threadId = found->second.ownerThreadId;
+        }
+        GuestMessage queued;
+        queued.threadId = threadId;
+        queued.window = window;
+        queued.message = message;
+        queued.wordParameter = wordParameter;
+        queued.longParameter = longParameter;
+        queued.time = time ? time : KSystem::getMilliesSinceStart();
+        queued.pointX = pointX;
+        queued.pointY = pointY;
+
+        constexpr U32 WM_MOUSEMOVE_GUEST = 0x0200;
+        if (message == WM_MOUSEMOVE_GUEST && !guestMessageQueue.empty()) {
+            GuestMessage& previous = guestMessageQueue.back();
+            if (previous.threadId == queued.threadId &&
+                previous.window == queued.window &&
+                previous.message == queued.message) {
+                previous = queued;
+                return;
+            }
+        }
+        constexpr std::size_t MAX_QUEUED_GUEST_MESSAGES = 4096;
+        if (guestMessageQueue.size() >= MAX_QUEUED_GUEST_MESSAGES) {
+            guestMessageQueue.pop_front();
+        }
+        guestMessageQueue.push_back(queued);
+    }
+
+    void queueGuestWindowSize(U32 handle) {
+        auto found = guestWindows.find(handle);
+        if (found == guestWindows.end()) {
+            return;
+        }
+        U32 width = static_cast<U32>(
+            std::min<S32>(0xffff, std::max<S32>(0, found->second.width)));
+        U32 height = static_cast<U32>(
+            std::min<S32>(0xffff, std::max<S32>(0, found->second.height)));
+        enqueueGuestMessage(
+            handle,
+            0x0005, // WM_SIZE
+            0, // SIZE_RESTORED
+            width | (height << 16));
+    }
+
+    void queueGuestWindowVisibility(U32 handle, bool visible) {
+        if (!guestWindows.count(handle)) {
+            return;
+        }
+        if (visible) {
+            enqueueGuestMessage(handle, 0x0018, 1, 0); // WM_SHOWWINDOW
+            enqueueGuestMessage(handle, 0x001c, 1, 0); // WM_ACTIVATEAPP
+            enqueueGuestMessage(handle, 0x0006, 1, 0); // WM_ACTIVATE / WA_ACTIVE
+            enqueueGuestMessage(handle, 0x0007, 0, 0); // WM_SETFOCUS
+            queueGuestWindowSize(handle);
+            enqueueGuestMessage(handle, 0x000f, 0, 0); // WM_PAINT
+        } else {
+            enqueueGuestMessage(handle, 0x0008, 0, 0); // WM_KILLFOCUS
+            enqueueGuestMessage(handle, 0x0006, 0, 0); // WM_ACTIVATE / WA_INACTIVE
+            enqueueGuestMessage(handle, 0x001c, 0, 0); // WM_ACTIVATEAPP
+            enqueueGuestMessage(handle, 0x0018, 0, 0); // WM_SHOWWINDOW
+        }
+    }
+
+    bool guestMessageMatches(
+        const GuestMessage& message,
+        U32 threadId,
+        U32 windowFilter,
+        U32 minimumMessage,
+        U32 maximumMessage) const {
+        if (message.threadId != threadId) {
+            return false;
+        }
+        if (windowFilter == 0xffffffff) {
+            if (message.window) {
+                return false;
+            }
+        } else if (windowFilter && message.window != windowFilter) {
+            return false;
+        }
+        return (!minimumMessage && !maximumMessage) ||
+            (message.message >= minimumMessage &&
+             message.message <= maximumMessage);
+    }
+
+    void writeGuestMessage(U32 destination, const GuestMessage& message) {
+        memory->writed(destination, message.window);
+        memory->writed(destination + 4, message.message);
+        memory->writed(destination + 8, message.wordParameter);
+        memory->writed(destination + 12, message.longParameter);
+        memory->writed(destination + 16, message.time);
+        memory->writed(destination + 20, static_cast<U32>(message.pointX));
+        memory->writed(destination + 24, static_cast<U32>(message.pointY));
+    }
+
+    bool peekGuestMessage(
+        CPU* guestCpu,
+        U32 destination,
+        U32 windowFilter,
+        U32 minimumMessage,
+        U32 maximumMessage,
+        U32 removeFlags) {
+        if (!destination || !memory->canWrite(destination, 28)) {
+            setLastError(87);
+            return false;
+        }
+        pumpHostMessages();
+        U32 threadId = guestCpu->thread->id;
+        auto found = std::find_if(
+            guestMessageQueue.begin(),
+            guestMessageQueue.end(),
+            [&](const GuestMessage& message) {
+                return guestMessageMatches(
+                    message,
+                    threadId,
+                    windowFilter,
+                    minimumMessage,
+                    maximumMessage);
+            });
+        if (found == guestMessageQueue.end()) {
+            memory->memset(destination, 0, 28);
+            return false;
+        }
+        GuestMessage message = *found;
+        writeGuestMessage(destination, message);
+        if (removeFlags & 0x0001) { // PM_REMOVE
+            guestMessageQueue.erase(found);
+        }
+        if (++guestMessageTraceCount <= 32) {
+            printf(
+                "Sugarbomb Win32 USER32: PeekMessageA -> "
+                "HWND 0x%08X, message 0x%04X%s\n",
+                message.window,
+                message.message,
+                (removeFlags & 0x0001) ? " (removed)" : "");
+        }
+        return true;
+    }
+
+    bool dispatchGuestMessage(CPU* guestCpu, U32 messageAddress) {
+        if (!messageAddress || !memory->canRead(messageAddress, 28)) {
+            setLastError(87);
+            guestCpu->reg[0].u32 = 0;
+            return false;
+        }
+        return dispatchGuestWindowProcedure(
+            guestCpu,
+            memory->readd(messageAddress),
+            memory->readd(messageAddress + 4),
+            memory->readd(messageAddress + 8),
+            memory->readd(messageAddress + 12));
+    }
+
+    bool dispatchGuestWindowProcedure(
+        CPU* guestCpu,
+        U32 window,
+        U32 message,
+        U32 wordParameter,
+        U32 longParameter) {
+        guestCpu->reg[0].u32 = 0;
+        auto found = guestWindows.find(window);
+        if (found == guestWindows.end()) {
+            if (window) {
+                setLastError(1400);
+            }
+            return false;
+        }
+        const GuestWindowClass* windowClass =
+            findGuestWindowClass(found->second.className);
+        if (!windowClass || !windowClass->windowProcedure) {
+            return false;
+        }
+
+        U32 originalStackPointer = guestCpu->reg[4].u32;
+        U32 frameStackPointer =
+            (originalStackPointer & guestCpu->stackNotMask) |
+            ((originalStackPointer - 20) & guestCpu->stackMask);
+        U32 frameAddress =
+            guestCpu->seg[SS].address +
+            (frameStackPointer & guestCpu->stackMask);
+        if (!memory->canWrite(frameAddress, 20)) {
+            setLastError(8);
+            return false;
+        }
+
+        PendingWndProcDispatch pending;
+        pending.nativeThunkStackPointer = originalStackPointer;
+        pending.nativeThunkResumeEip = guestCpu->eip.u32 + 2;
+        pending.window = window;
+        pending.message = message;
+        pendingWndProcDispatches[guestCpu->thread->id].push_back(pending);
+
+        guestCpu->push32(longParameter);
+        guestCpu->push32(wordParameter);
+        guestCpu->push32(message);
+        guestCpu->push32(window);
+        guestCpu->push32(wndProcReturnThunk);
+        guestCpu->eip.u32 = windowClass->windowProcedure;
+        guestCpu->nextOp = nullptr;
+        if (++wndProcDispatchTraceCount <= 32) {
+            printf(
+                "Sugarbomb Win32 USER32: dispatch message 0x%04X "
+                "to guest WndProc 0x%08X for HWND 0x%08X\n",
+                message,
+                windowClass->windowProcedure,
+                window);
+        }
+        return true;
+    }
+
+    void completeGuestWndProcDispatch(CPU* guestCpu) {
+        U32 threadId = guestCpu->thread->id;
+        auto found = pendingWndProcDispatches.find(threadId);
+        if (found == pendingWndProcDispatches.end() ||
+            found->second.empty()) {
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 USER32: guest WndProc return "
+                "without a pending dispatch on thread %u\n",
+                threadId);
+            guestCpu->thread->terminating = true;
+            runtimeStopping = true;
+            return;
+        }
+        PendingWndProcDispatch pending = found->second.back();
+        found->second.pop_back();
+        if (found->second.empty()) {
+            pendingWndProcDispatches.erase(found);
+        }
+        U32 result = guestCpu->reg[0].u32;
+        guestCpu->reg[4].u32 = pending.nativeThunkStackPointer;
+        guestCpu->eip.u32 = pending.nativeThunkResumeEip;
+        guestCpu->nextOp = nullptr;
+        if (wndProcDispatchTraceCount <= 32) {
+            printf(
+                "Sugarbomb Win32 USER32: guest WndProc returned "
+                "0x%08X for message 0x%04X\n",
+                result,
+                pending.message);
+        }
+    }
+
     U32 registerGuestWindowClass(U32 classAddress) {
         if (!classAddress || !memory->canRead(classAddress, 40)) {
             setLastError(87);
@@ -9534,6 +9853,7 @@ private:
 
         GuestWindow window;
         window.handle = nextWindowHandle++;
+        window.ownerThreadId = currentGuestThreadId();
         window.extendedStyle = extendedStyle;
         window.style = style;
         window.instance = instance ? instance : windowClass->instance;
@@ -9542,18 +9862,27 @@ private:
         window.y = y == static_cast<S32>(0x80000000) ? 0 : y;
         window.width = width <= 0 || width == static_cast<S32>(0x80000000) ? 1280 : width;
         window.height = height <= 0 || height == static_cast<S32>(0x80000000) ? 720 : height;
+        window.visible = (style & 0x10000000) != 0; // WS_VISIBLE
         window.className = windowClass->name;
         window.title = titleAddress ? readAnsi(titleAddress) : "";
         U32 handle = window.handle;
         guestWindows[handle] = window;
         activeWindow = handle;
         syncHostWindow(guestWindows[handle]);
+        if (window.visible) {
+            queueGuestWindowVisibility(handle, true);
+        } else {
+            queueGuestWindowSize(handle);
+        }
         printf(
-            "Sugarbomb Win32 USER32: CreateWindowExA(%s, %s, %dx%d) -> 0x%08X\n",
+            "Sugarbomb Win32 USER32: CreateWindowExA("
+            "%s, %s, style=0x%08X, %dx%d, visible=%u) -> 0x%08X\n",
             window.className.c_str(),
             window.title.c_str(),
+            window.style,
             window.width,
             window.height,
+            window.visible ? 1 : 0,
             handle);
         return handle;
     }
@@ -9580,8 +9909,43 @@ private:
         }
         bool wasVisible = found->second.visible;
         found->second.visible = command != 0;
+        if (found->second.visible) {
+            activeWindow = handle;
+        }
         syncHostWindow(found->second);
+        if (wasVisible != found->second.visible) {
+            queueGuestWindowVisibility(handle, found->second.visible);
+        }
         return wasVisible;
+    }
+
+    bool updateGuestWindow(U32 handle) {
+        if (!guestWindows.count(handle)) {
+            setLastError(1400);
+            return false;
+        }
+        enqueueGuestMessage(handle, 0x000f, 0, 0); // WM_PAINT
+        return true;
+    }
+
+    bool activateGuestWindow(U32 handle) {
+        auto found = guestWindows.find(handle);
+        if (found == guestWindows.end()) {
+            setLastError(1400);
+            return false;
+        }
+        U32 previous = activeWindow;
+        if (previous && previous != handle && guestWindows.count(previous)) {
+            enqueueGuestMessage(previous, 0x0008, handle, 0); // WM_KILLFOCUS
+            enqueueGuestMessage(previous, 0x0006, 0, handle); // WA_INACTIVE
+        }
+        activeWindow = handle;
+        if (previous != handle) {
+            enqueueGuestMessage(handle, 0x001c, 1, 0); // WM_ACTIVATEAPP
+            enqueueGuestMessage(handle, 0x0006, 1, previous); // WA_ACTIVE
+            enqueueGuestMessage(handle, 0x0007, previous, 0); // WM_SETFOCUS
+        }
+        return true;
     }
 
     bool writeGuestClientRect(U32 handle, U32 rectangle) {
@@ -9609,6 +9973,9 @@ private:
             setLastError(1400);
             return false;
         }
+        S32 previousWidth = found->second.width;
+        S32 previousHeight = found->second.height;
+        bool wasVisible = found->second.visible;
         if (!(flags & 0x0002)) { // SWP_NOMOVE
             found->second.x = x;
             found->second.y = y;
@@ -9624,6 +9991,16 @@ private:
             found->second.visible = false;
         }
         syncHostWindow(found->second);
+        if (previousWidth != found->second.width ||
+            previousHeight != found->second.height) {
+            queueGuestWindowSize(handle);
+        }
+        if (wasVisible != found->second.visible) {
+            if (found->second.visible) {
+                activeWindow = handle;
+            }
+            queueGuestWindowVisibility(handle, found->second.visible);
+        }
         return true;
     }
 
@@ -10808,6 +11185,7 @@ private:
     SugarbombThunkArena thunks;
     U32 entryReturnThunk = 0;
     U32 threadReturnThunk = 0;
+    U32 wndProcReturnThunk = 0;
     U32 staticTlsRawStart = 0;
     U32 staticTlsRawSize = 0;
     U32 staticTlsZeroFillSize = 0;
@@ -10824,6 +11202,8 @@ private:
     U32 fileOpenTraceCount = 0;
     U32 waitTraceCount = 0;
     U32 surfaceDescTraceCount = 0;
+    U32 guestMessageTraceCount = 0;
+    U32 wndProcDispatchTraceCount = 0;
     U32 nextKernelHandle = 0x53000000;
     U32 nextGuestFileHandle = GUEST_FILE_HANDLE_BASE;
     U32 nextGuestFindHandle = GUEST_FIND_HANDLE_BASE;
@@ -10879,6 +11259,9 @@ private:
     std::unordered_map<U32, std::string> registryKeys;
     std::unordered_map<std::string, GuestWindowClass> guestWindowClasses;
     std::unordered_map<U32, GuestWindow> guestWindows;
+    std::deque<GuestMessage> guestMessageQueue;
+    std::unordered_map<U32, std::vector<PendingWndProcDispatch>>
+        pendingWndProcDispatches;
     std::unordered_map<U32, DirectInputObject> directInputObjects;
     std::unordered_map<U32, DirectInputComMethod> directInputComMethods;
     std::vector<U32> directInputVtable;
