@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +43,8 @@ namespace {
 
 constexpr U32 THUNK_BASE = 0x60000000;
 constexpr U32 THUNK_SIZE = 0x00100000;
+constexpr U32 NVSE_LOADER_STUB_BASE = THUNK_BASE + THUNK_SIZE;
+constexpr U32 NVSE_LOADER_STUB_SIZE = 0x00001000;
 constexpr U32 STACK_BASE = 0x6f800000;
 constexpr U32 STACK_SIZE = 0x00800000;
 constexpr U32 STACK_TOP = STACK_BASE + STACK_SIZE;
@@ -86,7 +89,25 @@ constexpr U32 USER_HOOK_HANDLE = 0x57000003;
 constexpr U32 GDI_STOCK_OBJECT_HANDLE = 0x58000000;
 constexpr U32 MMIO_HANDLE_BASE = 0x59000000;
 constexpr U32 D3D9_MODULE_HANDLE = 0x5a000000;
+constexpr U32 USER32_MODULE_HANDLE = 0x5a010000;
+constexpr U32 GDI32_MODULE_HANDLE = 0x5a020000;
+constexpr U32 SHELL32_MODULE_HANDLE = 0x5a030000;
+constexpr U32 IMAGEHLP_MODULE_HANDLE = 0x5a040000;
+constexpr U32 ADVAPI32_MODULE_HANDLE = 0x5a050000;
+constexpr U32 OLE32_MODULE_HANDLE = 0x5a060000;
+constexpr U32 WINMM_MODULE_HANDLE = 0x5a070000;
+constexpr U32 DINPUT8_MODULE_HANDLE = 0x5a080000;
+constexpr U32 XINPUT_MODULE_HANDLE = 0x5a090000;
+constexpr U32 DSOUND_MODULE_HANDLE = 0x5a0a0000;
 constexpr U32 DIRECTINPUT_VERSION = 0x0800;
+constexpr U32 FALLOUT_140525_IMAGE_BASE = 0x00400000;
+constexpr U32 FALLOUT_140525_IMAGE_SIZE = 0x0107b000;
+constexpr U32 FALLOUT_140525_TIMESTAMP = 0x4e0d50ed;
+constexpr U32 FALLOUT_140525_ENTRY_POINT = 0x00ecc4db;
+constexpr U32 FALLOUT_140525_PACKED_ENTRY_POINT = 0x014092ee;
+constexpr U32 FALLOUT_140525_NVSE_HOOK_CALL = 0x00ecc46b;
+constexpr U32 FALLOUT_140525_WINMAIN = 0x0086a850;
+constexpr U32 FALLOUT_140525_LOAD_LIBRARY_IAT = 0x00fdf0b0;
 
 class SugarbombRuntimeSession;
 SugarbombRuntimeSession* activeSession = nullptr;
@@ -217,6 +238,14 @@ private:
         bool requireSuccess = false;
         bool marksModuleInitialized = false;
         std::string label;
+    };
+
+    struct PendingDynamicModuleLoad {
+        U32 nativeThunkStackPointer = 0;
+        U32 nativeThunkResumeEip = 0;
+        U32 moduleHandle = 0;
+        std::vector<GuestModuleInitializer> initializers;
+        std::size_t nextInitializer = 0;
     };
 
     struct GuestOnExitTable {
@@ -707,10 +736,144 @@ private:
         hostPresentPixels.clear();
     }
 
+    static bool isFallout140525Image(
+        const Pe32ImageInfo& info,
+        U32 entryPoint) {
+        return
+            info.imageBase == FALLOUT_140525_IMAGE_BASE &&
+            info.sizeOfImage == FALLOUT_140525_IMAGE_SIZE &&
+            info.timestamp == FALLOUT_140525_TIMESTAMP &&
+            info.entryPoint() == entryPoint;
+    }
+
+    bool selectExecutionImage(std::vector<U8>& bytes) {
+        executionImagePath = imagePath;
+        Pe32ImageInfo suppliedInfo;
+        if (!Pe32Loader::readFile(
+                imagePath.c_str(),
+                bytes,
+                error) ||
+            !Pe32Loader::inspect(
+                bytes,
+                suppliedInfo,
+                error)) {
+            return false;
+        }
+        if (isFallout140525Image(
+                suppliedInfo,
+                FALLOUT_140525_ENTRY_POINT)) {
+            verifiedFallout140525 = true;
+            return true;
+        }
+        if (!isFallout140525Image(
+                suppliedInfo,
+                FALLOUT_140525_PACKED_ENTRY_POINT)) {
+            return true;
+        }
+
+        std::vector<std::filesystem::path> candidates;
+        const char* configured =
+            std::getenv("SUGARBOMB_FALLOUT_UNPACKED_IMAGE");
+        if (configured && *configured) {
+            candidates.emplace_back(configured);
+        }
+        std::filesystem::path suppliedPath(imagePath);
+        candidates.emplace_back(imagePath + ".unpacked.exe");
+        candidates.push_back(
+            suppliedPath.parent_path() /
+            "FalloutNV_backup.exe.unpacked.exe");
+
+        std::vector<std::filesystem::path> discovered;
+        std::error_code directoryError;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(
+                 suppliedPath.parent_path(),
+                 directoryError)) {
+            if (!entry.is_regular_file(directoryError)) {
+                directoryError.clear();
+                continue;
+            }
+            std::string name =
+                lowerAscii(entry.path().filename().string());
+            constexpr const char* suffix = ".unpacked.exe";
+            if (name.rfind("falloutnv", 0) == 0 &&
+                name.size() >= std::strlen(suffix) &&
+                name.compare(
+                    name.size() - std::strlen(suffix),
+                    std::strlen(suffix),
+                    suffix) == 0) {
+                discovered.push_back(entry.path());
+            }
+        }
+        std::sort(discovered.begin(), discovered.end());
+        candidates.insert(
+            candidates.end(),
+            discovered.begin(),
+            discovered.end());
+
+        std::unordered_set<std::string> checked;
+        std::string lastCandidateError;
+        for (const std::filesystem::path& candidate :
+             candidates) {
+            const std::string key =
+                lowerAscii(candidate.lexically_normal().string());
+            if (!checked.insert(key).second) {
+                continue;
+            }
+            std::vector<U8> candidateBytes;
+            Pe32ImageInfo candidateInfo;
+            std::string candidateError;
+            if (!Pe32Loader::readFile(
+                    candidate.string().c_str(),
+                    candidateBytes,
+                    candidateError) ||
+                !Pe32Loader::inspect(
+                    candidateBytes,
+                    candidateInfo,
+                    candidateError)) {
+                lastCandidateError =
+                    candidate.string() + ": " + candidateError;
+                continue;
+            }
+            if (!isFallout140525Image(
+                    candidateInfo,
+                    FALLOUT_140525_ENTRY_POINT)) {
+                lastCandidateError =
+                    candidate.string() +
+                    ": not the unpacked FalloutNV 1.4.0.525 image";
+                continue;
+            }
+            executionImagePath = candidate.string();
+            bytes = std::move(candidateBytes);
+            verifiedFallout140525 = true;
+            printf(
+                "Sugarbomb Fallout 1.4: using verified unpacked "
+                "execution image %s while preserving guest identity %s\n",
+                executionImagePath.c_str(),
+                imagePath.c_str());
+            return true;
+        }
+
+        error =
+            "FalloutNV.exe is the Steam CEG-packed 1.4.0.525 image, "
+            "which cannot execute directly. Place a verified unpacked "
+            "FalloutNV 1.4.0.525 image beside it as "
+            "FalloutNV.exe.unpacked.exe or "
+            "FalloutNV_backup.exe.unpacked.exe, or set "
+            "SUGARBOMB_FALLOUT_UNPACKED_IMAGE";
+        if (!lastCandidateError.empty()) {
+            error += " (last candidate: " + lastCandidateError + ")";
+        }
+        return false;
+    }
+
     bool initialize() {
         std::vector<U8> bytes;
-        if (!Pe32Loader::readFile(imagePath.c_str(), bytes, error)) {
-            fprintf(stderr, "Sugarbomb could not read the PE32 guest: %s\n", error.c_str());
+        if (!selectExecutionImage(bytes)) {
+            fprintf(
+                stderr,
+                "Sugarbomb could not prepare the PE32 guest: %s\n",
+                error.c_str());
             return false;
         }
 
@@ -764,11 +927,11 @@ private:
             "sugarbomb",
             "GuestWndProcReturn",
             callbackGuestWndProcReturn);
-        U32 moduleInitializerReturnCallback =
+        U32 dynamicModuleInitializerReturnCallback =
             SugarbombBridge::registerCallback(
                 "sugarbomb",
-                "GuestModuleInitializerReturn",
-                callbackGuestModuleInitializerReturn);
+                "DynamicModuleInitializerReturn",
+                callbackDynamicModuleInitializerReturn);
         U32 guestFunctionArrayReturnCallback =
             SugarbombBridge::registerCallback(
                 "sugarbomb",
@@ -778,9 +941,9 @@ private:
             !thunks.createThunk(threadExitCallback, 0, threadReturnThunk, error) ||
             !thunks.createThunk(wndProcReturnCallback, 0, wndProcReturnThunk, error) ||
             !thunks.createThunk(
-                moduleInitializerReturnCallback,
+                dynamicModuleInitializerReturnCallback,
                 0,
-                moduleInitializerReturnThunk,
+                dynamicModuleInitializerReturnThunk,
                 error) ||
             !thunks.createThunk(
                 guestFunctionArrayReturnCallback,
@@ -796,6 +959,13 @@ private:
             fprintf(stderr, "Sugarbomb could not finalize native thunks: %s\n", error.c_str());
             return false;
         }
+        if (!installBundledNvseLoaderHook()) {
+            fprintf(
+                stderr,
+                "Sugarbomb could not install the NVSE loader hook: %s\n",
+                error.c_str());
+            return false;
+        }
 
         initializeWindowsEnvironment();
         initializeCpu();
@@ -804,13 +974,6 @@ private:
             fprintf(
                 stderr,
                 "Sugarbomb could not initialize PE static TLS modules: %s\n",
-                error.c_str());
-            return false;
-        }
-        if (!prepareBundledNvseInitialization()) {
-            fprintf(
-                stderr,
-                "Sugarbomb could not prepare NVSE initialization: %s\n",
                 error.c_str());
             return false;
         }
@@ -828,9 +991,6 @@ private:
     }
 
     void initializeFalloutBootstrapObjects() {
-        constexpr U32 FALLOUT_140525_IMAGE_BASE = 0x00400000;
-        constexpr U32 FALLOUT_140525_IMAGE_SIZE = 0x0107b000;
-        constexpr U32 FALLOUT_140525_ENTRY_POINT = 0x00ecc4db;
         constexpr U32 FALLOUT_BINK_MANAGER_POINTER = 0x0126fac4;
         constexpr U32 FALLOUT_BINK_MANAGER_SIZE = 0x54;
         constexpr U32 FALLOUT_BINK_MANAGER_VTABLE = 0x01082564;
@@ -1650,151 +1810,229 @@ private:
         return true;
     }
 
-    bool scheduleGuestModuleInitializer(CPU* guestCpu) {
-        if (guestModuleInitializerIndex >=
-            guestModuleInitializers.size()) {
-            initializeCpu();
-            printf(
-                "Sugarbomb Win32 loader: guest module initialization "
-                "completed; transferring to Fallout entry 0x%08X\n",
-                image.entryPoint);
-            return true;
+    bool finishDynamicGuestModuleLoad(
+        CPU* guestCpu,
+        bool success) {
+        U32 threadId = guestCpu->thread->id;
+        auto found = pendingDynamicModuleLoads.find(threadId);
+        if (found == pendingDynamicModuleLoads.end() ||
+            found->second.empty()) {
+            error =
+                "No pending dynamic guest module load for the "
+                "current thread";
+            return false;
         }
+        PendingDynamicModuleLoad pending =
+            std::move(found->second.back());
+        found->second.pop_back();
+        if (found->second.empty()) {
+            pendingDynamicModuleLoads.erase(found);
+        }
+
+        auto module = guestModules.find(pending.moduleHandle);
+        if (success && module != guestModules.end()) {
+            module->second.initialized = true;
+        } else if (!success) {
+            setLastError(1114); // ERROR_DLL_INIT_FAILED
+        }
+        guestCpu->reg[4].u32 =
+            pending.nativeThunkStackPointer;
+        guestCpu->eip.u32 =
+            pending.nativeThunkResumeEip;
+        guestCpu->reg[0].u32 =
+            success ? pending.moduleHandle : 0;
+        guestCpu->nextOp = nullptr;
+        printf(
+            "Sugarbomb Win32 loader: dynamic module 0x%08X "
+            "%s process initialization\n",
+            pending.moduleHandle,
+            success ? "completed" : "failed");
+        return true;
+    }
+
+    bool scheduleNextDynamicModuleInitializer(
+        CPU* guestCpu) {
+        U32 threadId = guestCpu->thread->id;
+        auto found = pendingDynamicModuleLoads.find(threadId);
+        if (found == pendingDynamicModuleLoads.end() ||
+            found->second.empty()) {
+            error =
+                "No pending dynamic guest module load for the "
+                "current thread";
+            return false;
+        }
+        PendingDynamicModuleLoad& pending =
+            found->second.back();
+        if (pending.nextInitializer >=
+            pending.initializers.size()) {
+            return finishDynamicGuestModuleLoad(
+                guestCpu,
+                true);
+        }
+
         const GuestModuleInitializer& initializer =
-            guestModuleInitializers[guestModuleInitializerIndex];
+            pending.initializers[pending.nextInitializer];
         constexpr U32 INITIALIZER_FRAME_BYTES = 16;
-        U32 stackPointer = STACK_TOP - INITIALIZER_FRAME_BYTES;
+        U32 stackPointer = guestCpu->reg[4].u32;
+        U32 frameStackPointer =
+            (stackPointer & guestCpu->stackNotMask) |
+            ((stackPointer - INITIALIZER_FRAME_BYTES) &
+             guestCpu->stackMask);
+        U32 frameAddress =
+            guestCpu->seg[SS].address +
+            (frameStackPointer & guestCpu->stackMask);
         if (!initializer.address ||
             !memory->canRead(initializer.address, 1) ||
             !memory->canWrite(
-                stackPointer,
+                frameAddress,
                 INITIALIZER_FRAME_BYTES)) {
-            error = "Guest module initializer or stack frame is invalid";
+            error =
+                "Dynamic guest module initializer or stack "
+                "frame is invalid";
             return false;
         }
-        memory->writed(
-            stackPointer,
-            moduleInitializerReturnThunk);
-        memory->writed(stackPointer + 4, initializer.moduleBase);
-        memory->writed(stackPointer + 8, 1); // DLL_PROCESS_ATTACH
-        memory->writed(stackPointer + 12, 0);
-        guestCpu->reg[4].u32 = stackPointer;
+
+        guestCpu->push32(0);
+        guestCpu->push32(1); // DLL_PROCESS_ATTACH
+        guestCpu->push32(initializer.moduleBase);
+        guestCpu->push32(
+            dynamicModuleInitializerReturnThunk);
         guestCpu->eip.u32 = initializer.address;
         guestCpu->nextOp = nullptr;
         printf(
-            "Sugarbomb Win32 loader: calling %s at 0x%08X "
-            "(module=0x%08X, reason=DLL_PROCESS_ATTACH)\n",
+            "Sugarbomb Win32 loader: calling dynamic %s at "
+            "0x%08X (module=0x%08X, reason=DLL_PROCESS_ATTACH)\n",
             initializer.label.c_str(),
             initializer.address,
             initializer.moduleBase);
         return true;
     }
 
-    bool prepareBundledNvseInitialization() {
-        const char* configured =
-            std::getenv("SUGARBOMB_RUN_NVSE_ENTRY");
-        if (!configured ||
-            !*configured ||
-            std::strcmp(configured, "0") == 0) {
-            return true;
-        }
-        U32 moduleBase = guestModuleHandle("nvse_1_4.dll");
-        auto module = guestModules.find(moduleBase);
-        if (!moduleBase || module == guestModules.end()) {
-            error =
-                "SUGARBOMB_RUN_NVSE_ENTRY requested but nvse_1_4.dll "
-                "was not staged";
+    bool beginDynamicGuestModuleLoad(
+        CPU* guestCpu,
+        U32 moduleHandle) {
+        auto module = guestModules.find(moduleHandle);
+        if (module == guestModules.end()) {
+            error = "Dynamic guest module handle is invalid";
             return false;
         }
-
-        guestModuleInitializers.clear();
-        guestModuleInitializerIndex = 0;
-        const StaticTlsTemplate* tls = nullptr;
-        for (const StaticTlsTemplate& candidate :
-             staticTlsTemplates) {
-            if (candidate.moduleBase == moduleBase) {
-                tls = &candidate;
-                break;
-            }
+        if (module->second.initialized) {
+            guestCpu->reg[0].u32 = moduleHandle;
+            return true;
         }
-        if (tls) {
+
+        PendingDynamicModuleLoad pending;
+        pending.nativeThunkStackPointer =
+            guestCpu->reg[4].u32;
+        pending.nativeThunkResumeEip =
+            guestCpu->eip.u32 + 2;
+        pending.moduleHandle = moduleHandle;
+        const std::string moduleName =
+            std::filesystem::path(
+                module->second.path).filename().string();
+        for (const StaticTlsTemplate& tls :
+             staticTlsTemplates) {
+            if (tls.moduleBase != moduleHandle) {
+                continue;
+            }
             for (std::size_t index = 0;
-                 index < tls->callbacks.size();
+                 index < tls.callbacks.size();
                  ++index) {
                 GuestModuleInitializer initializer;
-                initializer.address = tls->callbacks[index];
-                initializer.moduleBase = moduleBase;
+                initializer.address =
+                    tls.callbacks[index];
+                initializer.moduleBase = moduleHandle;
                 initializer.label =
-                    "nvse_1_4.dll TLS callback #" +
+                    moduleName + " TLS callback #" +
                     std::to_string(index + 1);
-                guestModuleInitializers.push_back(
+                pending.initializers.push_back(
                     std::move(initializer));
             }
+            break;
         }
         if (module->second.image.info.entryPointRva) {
             GuestModuleInitializer initializer;
             initializer.address =
                 module->second.image.entryPoint;
-            initializer.moduleBase = moduleBase;
+            initializer.moduleBase = moduleHandle;
             initializer.requireSuccess = true;
             initializer.marksModuleInitialized = true;
             initializer.label =
-                "nvse_1_4.dll PE entry point";
-            guestModuleInitializers.push_back(
+                moduleName + " PE entry point";
+            pending.initializers.push_back(
                 std::move(initializer));
         }
-        if (guestModuleInitializers.empty()) {
-            error = "nvse_1_4.dll has no TLS callbacks or PE entry point";
+        if (pending.initializers.empty()) {
+            module->second.initialized = true;
+            guestCpu->reg[0].u32 = moduleHandle;
+            return true;
+        }
+
+        pendingDynamicModuleLoads[guestCpu->thread->id]
+            .push_back(std::move(pending));
+        if (!scheduleNextDynamicModuleInitializer(guestCpu)) {
+            pendingDynamicModuleLoads[guestCpu->thread->id]
+                .pop_back();
+            if (pendingDynamicModuleLoads[
+                    guestCpu->thread->id].empty()) {
+                pendingDynamicModuleLoads.erase(
+                    guestCpu->thread->id);
+            }
             return false;
         }
-        printf(
-            "Sugarbomb NVSE: diagnostic initialization enabled; "
-            "queued %zu TLS/entry initializer(s)\n",
-            guestModuleInitializers.size());
-        return scheduleGuestModuleInitializer(cpu);
+        return true;
     }
 
-    void completeGuestModuleInitializer(CPU* guestCpu) {
-        if (guestModuleInitializerIndex >=
-            guestModuleInitializers.size()) {
+    void completeDynamicModuleInitializer(
+        CPU* guestCpu) {
+        U32 threadId = guestCpu->thread->id;
+        auto found = pendingDynamicModuleLoads.find(threadId);
+        if (found == pendingDynamicModuleLoads.end() ||
+            found->second.empty()) {
             fprintf(
                 stderr,
-                "Sugarbomb Win32 loader: initializer return without "
-                "a pending initializer\n");
+                "Sugarbomb Win32 loader: dynamic initializer "
+                "return without a pending load on thread %u\n",
+                threadId);
             runtimeStopping = true;
             guestCpu->thread->terminating = true;
             return;
         }
-        GuestModuleInitializer initializer =
-            guestModuleInitializers[guestModuleInitializerIndex];
+        PendingDynamicModuleLoad& pending =
+            found->second.back();
+        if (pending.nextInitializer >=
+            pending.initializers.size()) {
+            fprintf(
+                stderr,
+                "Sugarbomb Win32 loader: dynamic initializer "
+                "index is outside the pending load\n");
+            runtimeStopping = true;
+            guestCpu->thread->terminating = true;
+            return;
+        }
+        const GuestModuleInitializer& initializer =
+            pending.initializers[pending.nextInitializer];
         U32 result = guestCpu->reg[0].u32;
         printf(
-            "Sugarbomb Win32 loader: %s returned EAX=0x%08X\n",
+            "Sugarbomb Win32 loader: dynamic %s returned "
+            "EAX=0x%08X\n",
             initializer.label.c_str(),
             result);
         if (initializer.requireSuccess && !result) {
-            fprintf(
-                stderr,
-                "Sugarbomb Win32 loader: %s rejected "
-                "DLL_PROCESS_ATTACH\n",
-                initializer.label.c_str());
-            runtimeStopping = true;
-            guestCpu->thread->terminating = true;
+            if (!finishDynamicGuestModuleLoad(
+                    guestCpu,
+                    false)) {
+                runtimeStopping = true;
+                guestCpu->thread->terminating = true;
+            }
             return;
         }
-        if (initializer.marksModuleInitialized) {
-            auto module =
-                guestModules.find(initializer.moduleBase);
-            if (module != guestModules.end()) {
-                module->second.initialized = true;
-            }
-        }
-        ++guestModuleInitializerIndex;
-        if (!scheduleGuestModuleInitializer(guestCpu)) {
+        ++pending.nextInitializer;
+        if (!scheduleNextDynamicModuleInitializer(guestCpu)) {
             fprintf(
                 stderr,
-                "Sugarbomb Win32 loader: could not schedule the next "
-                "guest module initializer: %s\n",
+                "Sugarbomb Win32 loader: could not continue "
+                "dynamic module initialization: %s\n",
                 error.c_str());
             runtimeStopping = true;
             guestCpu->thread->terminating = true;
@@ -2202,6 +2440,139 @@ private:
         return lowerAscii(key);
     }
 
+    U32 hleModuleHandle(
+        const std::string& requestedName) const {
+        const std::string key =
+            guestModuleKey(requestedName);
+        if (key == "kernel32.dll" ||
+            key == "kernelbase.dll") {
+            return KERNEL32_MODULE_HANDLE;
+        }
+        if (key == "d3d9.dll") {
+            return D3D9_MODULE_HANDLE;
+        }
+        if (key == "user32.dll") {
+            return USER32_MODULE_HANDLE;
+        }
+        if (key == "gdi32.dll") {
+            return GDI32_MODULE_HANDLE;
+        }
+        if (key == "shell32.dll") {
+            return SHELL32_MODULE_HANDLE;
+        }
+        if (key == "imagehlp.dll") {
+            return IMAGEHLP_MODULE_HANDLE;
+        }
+        if (key == "advapi32.dll") {
+            return ADVAPI32_MODULE_HANDLE;
+        }
+        if (key == "ole32.dll") {
+            return OLE32_MODULE_HANDLE;
+        }
+        if (key == "winmm.dll") {
+            return WINMM_MODULE_HANDLE;
+        }
+        if (key == "dinput8.dll") {
+            return DINPUT8_MODULE_HANDLE;
+        }
+        if (key == "xinput1_3.dll") {
+            return XINPUT_MODULE_HANDLE;
+        }
+        if (key == "dsound.dll") {
+            return DSOUND_MODULE_HANDLE;
+        }
+        return 0;
+    }
+
+    std::string hleModuleName(
+        U32 moduleHandle) const {
+        switch (moduleHandle) {
+        case KERNEL32_MODULE_HANDLE:
+            return "kernel32.dll";
+        case D3D9_MODULE_HANDLE:
+            return "d3d9.dll";
+        case USER32_MODULE_HANDLE:
+            return "user32.dll";
+        case GDI32_MODULE_HANDLE:
+            return "gdi32.dll";
+        case SHELL32_MODULE_HANDLE:
+            return "shell32.dll";
+        case IMAGEHLP_MODULE_HANDLE:
+            return "imagehlp.dll";
+        case ADVAPI32_MODULE_HANDLE:
+            return "advapi32.dll";
+        case OLE32_MODULE_HANDLE:
+            return "ole32.dll";
+        case WINMM_MODULE_HANDLE:
+            return "winmm.dll";
+        case DINPUT8_MODULE_HANDLE:
+            return "dinput8.dll";
+        case XINPUT_MODULE_HANDLE:
+            return "xinput1_3.dll";
+        case DSOUND_MODULE_HANDLE:
+            return "dsound.dll";
+        default:
+            return std::string();
+        }
+    }
+
+    U32 dynamicNativeProcAddress(
+        U32 moduleHandle,
+        const std::string& symbol) {
+        std::string module =
+            hleModuleName(moduleHandle);
+        if (module.empty() || symbol.empty()) {
+            return 0;
+        }
+        const std::string key =
+            module + "!" + symbol;
+        auto existing =
+            dynamicNativeProcAddresses.find(key);
+        if (existing !=
+            dynamicNativeProcAddresses.end()) {
+            return existing->second;
+        }
+
+        SugarbombNativeCallback callback = nullptr;
+        U16 stackCleanupBytes = 0;
+        findNativeCallback(
+            module,
+            symbol,
+            callback,
+            stackCleanupBytes);
+        if (!callback) {
+            return 0;
+        }
+        std::string thunkError;
+        if (!thunks.beginUpdate(thunkError)) {
+            error = thunkError;
+            return 0;
+        }
+        U32 callbackIndex =
+            SugarbombBridge::registerCallback(
+                module,
+                symbol,
+                callback);
+        U32 guestAddress = 0;
+        bool created = thunks.createThunk(
+            callbackIndex,
+            stackCleanupBytes,
+            guestAddress,
+            thunkError);
+        std::string finalizeError;
+        bool finalized =
+            thunks.finalize(finalizeError);
+        if (!created || !finalized) {
+            error = created
+                ? finalizeError
+                : thunkError;
+            return 0;
+        }
+        dynamicNativeProcAddresses[key] =
+            guestAddress;
+        return guestAddress;
+    }
+
     bool guestRangeIsFree(U32 base, U32 size) const {
         if (!base || !size ||
             static_cast<U64>(base) + size >
@@ -2242,6 +2613,99 @@ private:
         return 0;
     }
 
+    std::vector<std::filesystem::path>
+    configuredNvsePluginFiles() const {
+        std::vector<std::filesystem::path> result;
+        const char* configured =
+            std::getenv("SUGARBOMB_NVSE_PLUGIN_PATHS");
+        if (!configured || !*configured) {
+            return result;
+        }
+
+        std::unordered_set<std::string> seen;
+        std::string paths(configured);
+        std::size_t first = 0;
+        while (first <= paths.size()) {
+            std::size_t separator = paths.find(';', first);
+            std::string entry = paths.substr(
+                first,
+                separator == std::string::npos
+                    ? std::string::npos
+                    : separator - first);
+            std::size_t begin = 0;
+            while (begin < entry.size() &&
+                   std::isspace(
+                       static_cast<unsigned char>(
+                           entry[begin]))) {
+                ++begin;
+            }
+            std::size_t end = entry.size();
+            while (end > begin &&
+                   std::isspace(
+                       static_cast<unsigned char>(
+                           entry[end - 1]))) {
+                --end;
+            }
+            entry = entry.substr(begin, end - begin);
+            if (entry.size() >= 2 &&
+                entry.front() == '"' &&
+                entry.back() == '"') {
+                entry = entry.substr(1, entry.size() - 2);
+            }
+
+            std::error_code fileError;
+            std::filesystem::path path(entry);
+            if (!entry.empty() &&
+                std::filesystem::is_regular_file(
+                    path,
+                    fileError) &&
+                lowerAscii(path.extension().string()) ==
+                    ".dll") {
+                path = std::filesystem::absolute(path);
+                if (seen.insert(
+                        lowerAscii(path.string())).second) {
+                    result.push_back(std::move(path));
+                }
+            } else {
+                fileError.clear();
+                if (!entry.empty() &&
+                    std::filesystem::is_directory(
+                        path,
+                        fileError)) {
+                    for (const auto& child :
+                         std::filesystem::directory_iterator(
+                             path,
+                             fileError)) {
+                        if (fileError) {
+                            break;
+                        }
+                        std::error_code childError;
+                        if (!child.is_regular_file(childError) ||
+                            lowerAscii(
+                                child.path().extension().string()) !=
+                                ".dll") {
+                            continue;
+                        }
+                        std::filesystem::path absolute =
+                            std::filesystem::absolute(
+                                child.path());
+                        if (seen.insert(
+                                lowerAscii(
+                                    absolute.string())).second) {
+                            result.push_back(
+                                std::move(absolute));
+                        }
+                    }
+                }
+            }
+            if (separator == std::string::npos) {
+                break;
+            }
+            first = separator + 1;
+        }
+        return result;
+    }
+
     std::string resolveGuestLibraryPath(
         const std::string& requested) const {
         if (requested.empty()) {
@@ -2267,13 +2731,25 @@ private:
         if (std::filesystem::is_regular_file(byName, fileError)) {
             return std::filesystem::absolute(byName).string();
         }
+        std::string requestedKey = guestModuleKey(requested);
+        for (const std::filesystem::path& plugin :
+             configuredNvsePluginFiles()) {
+            if (guestModuleKey(plugin.string()) ==
+                requestedKey) {
+                return plugin.string();
+            }
+        }
         return std::string();
     }
 
     bool mapGuestModule(
         const std::string& requestedPath,
-        U32& moduleHandle) {
+        U32& moduleHandle,
+        bool* newlyMapped = nullptr) {
         moduleHandle = 0;
+        if (newlyMapped) {
+            *newlyMapped = false;
+        }
         std::string path = resolveGuestLibraryPath(requestedPath);
         if (path.empty()) {
             error = "Unable to locate guest DLL " + requestedPath;
@@ -2350,6 +2826,9 @@ private:
         guestModuleHandles[key] = moduleHandle;
         guestModules[moduleHandle] = std::move(module);
         guestModuleLoadOrder.push_back(moduleHandle);
+        if (newlyMapped) {
+            *newlyMapped = true;
+        }
         if (staticTlsInitialized) {
             std::size_t previousTemplateCount =
                 staticTlsTemplates.size();
@@ -2414,6 +2893,177 @@ private:
         return loadBase + symbol->rva;
     }
 
+    bool installBundledNvseLoaderHook() {
+        if (!verifiedFallout140525 ||
+            !bundledNvseModuleHandle) {
+            return true;
+        }
+        const char* disabled =
+            std::getenv("SUGARBOMB_DISABLE_NVSE");
+        if (disabled &&
+            *disabled &&
+            std::strcmp(disabled, "0") != 0) {
+            printf(
+                "Sugarbomb NVSE: integrated loading disabled by "
+                "SUGARBOMB_DISABLE_NVSE\n");
+            return true;
+        }
+        if (!memory->canRead(
+                FALLOUT_140525_NVSE_HOOK_CALL,
+                5) ||
+            memory->readb(
+                FALLOUT_140525_NVSE_HOOK_CALL) != 0xe8) {
+            error =
+                "Fallout 1.4.0.525 WinMain call site is not the "
+                "expected rel32 CALL";
+            return false;
+        }
+        const S32 originalDisplacement =
+            static_cast<S32>(
+                memory->readd(
+                    FALLOUT_140525_NVSE_HOOK_CALL + 1));
+        const S64 originalTarget64 =
+            static_cast<S64>(
+                FALLOUT_140525_NVSE_HOOK_CALL + 5) +
+            originalDisplacement;
+        if (originalTarget64 != FALLOUT_140525_WINMAIN) {
+            std::ostringstream message;
+            message
+                << "Fallout 1.4.0.525 WinMain call target is 0x"
+                << std::hex << std::uppercase
+                << originalTarget64
+                << ", expected 0x"
+                << FALLOUT_140525_WINMAIN;
+            error = message.str();
+            return false;
+        }
+
+        U32 mapped = memory->mmap(
+            thread,
+            NVSE_LOADER_STUB_BASE,
+            NVSE_LOADER_STUB_SIZE,
+            K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC,
+            K_MAP_FIXED_NOREPLACE |
+                K_MAP_PRIVATE |
+                K_MAP_ANONYMOUS,
+            -1,
+            0);
+        if (mapped != NVSE_LOADER_STUB_BASE) {
+            error =
+                "Unable to reserve the Fallout NVSE loader stub page";
+            return false;
+        }
+        memory->memset(
+            NVSE_LOADER_STUB_BASE,
+            0,
+            NVSE_LOADER_STUB_SIZE);
+
+        constexpr U32 CALL_MAIN_POINTER_OFFSET = 17;
+        constexpr U32 LIBRARY_NAME_OFFSET = 21;
+        const U32 callMainPointer =
+            NVSE_LOADER_STUB_BASE +
+            CALL_MAIN_POINTER_OFFSET;
+        const U32 libraryName =
+            NVSE_LOADER_STUB_BASE +
+            LIBRARY_NAME_OFFSET;
+        const char nvseName[] = "nvse_1_4.dll";
+
+        memory->writeb(
+            NVSE_LOADER_STUB_BASE,
+            0x68); // push imm32
+        memory->writed(
+            NVSE_LOADER_STUB_BASE + 1,
+            libraryName);
+        memory->writeb(
+            NVSE_LOADER_STUB_BASE + 5,
+            0xff);
+        memory->writeb(
+            NVSE_LOADER_STUB_BASE + 6,
+            0x15); // call dword ptr [imm32]
+        memory->writed(
+            NVSE_LOADER_STUB_BASE + 7,
+            FALLOUT_140525_LOAD_LIBRARY_IAT);
+        memory->writeb(
+            NVSE_LOADER_STUB_BASE + 11,
+            0xff);
+        memory->writeb(
+            NVSE_LOADER_STUB_BASE + 12,
+            0x25); // jmp dword ptr [imm32]
+        memory->writed(
+            NVSE_LOADER_STUB_BASE + 13,
+            callMainPointer);
+        memory->writed(
+            callMainPointer,
+            FALLOUT_140525_WINMAIN);
+        memory->memcpy(
+            libraryName,
+            nvseName,
+            sizeof(nvseName));
+
+        if (memory->mprotect(
+                thread,
+                NVSE_LOADER_STUB_BASE,
+                NVSE_LOADER_STUB_SIZE,
+                K_PROT_READ | K_PROT_EXEC) != 0) {
+            error =
+                "Unable to protect the Fallout NVSE loader stub page";
+            return false;
+        }
+
+        constexpr U32 PAGE_SIZE = 0x1000;
+        const U32 hookPage =
+            FALLOUT_140525_NVSE_HOOK_CALL &
+            ~(PAGE_SIZE - 1);
+        if (memory->mprotect(
+                thread,
+                hookPage,
+                PAGE_SIZE,
+                K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC) != 0) {
+            error =
+                "Unable to make the Fallout WinMain call page writable";
+            return false;
+        }
+        const S64 newDisplacement64 =
+            static_cast<S64>(NVSE_LOADER_STUB_BASE) -
+            static_cast<S64>(
+                FALLOUT_140525_NVSE_HOOK_CALL + 5);
+        if (newDisplacement64 <
+                std::numeric_limits<S32>::min() ||
+            newDisplacement64 >
+                std::numeric_limits<S32>::max()) {
+            memory->mprotect(
+                thread,
+                hookPage,
+                PAGE_SIZE,
+                K_PROT_READ | K_PROT_EXEC);
+            error =
+                "Fallout NVSE loader stub is outside rel32 CALL range";
+            return false;
+        }
+        memory->writed(
+            FALLOUT_140525_NVSE_HOOK_CALL + 1,
+            static_cast<U32>(
+                static_cast<S32>(
+                    newDisplacement64)));
+        if (memory->mprotect(
+                thread,
+                hookPage,
+                PAGE_SIZE,
+                K_PROT_READ | K_PROT_EXEC) != 0) {
+            error =
+                "Unable to restore the Fallout WinMain code protection";
+            return false;
+        }
+        memory->clearOpCache();
+        printf(
+            "Sugarbomb NVSE: hooked Fallout CRT WinMain call "
+            "0x%08X -> loader stub 0x%08X -> WinMain 0x%08X\n",
+            FALLOUT_140525_NVSE_HOOK_CALL,
+            NVSE_LOADER_STUB_BASE,
+            FALLOUT_140525_WINMAIN);
+        return true;
+    }
+
     bool mapBundledNvse() {
         std::filesystem::path nvsePath =
             std::filesystem::path(imagePath).parent_path() /
@@ -2429,6 +3079,7 @@ private:
         if (!mapGuestModule(nvsePath.string(), moduleHandle)) {
             return false;
         }
+        bundledNvseModuleHandle = moduleHandle;
         const GuestModule& module = guestModules[moduleHandle];
         const Pe32ExportSymbol* start =
             module.image.info.findExport("StartNVSE");
@@ -2953,6 +3604,24 @@ private:
             }
             return;
         }
+        if (module == "imagehlp.dll") {
+            if (symbol == "MapAndLoad") {
+                callback = callbackImageHlpMapAndLoad;
+                stackCleanupBytes = 20;
+            } else if (symbol == "UnMapAndLoad") {
+                callback = callbackImageHlpUnMapAndLoad;
+                stackCleanupBytes = 4;
+            } else if (
+                symbol == "ImageDirectoryEntryToData") {
+                callback =
+                    callbackImageDirectoryEntryToData;
+                stackCleanupBytes = 16;
+            } else if (symbol == "ImageRvaToVa") {
+                callback = callbackImageRvaToVa;
+                stackCleanupBytes = 16;
+            }
+            return;
+        }
         if (module == "vcruntime140.dll" ||
             module == "vcruntime140d.dll") {
             findCrtMemoryCallback(
@@ -2962,7 +3631,8 @@ private:
             return;
         }
         if (module == "ucrtbase.dll" ||
-            module == "ucrtbased.dll") {
+            module == "ucrtbased.dll" ||
+            module.rfind("api-ms-win-crt-", 0) == 0) {
             if (findCrtMemoryCallback(
                     symbol,
                     callback,
@@ -3139,6 +3809,11 @@ private:
         } else if (symbol == "GetProcAddress") {
             callback = callbackGetProcAddress;
             stackCleanupBytes = 8;
+        } else if (
+            symbol == "EncodePointer" ||
+            symbol == "DecodePointer") {
+            callback = callbackPointerIdentity;
+            stackCleanupBytes = 4;
         } else if (symbol == "LoadLibraryA") {
             callback = callbackLoadLibraryA;
             stackCleanupBytes = 4;
@@ -3575,6 +4250,8 @@ private:
             callback = callbackUcrtStrcpyS;
         } else if (symbol == "strcat_s") {
             callback = callbackUcrtStrcatS;
+        } else if (symbol == "_splitpath_s") {
+            callback = callbackUcrtSplitPathS;
         } else if (symbol == "islower") {
             callback = callbackUcrtIsLower;
         } else if (symbol == "isupper") {
@@ -10416,12 +11093,9 @@ private:
                 cpu->reg[0].u32 = session->image.loadBase;
             } else {
                 std::string name = session->readAnsi(moduleName);
-                std::string key = session->guestModuleKey(name);
-                if (key == "kernel32.dll") {
-                    cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
-                } else if (key == "d3d9.dll") {
-                    cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
-                } else {
+                cpu->reg[0].u32 =
+                    session->hleModuleHandle(name);
+                if (!cpu->reg[0].u32) {
                     cpu->reg[0].u32 =
                         session->guestModuleHandle(name);
                     if (!cpu->reg[0].u32) {
@@ -10440,12 +11114,9 @@ private:
                 cpu->reg[0].u32 = session->image.loadBase;
             } else {
                 std::string name = session->readWide(moduleName);
-                std::string key = session->guestModuleKey(name);
-                if (key == "kernel32.dll") {
-                    cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
-                } else if (key == "d3d9.dll") {
-                    cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
-                } else {
+                cpu->reg[0].u32 =
+                    session->hleModuleHandle(name);
+                if (!cpu->reg[0].u32) {
                     cpu->reg[0].u32 =
                         session->guestModuleHandle(name);
                     if (!cpu->reg[0].u32) {
@@ -10853,6 +11524,22 @@ private:
             cpu->reg[0].u32 = session->direct3DCreate9Thunk;
             return;
         }
+        if (!ordinal) {
+            U32 nativeAddress =
+                session->dynamicNativeProcAddress(
+                    module,
+                    name);
+            if (nativeAddress) {
+                printf(
+                    "Sugarbomb Win32 loader: GetProcAddress("
+                    "0x%08X, %s) -> HLE 0x%08X\n",
+                    module,
+                    name.c_str(),
+                    nativeAddress);
+                cpu->reg[0].u32 = nativeAddress;
+                return;
+            }
+        }
         U32 guestAddress = session->guestModuleProcAddress(
             module,
             ordinal ? std::string() : name,
@@ -10872,26 +11559,50 @@ private:
         cpu->reg[0].u32 = 0;
     }
 
+    static void callbackPointerIdentity(CPU* cpu) {
+        if (current(cpu, "KERNEL32!Encode/DecodePointer")) {
+            cpu->reg[0].u32 = argument(cpu, 0);
+        }
+    }
+
     static void callbackLoadLibraryA(CPU* cpu) {
         SugarbombRuntimeSession* session = current(cpu, "KERNEL32!LoadLibraryA");
         if (session) {
             std::string name = session->readAnsi(argument(cpu, 0));
-            std::string key = session->guestModuleKey(name);
-            if (key == "kernel32.dll") {
-                cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
-                return;
-            }
-            if (key == "d3d9.dll") {
+            U32 hleHandle =
+                session->hleModuleHandle(name);
+            if (hleHandle) {
                 printf(
                     "Sugarbomb Win32 loader: LoadLibraryA(%s) -> 0x%08X\n",
                     name.c_str(),
-                    D3D9_MODULE_HANDLE);
-                cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
+                    hleHandle);
+                cpu->reg[0].u32 = hleHandle;
                 return;
             }
             U32 moduleHandle = 0;
-            if (session->mapGuestModule(name, moduleHandle)) {
-                cpu->reg[0].u32 = moduleHandle;
+            if (session->mapGuestModule(
+                    name,
+                    moduleHandle)) {
+                auto module =
+                    session->guestModules.find(moduleHandle);
+                if (module != session->guestModules.end() &&
+                    !module->second.initialized &&
+                    !session->beginDynamicGuestModuleLoad(
+                        cpu,
+                        moduleHandle)) {
+                    printf(
+                        "Sugarbomb Win32 loader: LoadLibraryA(%s) "
+                        "could not initialize 0x%08X: %s\n",
+                        name.c_str(),
+                        moduleHandle,
+                        session->error.c_str());
+                    session->setLastError(1114);
+                    cpu->reg[0].u32 = 0;
+                } else if (
+                    module == session->guestModules.end() ||
+                    module->second.initialized) {
+                    cpu->reg[0].u32 = moduleHandle;
+                }
             } else {
                 printf(
                     "Sugarbomb Win32 loader probe: LoadLibraryA(%s) "
@@ -10911,18 +11622,38 @@ private:
             return;
         }
         std::string name = session->readAnsi(argument(cpu, 0));
-        std::string key = session->guestModuleKey(name);
-        if (key == "kernel32.dll") {
-            cpu->reg[0].u32 = KERNEL32_MODULE_HANDLE;
-            return;
-        }
-        if (key == "d3d9.dll") {
-            cpu->reg[0].u32 = D3D9_MODULE_HANDLE;
+        U32 hleHandle =
+            session->hleModuleHandle(name);
+        if (hleHandle) {
+            cpu->reg[0].u32 = hleHandle;
             return;
         }
         U32 moduleHandle = 0;
-        if (session->mapGuestModule(name, moduleHandle)) {
-            cpu->reg[0].u32 = moduleHandle;
+        if (session->mapGuestModule(
+                name,
+                moduleHandle)) {
+            auto module =
+                session->guestModules.find(moduleHandle);
+            if (module != session->guestModules.end() &&
+                !module->second.initialized &&
+                !session->beginDynamicGuestModuleLoad(
+                    cpu,
+                    moduleHandle)) {
+                printf(
+                    "Sugarbomb Win32 loader: LoadLibraryExA(%s, "
+                    "flags=0x%08X) could not initialize 0x%08X: "
+                    "%s\n",
+                    name.c_str(),
+                    argument(cpu, 2),
+                    moduleHandle,
+                    session->error.c_str());
+                session->setLastError(1114);
+                cpu->reg[0].u32 = 0;
+            } else if (
+                module == session->guestModules.end() ||
+                module->second.initialized) {
+                cpu->reg[0].u32 = moduleHandle;
+            }
         } else {
             printf(
                 "Sugarbomb Win32 loader probe: LoadLibraryExA(%s, "
@@ -10949,12 +11680,69 @@ private:
             }
             cpu->reg[0].u32 = 1;
         } else if (
-            moduleHandle == KERNEL32_MODULE_HANDLE ||
-            moduleHandle == D3D9_MODULE_HANDLE) {
+            !session->hleModuleName(
+                moduleHandle).empty()) {
             cpu->reg[0].u32 = 1;
         } else {
             session->setLastError(6); // ERROR_INVALID_HANDLE
             cpu->reg[0].u32 = 0;
+        }
+    }
+
+    static void callbackImageHlpMapAndLoad(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "IMAGEHLP!MapAndLoad");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->imageHlpMapAndLoad(
+                    session->readAnsi(argument(cpu, 0), 32768),
+                    session->readAnsi(argument(cpu, 1), 32768),
+                    argument(cpu, 2),
+                    argument(cpu, 3) != 0,
+                    argument(cpu, 4) != 0)
+                ? 1
+                : 0;
+        }
+    }
+
+    static void callbackImageHlpUnMapAndLoad(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "IMAGEHLP!UnMapAndLoad");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->imageHlpUnMapAndLoad(
+                    argument(cpu, 0))
+                ? 1
+                : 0;
+        }
+    }
+
+    static void callbackImageDirectoryEntryToData(
+        CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(
+                cpu,
+                "IMAGEHLP!ImageDirectoryEntryToData");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->imageHlpDirectoryEntryToData(
+                    argument(cpu, 0),
+                    argument(cpu, 1) != 0,
+                    argument(cpu, 2),
+                    argument(cpu, 3));
+        }
+    }
+
+    static void callbackImageRvaToVa(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "IMAGEHLP!ImageRvaToVa");
+        if (session) {
+            cpu->reg[0].u32 =
+                session->imageHlpRvaToVa(
+                    argument(cpu, 0),
+                    argument(cpu, 1),
+                    argument(cpu, 2),
+                    argument(cpu, 3));
         }
     }
 
@@ -12676,6 +13464,111 @@ private:
         }
     }
 
+    static void callbackUcrtSplitPathS(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "UCRT!_splitpath_s");
+        if (!session) {
+            return;
+        }
+        const U32 outputAddresses[] = {
+            argument(cpu, 1),
+            argument(cpu, 3),
+            argument(cpu, 5),
+            argument(cpu, 7)};
+        const U32 outputCapacities[] = {
+            argument(cpu, 2),
+            argument(cpu, 4),
+            argument(cpu, 6),
+            argument(cpu, 8)};
+        for (U32 index = 0; index < 4; ++index) {
+            if (outputAddresses[index] &&
+                outputCapacities[index] &&
+                session->memory->canWrite(
+                    outputAddresses[index],
+                    1)) {
+                session->memory->writeb(
+                    outputAddresses[index],
+                    0);
+            }
+        }
+
+        U32 pathLength = 0;
+        if (!session->guestCStringLength(
+                argument(cpu, 0),
+                pathLength)) {
+            cpu->reg[0].u32 = 22; // EINVAL
+            return;
+        }
+        std::string path = session->readAnsi(
+            argument(cpu, 0),
+            pathLength + 1);
+        std::replace(
+            path.begin(),
+            path.end(),
+            '/',
+            '\\');
+        std::string drive;
+        std::size_t fileStart = 0;
+        if (path.size() >= 2 &&
+            path[1] == ':') {
+            drive = path.substr(0, 2);
+            fileStart = 2;
+        }
+        std::size_t slash =
+            path.find_last_of('\\');
+        std::string directory;
+        if (slash != std::string::npos &&
+            slash + 1 >= fileStart) {
+            directory = path.substr(
+                fileStart,
+                slash - fileStart + 1);
+            fileStart = slash + 1;
+        }
+        std::size_t dot =
+            path.find_last_of('.');
+        if (dot == std::string::npos ||
+            dot < fileStart) {
+            dot = path.size();
+        }
+        std::string filename =
+            path.substr(fileStart, dot - fileStart);
+        std::string extension =
+            dot < path.size()
+            ? path.substr(dot)
+            : std::string();
+        const std::string values[] = {
+            drive,
+            directory,
+            filename,
+            extension};
+        for (U32 index = 0; index < 4; ++index) {
+            U32 address = outputAddresses[index];
+            U32 capacity = outputCapacities[index];
+            if ((!address && capacity) ||
+                (address && !capacity) ||
+                (address &&
+                 (!session->memory->canWrite(
+                      address,
+                      capacity) ||
+                  values[index].size() + 1 >
+                      capacity))) {
+                cpu->reg[0].u32 =
+                    address && capacity
+                    ? 34 // ERANGE
+                    : 22; // EINVAL
+                return;
+            }
+        }
+        for (U32 index = 0; index < 4; ++index) {
+            if (outputAddresses[index]) {
+                session->memory->strcpy(
+                    outputAddresses[index],
+                    values[index].c_str());
+            }
+        }
+        cpu->reg[0].u32 = 0;
+    }
+
     enum class UcrtCtypeOperation {
         IsLower,
         IsUpper,
@@ -14182,13 +15075,14 @@ private:
         }
     }
 
-    static void callbackGuestModuleInitializerReturn(CPU* cpu) {
+    static void callbackDynamicModuleInitializerReturn(
+        CPU* cpu) {
         SugarbombRuntimeSession* session =
             current(
                 cpu,
-                "SUGARBOMB!GuestModuleInitializerReturn");
+                "SUGARBOMB!DynamicModuleInitializerReturn");
         if (session) {
-            session->completeGuestModuleInitializer(cpu);
+            session->completeDynamicModuleInitializer(cpu);
         }
     }
 
@@ -14264,6 +15158,15 @@ private:
         std::size_t nextIndex = 0;
     };
 
+    struct ImageHlpLoadedImageState {
+        U32 mappedAddress = 0;
+        U32 mappedSize = 0;
+        U32 moduleNameAddress = 0;
+        U32 ntHeadersAddress = 0;
+        U32 sectionsAddress = 0;
+        Pe32ImageInfo info;
+    };
+
     static bool wildcardMatch(const std::string& patternValue, const std::string& textValue) {
         std::string pattern = lowerAscii(patternValue);
         std::string text = lowerAscii(textValue);
@@ -14290,6 +15193,368 @@ private:
             ++patternIndex;
         }
         return patternIndex == pattern.size();
+    }
+
+    ImageHlpLoadedImageState*
+    imageHlpLoadedImageForBase(U32 mappedAddress) {
+        for (auto& entry : imageHlpLoadedImages) {
+            if (entry.second.mappedAddress ==
+                mappedAddress) {
+                return &entry.second;
+            }
+        }
+        return nullptr;
+    }
+
+    bool imageHlpRawAddress(
+        const ImageHlpLoadedImageState& state,
+        U32 rva,
+        U32& address,
+        U32& sectionHeader) const {
+        address = 0;
+        sectionHeader = 0;
+        if (rva < state.info.sizeOfHeaders &&
+            rva < state.mappedSize) {
+            address = state.mappedAddress + rva;
+            return true;
+        }
+        for (std::size_t index = 0;
+             index < state.info.sections.size();
+             ++index) {
+            const Pe32SectionInfo& section =
+                state.info.sections[index];
+            U64 extent = std::max<U32>(
+                section.virtualSize,
+                section.rawDataSize);
+            if (rva < section.virtualAddress ||
+                static_cast<U64>(rva) >=
+                    static_cast<U64>(
+                        section.virtualAddress) +
+                        extent) {
+                continue;
+            }
+            U32 relative = rva - section.virtualAddress;
+            U64 rawOffset =
+                static_cast<U64>(
+                    section.rawDataOffset) +
+                relative;
+            if (relative >= section.rawDataSize ||
+                rawOffset >= state.mappedSize) {
+                return false;
+            }
+            address =
+                state.mappedAddress +
+                static_cast<U32>(rawOffset);
+            sectionHeader =
+                state.sectionsAddress +
+                static_cast<U32>(index) * 40;
+            return true;
+        }
+        return false;
+    }
+
+    bool imageHlpMapAndLoad(
+        std::string imageName,
+        const std::string& dllPath,
+        U32 loadedImageAddress,
+        bool appendDllExtension,
+        bool readOnly) {
+        constexpr U32 LOADED_IMAGE_SIZE = 48;
+        if (imageName.empty() ||
+            !loadedImageAddress ||
+            !memory->canWrite(
+                loadedImageAddress,
+                LOADED_IMAGE_SIZE)) {
+            setLastError(87);
+            return false;
+        }
+        if (appendDllExtension &&
+            std::filesystem::path(
+                imageName).extension().empty()) {
+            imageName += ".dll";
+        }
+        std::filesystem::path requested =
+            dllPath.empty()
+            ? std::filesystem::path(imageName)
+            : std::filesystem::path(dllPath) /
+                imageName;
+        std::string path =
+            resolveGuestLibraryPath(requested.string());
+        if (path.empty()) {
+            path = resolveGuestLibraryPath(imageName);
+        }
+        if (path.empty()) {
+            setLastError(2);
+            return false;
+        }
+
+        std::vector<U8> bytes;
+        Pe32ImageInfo inspected;
+        std::string loadError;
+        if (!Pe32Loader::readFile(
+                path.c_str(),
+                bytes,
+                loadError) ||
+            !Pe32Loader::inspect(
+                bytes,
+                inspected,
+                loadError) ||
+            bytes.size() >
+                std::numeric_limits<U32>::max() ||
+            bytes.size() < 64) {
+            setLastError(193);
+            return false;
+        }
+        auto readHostU16 =
+            [&bytes](std::size_t offset, U16& value) {
+                if (offset > bytes.size() - 2) {
+                    return false;
+                }
+                value =
+                    static_cast<U16>(bytes[offset]) |
+                    (static_cast<U16>(
+                         bytes[offset + 1]) << 8);
+                return true;
+            };
+        auto readHostU32 =
+            [&bytes](std::size_t offset, U32& value) {
+                if (offset > bytes.size() - 4) {
+                    return false;
+                }
+                value =
+                    static_cast<U32>(bytes[offset]) |
+                    (static_cast<U32>(
+                         bytes[offset + 1]) << 8) |
+                    (static_cast<U32>(
+                         bytes[offset + 2]) << 16) |
+                    (static_cast<U32>(
+                         bytes[offset + 3]) << 24);
+                return true;
+            };
+        U32 ntOffset = 0;
+        U16 sectionCount = 0;
+        U16 optionalHeaderSize = 0;
+        if (!readHostU32(0x3c, ntOffset) ||
+            static_cast<U64>(ntOffset) + 24 >
+                bytes.size() ||
+            !readHostU16(ntOffset + 6, sectionCount) ||
+            !readHostU16(
+                ntOffset + 20,
+                optionalHeaderSize)) {
+            setLastError(193);
+            return false;
+        }
+        U64 sectionsOffset64 =
+            static_cast<U64>(ntOffset) + 24 +
+            optionalHeaderSize;
+        if (sectionsOffset64 +
+                static_cast<U64>(sectionCount) * 40 >
+            bytes.size()) {
+            setLastError(193);
+            return false;
+        }
+
+        auto existing =
+            imageHlpLoadedImages.find(
+                loadedImageAddress);
+        if (existing != imageHlpLoadedImages.end()) {
+            imageHlpUnMapAndLoad(loadedImageAddress);
+        }
+        U32 mappedSize = static_cast<U32>(bytes.size());
+        U32 mappedAddress =
+            allocateGuestHeap(mappedSize, false);
+        U32 moduleNameAddress = allocateGuestHeap(
+            static_cast<U32>(path.size() + 1),
+            false);
+        if (!mappedAddress || !moduleNameAddress) {
+            if (mappedAddress) {
+                freeGuestHeap(mappedAddress);
+            }
+            if (moduleNameAddress) {
+                freeGuestHeap(moduleNameAddress);
+            }
+            setLastError(8);
+            return false;
+        }
+        memory->memcpy(
+            mappedAddress,
+            bytes.data(),
+            mappedSize);
+        memory->strcpy(
+            moduleNameAddress,
+            path.c_str());
+        memory->memset(
+            loadedImageAddress,
+            0,
+            LOADED_IMAGE_SIZE);
+        memory->writed(
+            loadedImageAddress,
+            moduleNameAddress);
+        memory->writed(
+            loadedImageAddress + 8,
+            mappedAddress);
+        memory->writed(
+            loadedImageAddress + 12,
+            mappedAddress + ntOffset);
+        memory->writed(
+            loadedImageAddress + 20,
+            sectionCount);
+        memory->writed(
+            loadedImageAddress + 24,
+            mappedAddress +
+                static_cast<U32>(sectionsOffset64));
+        memory->writed(
+            loadedImageAddress + 28,
+            inspected.characteristics);
+        memory->writeb(
+            loadedImageAddress + 34,
+            readOnly ? 1 : 0);
+        memory->writeb(
+            loadedImageAddress + 35,
+            1);
+        memory->writed(
+            loadedImageAddress + 44,
+            inspected.sizeOfImage);
+
+        ImageHlpLoadedImageState state;
+        state.mappedAddress = mappedAddress;
+        state.mappedSize = mappedSize;
+        state.moduleNameAddress = moduleNameAddress;
+        state.ntHeadersAddress =
+            mappedAddress + ntOffset;
+        state.sectionsAddress =
+            mappedAddress +
+            static_cast<U32>(sectionsOffset64);
+        state.info = std::move(inspected);
+        imageHlpLoadedImages[loadedImageAddress] =
+            std::move(state);
+        printf(
+            "Sugarbomb ImageHlp: MapAndLoad(%s) -> raw "
+            "guest image 0x%08X\n",
+            path.c_str(),
+            mappedAddress);
+        return true;
+    }
+
+    bool imageHlpUnMapAndLoad(
+        U32 loadedImageAddress) {
+        auto found =
+            imageHlpLoadedImages.find(
+                loadedImageAddress);
+        if (found == imageHlpLoadedImages.end()) {
+            setLastError(87);
+            return false;
+        }
+        U32 mappedAddress =
+            found->second.mappedAddress;
+        U32 moduleNameAddress =
+            found->second.moduleNameAddress;
+        imageHlpLoadedImages.erase(found);
+        freeGuestHeap(mappedAddress);
+        freeGuestHeap(moduleNameAddress);
+        if (memory->canWrite(loadedImageAddress, 48)) {
+            memory->memset(
+                loadedImageAddress,
+                0,
+                48);
+        }
+        return true;
+    }
+
+    U32 imageHlpDirectoryEntryToData(
+        U32 mappedAddress,
+        bool mappedAsImage,
+        U32 directoryEntry,
+        U32 sizeAddress) {
+        ImageHlpLoadedImageState* state =
+            imageHlpLoadedImageForBase(
+                mappedAddress);
+        if (!state ||
+            !sizeAddress ||
+            !memory->canWrite(sizeAddress, 4) ||
+            directoryEntry >= 16) {
+            setLastError(87);
+            return 0;
+        }
+        U32 optionalHeader =
+            state->ntHeadersAddress + 24;
+        if (!memory->canRead(
+                optionalHeader,
+                96) ||
+            memory->readw(optionalHeader) != 0x10b) {
+            setLastError(193);
+            return 0;
+        }
+        U32 directoryCount =
+            memory->readd(optionalHeader + 92);
+        if (directoryEntry >= directoryCount) {
+            memory->writed(sizeAddress, 0);
+            return 0;
+        }
+        U32 entryAddress =
+            optionalHeader + 96 +
+            directoryEntry * 8;
+        if (!memory->canRead(entryAddress, 8)) {
+            setLastError(193);
+            return 0;
+        }
+        U32 rva = memory->readd(entryAddress);
+        U32 size = memory->readd(entryAddress + 4);
+        memory->writed(sizeAddress, size);
+        if (!rva || !size) {
+            return 0;
+        }
+        if (mappedAsImage) {
+            U64 end =
+                static_cast<U64>(rva) + size;
+            return end <= state->mappedSize
+                ? state->mappedAddress + rva
+                : 0;
+        }
+        U32 address = 0;
+        U32 section = 0;
+        return imageHlpRawAddress(
+                   *state,
+                   rva,
+                   address,
+                   section)
+            ? address
+            : 0;
+    }
+
+    U32 imageHlpRvaToVa(
+        U32 ntHeadersAddress,
+        U32 mappedAddress,
+        U32 rva,
+        U32 lastSectionAddress) {
+        ImageHlpLoadedImageState* state =
+            imageHlpLoadedImageForBase(
+                mappedAddress);
+        if (!state ||
+            ntHeadersAddress !=
+                state->ntHeadersAddress ||
+            (lastSectionAddress &&
+             !memory->canWrite(
+                 lastSectionAddress,
+                 4))) {
+            setLastError(87);
+            return 0;
+        }
+        U32 address = 0;
+        U32 section = 0;
+        if (!imageHlpRawAddress(
+                *state,
+                rva,
+                address,
+                section)) {
+            return 0;
+        }
+        if (lastSectionAddress) {
+            memory->writed(
+                lastSectionAddress,
+                section);
+        }
+        return address;
     }
 
     U32 createGuestFile(const std::string& guestPath, U32 desiredAccess, U32 disposition) {
@@ -14871,6 +16136,39 @@ private:
             if (virtualDeletedFiles.find(normalized) == virtualDeletedFiles.end() &&
                 wildcardMatch(pattern, entry.path().filename().string())) {
                 state.entries.push_back(entry.path());
+            }
+        }
+        const std::filesystem::path nvsePluginDirectory =
+            (std::filesystem::path(imagePath).parent_path() /
+             "Data" / "NVSE" / "Plugins").lexically_normal();
+        if (lowerAscii(directory.lexically_normal().string()) ==
+            lowerAscii(nvsePluginDirectory.string())) {
+            std::unordered_set<std::string> names;
+            for (const std::filesystem::path& path :
+                 state.entries) {
+                names.insert(
+                    lowerAscii(
+                        path.filename().string()));
+            }
+            U32 added = 0;
+            for (const std::filesystem::path& plugin :
+                 configuredNvsePluginFiles()) {
+                std::string name =
+                    plugin.filename().string();
+                if (wildcardMatch(pattern, name) &&
+                    names.insert(
+                        lowerAscii(name)).second) {
+                    state.entries.push_back(plugin);
+                    ++added;
+                }
+            }
+            if (added &&
+                ++nvsePluginOverlayTraceCount <= 4) {
+                printf(
+                    "Sugarbomb NVSE: exposed %u configured "
+                    "plugin DLL(s) through %s\n",
+                    added,
+                    nvsePluginDirectory.string().c_str());
             }
         }
         std::sort(state.entries.begin(), state.entries.end());
@@ -17598,6 +18896,7 @@ private:
     }
 
     std::string imagePath;
+    std::string executionImagePath;
     std::string commandLine;
     std::string error;
     KProcessPtr process;
@@ -17608,15 +18907,17 @@ private:
     Pe32MappedImage image;
     std::unordered_map<U32, GuestModule> guestModules;
     std::unordered_map<std::string, U32> guestModuleHandles;
+    std::unordered_map<std::string, U32>
+        dynamicNativeProcAddresses;
     std::vector<U32> guestModuleLoadOrder;
-    std::vector<GuestModuleInitializer> guestModuleInitializers;
-    std::size_t guestModuleInitializerIndex = 0;
     U32 nextGuestModuleBase = 0x18000000;
+    U32 bundledNvseModuleHandle = 0;
+    bool verifiedFallout140525 = false;
     SugarbombThunkArena thunks;
     U32 entryReturnThunk = 0;
     U32 threadReturnThunk = 0;
     U32 wndProcReturnThunk = 0;
-    U32 moduleInitializerReturnThunk = 0;
+    U32 dynamicModuleInitializerReturnThunk = 0;
     U32 guestFunctionArrayReturnThunk = 0;
     std::vector<StaticTlsTemplate> staticTlsTemplates;
     U32 nativeCallCount = 0;
@@ -17630,6 +18931,7 @@ private:
     U32 profileTraceCount = 0;
     U32 fileAttributeTraceCount = 0;
     U32 fileOpenTraceCount = 0;
+    U32 nvsePluginOverlayTraceCount = 0;
     U32 waitTraceCount = 0;
     U32 surfaceDescTraceCount = 0;
     U32 guestMessageTraceCount = 0;
@@ -17698,6 +19000,8 @@ private:
     std::unordered_map<U32, GuestCFile> guestCFiles;
     U32 standardCFiles[3] = {};
     std::unordered_map<U32, FindState> findStates;
+    std::unordered_map<U32, ImageHlpLoadedImageState>
+        imageHlpLoadedImages;
     std::unordered_map<U32, MmioFile> mmioFiles;
     std::unordered_map<U32, std::string> registryKeys;
     std::unordered_map<std::string, GuestWindowClass> guestWindowClasses;
@@ -17705,6 +19009,10 @@ private:
     std::deque<GuestMessage> guestMessageQueue;
     std::unordered_map<U32, std::vector<PendingWndProcDispatch>>
         pendingWndProcDispatches;
+    std::unordered_map<
+        U32,
+        std::vector<PendingDynamicModuleLoad>>
+        pendingDynamicModuleLoads;
     std::unordered_map<
         U32,
         std::vector<PendingGuestFunctionArray>>

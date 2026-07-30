@@ -14,10 +14,20 @@ The primary guest executable is **FalloutNV.exe 1.4.0.525**. Sugarbomb maps it
 at `0x00400000`, builds its Windows process environment, binds its imports, and
 starts its PE entry point.
 
+The retail Steam executable is CEG-packed on disk. Sugarbomb recognizes that
+exact image identity and selects a verified unpacked 1.4.0.525 sidecar for the
+bytes it maps, while retaining the user-supplied `FalloutNV.exe` path in the
+guest command line, process parameters, module filename, working directory,
+and filesystem view. It rejects an unverified sidecar instead of executing
+packed bytes as x86 code.
+
 `nvse_1_4.dll` is not the execution target. It is the xNVSE runtime DLL for the
-FalloutNV 1.4 executable and is mapped into the same guest process afterward.
-Sugarbomb owns that loading step, so the deployed path does not run
-`nvse_loader.exe`.
+FalloutNV 1.4 executable and is staged in the same guest process. Sugarbomb
+hooks Fallout's CRT-to-WinMain call at `0x00ECC46B`, loads xNVSE there through
+Fallout's own `LoadLibraryA` IAT, and then tail-jumps to the original WinMain at
+`0x0086A850`. Sugarbomb therefore owns the loading step without running
+`nvse_loader.exe`, while preserving the initialization order expected by the
+game and its plugins.
 
 ## Verified milestone
 
@@ -53,16 +63,19 @@ worker threads are parked on their normal kernel-object waits. Fallout's 32-bit
 guest `HWND` remains an integer in guest memory, while its corresponding native
 `HWND` and every native D3D pointer remain private to the 64-bit host.
 
-The staged xNVSE 6.4.8 runtime now also completes both of its PE TLS callbacks
-and its real DLL entry point in the same guest process. A bounded headless smoke
-run finishes all 909 UCRT initializer calls, registers 79 exit handlers, reads
-`Data/NVSE/nvse_config.ini`, identifies the Fallout image at `0x00400000`,
-applies its executable patches through `VirtualProtect`, and emits xNVSE's
-runtime-ready diagnostics. Fallout then continues through archive/plugin
-discovery, window and DirectInput creation, audio and DirectShow setup, D3D9
-device/resource creation, and 45 complete presentation cycles before the
-five-million-slice diagnostic budget expires. No Wine process, `nvse_loader.exe`,
-unresolved import, or host crash is involved.
+The staged xNVSE 6.4.8 runtime now initializes automatically at Fallout's real
+WinMain boundary. A bounded headless smoke run completes both PE TLS callbacks,
+the DLL entry point, all 909 UCRT initializer calls, and 79 exit-handler
+registrations. xNVSE reads `Data/NVSE/nvse_config.ini`, identifies and patches
+the Fallout image, discovers a configured `mlf.dll` plugin, validates it with
+ImageHlp, maps and relocates it, runs its CRT/DllMain, resolves
+`NVSEPlugin_Query` and `NVSEPlugin_Load`, and reports `MLF` version 3 loaded
+correctly. Fallout then continues through archive/plugin discovery, window and
+DirectInput creation, audio and DirectShow setup, D3D9 device/resource creation,
+and seven complete presentation cycles in a 1.5-million-slice run. The former
+R6030 “CRT not initialized” failure is gone because plugin Load now occurs after
+Fallout's executable CRT startup. No Wine process, `nvse_loader.exe`, unresolved
+import, or host crash is involved.
 
 The renderer checkpoint is no longer synthetic. Sugarbomb translates
 Fallout's render targets, surfaces, textures, texture locks, vertex/index
@@ -88,7 +101,14 @@ The runtime currently builds:
   Kernel32 module APIs;
 - automatic staging of `nvse_1_4.dll` beside Fallout at its preferred
   `0x10000000` base, with `StartNVSE` discovered from the real export table and
-  gated TLS/PE-entry initialization available for deterministic diagnostics;
+  automatic TLS/PE-entry initialization from an xNVSE-compatible hook at
+  Fallout's CRT-to-WinMain boundary;
+- dynamic PE32 DLL process initialization for both newly mapped and prestaged
+  modules, including nested `LoadLibrary` calls, TLS callbacks, CRT/DllMain,
+  relocation, exports, and return to the interrupted guest import thunk;
+- an optional `SUGARBOMB_NVSE_PLUGIN_PATHS` filesystem overlay that exposes
+  selected DLLs or plugin directories through `Data/NVSE/Plugins` without
+  copying files into the game installation;
 - a cooperative x86 guest scheduler with suspended/runnable/completed thread
   states, timed sleeps, and semaphore/event/mutex/thread waits;
 - filesystem, profile/INI, registry, Shell32, USER32, GDI32, input, audio,
@@ -228,10 +248,11 @@ dependency order and validate each group with small guest fixtures:
 2. **NVSE bootstrap:** DLL export parsing, import binding, module lookup,
    preferred-base staging, per-module/per-thread static TLS, CRT startup, TLS
    callbacks, and the real DLL entry point are implemented. The staged xNVSE
-   runtime reaches its runtime-ready state and Fallout continues afterward.
-   Remaining work includes making this initialization policy unconditional for
-   ordinary launches, mapping `Data/NVSE/Plugins/*.dll`, and implementing the
-   NVSE plugin-query/load, messaging, and interface contracts.
+   runtime initializes automatically after Fallout's CRT and before WinMain.
+   xNVSE can discover, validate, map, initialize, Query, and Load a real plugin;
+   `FNV Mod Limit Fix` version 3 is the current verified fixture. Remaining work
+   includes broader plugin coverage plus the NVSE messaging and optional
+   interface contracts those plugins exercise.
 3. **Window and input:** USER32, raw input, DirectInput 8, XInput, cursor and
    message-loop behavior. Fallout's mapped top-level `HWND` now belongs to a
    dedicated native UI thread with an independent Windows message loop, so the
@@ -288,7 +309,9 @@ change the guest ABI:
 $env:SUGARBOMB_MAX_RUN_SLICES = '2600000'
 $env:SUGARBOMB_MAX_RUN_MILLISECONDS = '20000'
 $env:SUGARBOMB_NO_HOST_WINDOW = '1' # optional for unattended runs
-$env:SUGARBOMB_RUN_NVSE_ENTRY = '1' # run staged xNVSE TLS callbacks and DllMain
+$env:SUGARBOMB_FALLOUT_UNPACKED_IMAGE = 'D:\path\to\verified\FalloutNV.unpacked.exe'
+$env:SUGARBOMB_NVSE_PLUGIN_PATHS = 'D:\mods\PluginA.dll;D:\mods\NVSE\Plugins'
+$env:SUGARBOMB_DISABLE_NVSE = '1' # optional diagnostic opt-out
 $env:SUGARBOMB_CAPTURE_FRAME = 'D:\captures\fallout-present.png'
 $env:SUGARBOMB_CAPTURE_AFTER_PRESENTS = '100'
 $env:SUGARBOMB_CAPTURE_FINAL_FRAME = 'D:\captures\fallout-final-target.png'
@@ -320,8 +343,9 @@ The 64-bit host owns the window and real D3D9 objects, translates Fallout's
 32-bit graphics workload, delivers host and lifecycle messages through
 Fallout's own 32-bit WndProc, and reaches the correctly textured main menu
 without exposing native pointers to the guest. xNVSE now initializes through
-its real static-TLS and DLL-entry sequence and patches the same guest Fallout
-image before the game continues. The next major work is to verify deterministic
-menu interaction through the new native-focus/DirectInput path, persist
-remaining virtual-file operations, and map and initialize NVSE plugins in the
-same guest process.
+its real static-TLS and DLL-entry sequence at the same CRT boundary used by the
+xNVSE loader, patches the same guest Fallout image, and loads a real NVSE plugin
+before the game continues. The next major work is to verify deterministic menu
+interaction through the native-focus/DirectInput path, persist remaining
+virtual-file operations, and expand plugin/API coverage from additional real
+NVSE workloads.
