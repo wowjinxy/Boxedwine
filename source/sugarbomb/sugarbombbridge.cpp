@@ -22,6 +22,7 @@ struct SugarbombCallbackEntry {
 
 std::vector<SugarbombCallbackEntry> callbacks;
 std::mutex callbacksMutex;
+SugarbombPageFaultObserver pageFaultObserver = nullptr;
 
 } // namespace
 
@@ -84,10 +85,30 @@ std::size_t SugarbombBridge::callbackCount() {
     return callbacks.size();
 }
 
+void SugarbombBridge::setPageFaultObserver(
+    SugarbombPageFaultObserver observer) {
+    std::lock_guard<std::mutex> lock(callbacksMutex);
+    pageFaultObserver = observer;
+}
+
+void SugarbombBridge::notifyPageFault(
+    KThread* thread,
+    U32 address) {
+    SugarbombPageFaultObserver observer = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(callbacksMutex);
+        observer = pageFaultObserver;
+    }
+    if (observer) {
+        observer(thread, address);
+    }
+}
+
 #ifdef __TEST
 void SugarbombBridge::clearForTests() {
     std::lock_guard<std::mutex> lock(callbacksMutex);
     callbacks.clear();
+    pageFaultObserver = nullptr;
 }
 #endif
 

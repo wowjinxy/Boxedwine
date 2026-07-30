@@ -67,6 +67,11 @@ using D3DXLoadSurfaceFromSurfaceProc =
         const RECT*,
         DWORD,
         D3DCOLOR);
+
+struct SugarbombD3DFormatBridge {
+    std::uint32_t guestFormat = 0;
+    D3DFORMAT nativeFormat = D3DFMT_UNKNOWN;
+};
 #endif
 
 struct SugarbombHostD3D9::Impl {
@@ -85,6 +90,10 @@ struct SugarbombHostD3D9::Impl {
     std::unordered_map<std::uint32_t, IDirect3DSurface9*> surfaces;
     std::unordered_map<std::uint32_t, IDirect3DTexture9*> textures;
     std::unordered_map<std::uint32_t, IDirect3DCubeTexture9*> cubeTextures;
+    std::unordered_map<std::uint32_t, SugarbombD3DFormatBridge>
+        translatedSurfaceFormats;
+    std::unordered_map<std::uint32_t, SugarbombD3DFormatBridge>
+        translatedTextureFormats;
     std::unordered_map<std::uint32_t, IDirect3DVertexBuffer9*> vertexBuffers;
     std::unordered_map<std::uint32_t, IDirect3DIndexBuffer9*> indexBuffers;
     std::unordered_map<std::uint32_t, IDirect3DVertexDeclaration9*> declarations;
@@ -105,6 +114,23 @@ void releaseObject(T*& object) {
         object->Release();
         object = nullptr;
     }
+}
+
+bool ensureDirect3DInterface(SugarbombHostD3D9::Impl* impl) {
+    if (!impl) {
+        return false;
+    }
+    if (impl->direct3D) {
+        return true;
+    }
+    impl->direct3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!impl->direct3D) {
+        std::fprintf(
+            stderr,
+            "Sugarbomb host D3D9: Direct3DCreate9 returned null\n");
+        return false;
+    }
+    return true;
 }
 
 template <typename T>
@@ -130,6 +156,32 @@ bool reportFailure(
     return SUCCEEDED(result);
 }
 
+SugarbombD3DFormatBridge bridgeTextureFormat(
+    std::uint32_t guestFormat) {
+    SugarbombD3DFormatBridge bridge;
+    bridge.guestFormat = guestFormat;
+    bridge.nativeFormat = static_cast<D3DFORMAT>(guestFormat);
+    if (bridge.nativeFormat == D3DFMT_R8G8B8) {
+        bridge.nativeFormat = D3DFMT_X8R8G8B8;
+    }
+    return bridge;
+}
+
+bool expandsRgb24(const SugarbombD3DFormatBridge* bridge) {
+    return bridge &&
+        bridge->guestFormat == D3DFMT_R8G8B8 &&
+        bridge->nativeFormat == D3DFMT_X8R8G8B8;
+}
+
+const SugarbombD3DFormatBridge* findFormatBridge(
+    const std::unordered_map<
+        std::uint32_t,
+        SugarbombD3DFormatBridge>& formats,
+    std::uint32_t key) {
+    auto found = formats.find(key);
+    return found == formats.end() ? nullptr : &found->second;
+}
+
 std::uint32_t surfaceRowCount(
     D3DFORMAT format,
     std::uint32_t height) {
@@ -151,6 +203,7 @@ bool uploadSurfacePixels(
     const void* pixels,
     std::uint32_t sourcePitch,
     std::uint32_t rowCount,
+    const SugarbombD3DFormatBridge* formatBridge,
     const char* operation) {
     if (!impl || !impl->device || !destination ||
         !pixels || !sourcePitch || !rowCount) {
@@ -188,10 +241,8 @@ bool uploadSurfacePixels(
         releaseObject(staging);
         return false;
     }
-    const std::uint32_t copyBytes =
-        std::min<std::uint32_t>(
-            sourcePitch,
-            static_cast<std::uint32_t>(std::abs(locked.Pitch)));
+    const std::uint32_t targetPitch =
+        static_cast<std::uint32_t>(std::abs(locked.Pitch));
     const std::uint32_t rows =
         std::min<std::uint32_t>(
             rowCount,
@@ -203,7 +254,26 @@ bool uploadSurfacePixels(
     auto* target =
         static_cast<unsigned char*>(locked.pBits);
     for (std::uint32_t row = 0; row < rows; ++row) {
-        std::memcpy(target, source, copyBytes);
+        if (expandsRgb24(formatBridge)) {
+            const std::uint32_t pixelsInSource = sourcePitch / 3;
+            const std::uint32_t pixelsInTarget = targetPitch / 4;
+            const std::uint32_t pixelsToCopy =
+                std::min<std::uint32_t>(
+                    description.Width,
+                    std::min(pixelsInSource, pixelsInTarget));
+            for (std::uint32_t pixel = 0;
+                 pixel < pixelsToCopy;
+                 ++pixel) {
+                target[pixel * 4] = source[pixel * 3];
+                target[pixel * 4 + 1] = source[pixel * 3 + 1];
+                target[pixel * 4 + 2] = source[pixel * 3 + 2];
+                target[pixel * 4 + 3] = 0xff;
+            }
+        } else {
+            const std::uint32_t copyBytes =
+                std::min<std::uint32_t>(sourcePitch, targetPitch);
+            std::memcpy(target, source, copyBytes);
+        }
         source += sourcePitch;
         target += locked.Pitch;
     }
@@ -251,6 +321,8 @@ void releaseDeviceResources(SugarbombHostD3D9::Impl* impl) {
     releaseMap(impl->surfaces);
     releaseMap(impl->textures);
     releaseMap(impl->cubeTextures);
+    impl->translatedSurfaceFormats.clear();
+    impl->translatedTextureFormats.clear();
     releaseMap(impl->vertexBuffers);
     releaseMap(impl->indexBuffers);
     releaseMap(impl->declarations);
@@ -270,6 +342,74 @@ SugarbombHostD3D9::~SugarbombHostD3D9() {
     delete impl;
 }
 
+bool SugarbombHostD3D9::queryAdapterIdentifier(
+    std::uint32_t adapter,
+    std::uint32_t flags,
+    void* destination,
+    std::size_t byteCount) {
+#ifdef _WIN32
+    constexpr std::size_t IDENTIFIER_BYTES =
+        offsetof(D3DADAPTER_IDENTIFIER9, WHQLLevel) +
+        sizeof(DWORD);
+    static_assert(IDENTIFIER_BYTES == 1100);
+    if (!destination ||
+        byteCount < IDENTIFIER_BYTES ||
+        !ensureDirect3DInterface(impl)) {
+        return false;
+    }
+    D3DADAPTER_IDENTIFIER9 identifier = {};
+    const HRESULT result = impl->direct3D->GetAdapterIdentifier(
+        adapter,
+        flags,
+        &identifier);
+    if (!reportFailure(impl, "GetAdapterIdentifier", result)) {
+        return false;
+    }
+    std::memcpy(
+        destination,
+        &identifier,
+        IDENTIFIER_BYTES);
+    return true;
+#else
+    (void)adapter;
+    (void)flags;
+    (void)destination;
+    (void)byteCount;
+    return false;
+#endif
+}
+
+bool SugarbombHostD3D9::queryDeviceCaps(
+    std::uint32_t adapter,
+    std::uint32_t deviceType,
+    void* destination,
+    std::size_t byteCount) {
+#ifdef _WIN32
+    static_assert(sizeof(D3DCAPS9) == 304);
+    if (!destination ||
+        byteCount < sizeof(D3DCAPS9) ||
+        !ensureDirect3DInterface(impl)) {
+        return false;
+    }
+    D3DCAPS9 caps = {};
+    const HRESULT result = impl->direct3D->GetDeviceCaps(
+        adapter,
+        static_cast<D3DDEVTYPE>(deviceType),
+        &caps);
+    if (!reportFailure(impl, "GetDeviceCaps", result)) {
+        return false;
+    }
+    std::memcpy(destination, &caps, sizeof(caps));
+    return true;
+#else
+    (void)adapter;
+    (void)deviceType;
+    (void)destination;
+    (void)byteCount;
+    return false;
+#endif
+}
+
 bool SugarbombHostD3D9::initialize(
     std::uintptr_t nativeWindow,
     std::uint32_t width,
@@ -282,11 +422,7 @@ bool SugarbombHostD3D9::initialize(
     if (!impl->window) {
         return false;
     }
-    impl->direct3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!impl->direct3D) {
-        std::fprintf(
-            stderr,
-            "Sugarbomb host D3D9: Direct3DCreate9 returned null\n");
+    if (!ensureDirect3DInterface(impl)) {
         return false;
     }
     impl->presentation = {};
@@ -326,7 +462,6 @@ bool SugarbombHostD3D9::initialize(
             &impl->device);
     }
     if (!reportFailure(impl, "CreateDevice", result)) {
-        releaseObject(impl->direct3D);
         return false;
     }
     impl->d3dxModule = LoadLibraryA("d3dx9_38.dll");
@@ -454,13 +589,15 @@ bool SugarbombHostD3D9::createSurface(
         return false;
     }
     releaseResource(guestKey);
+    const SugarbombD3DFormatBridge formatBridge =
+        bridgeTextureFormat(format);
     IDirect3DSurface9* surface = nullptr;
     HRESULT result = D3DERR_INVALIDCALL;
     if (usage & D3DUSAGE_DEPTHSTENCIL) {
         result = impl->device->CreateDepthStencilSurface(
             width,
             height,
-            static_cast<D3DFORMAT>(format),
+            formatBridge.nativeFormat,
             static_cast<D3DMULTISAMPLE_TYPE>(multiSampleType),
             multiSampleQuality,
             TRUE,
@@ -470,7 +607,7 @@ bool SugarbombHostD3D9::createSurface(
         result = impl->device->CreateRenderTarget(
             width,
             height,
-            static_cast<D3DFORMAT>(format),
+            formatBridge.nativeFormat,
             static_cast<D3DMULTISAMPLE_TYPE>(multiSampleType),
             multiSampleQuality,
             FALSE,
@@ -480,7 +617,7 @@ bool SugarbombHostD3D9::createSurface(
         result = impl->device->CreateOffscreenPlainSurface(
             width,
             height,
-            static_cast<D3DFORMAT>(format),
+            formatBridge.nativeFormat,
             static_cast<D3DPOOL>(pool),
             &surface,
             nullptr);
@@ -489,6 +626,9 @@ bool SugarbombHostD3D9::createSurface(
         return false;
     }
     impl->surfaces[guestKey] = surface;
+    if (formatBridge.guestFormat != formatBridge.nativeFormat) {
+        impl->translatedSurfaceFormats[guestKey] = formatBridge;
+    }
     return true;
 #else
     (void)guestKey;
@@ -529,6 +669,11 @@ bool SugarbombHostD3D9::aliasTextureSurface(
         return false;
     }
     impl->surfaces[surfaceKey] = surface;
+    const SugarbombD3DFormatBridge* formatBridge =
+        findFormatBridge(impl->translatedTextureFormats, textureKey);
+    if (formatBridge) {
+        impl->translatedSurfaceFormats[surfaceKey] = *formatBridge;
+    }
     return true;
 #else
     (void)surfaceKey;
@@ -557,13 +702,15 @@ bool SugarbombHostD3D9::createTexture(
         return false;
     }
     releaseResource(guestKey);
+    const SugarbombD3DFormatBridge formatBridge =
+        bridgeTextureFormat(format);
     if (cube) {
         IDirect3DCubeTexture9* texture = nullptr;
         HRESULT result = impl->device->CreateCubeTexture(
             width,
             levels,
             usage,
-            static_cast<D3DFORMAT>(format),
+            formatBridge.nativeFormat,
             static_cast<D3DPOOL>(pool),
             &texture,
             nullptr);
@@ -575,17 +722,21 @@ bool SugarbombHostD3D9::createTexture(
             operation,
             sizeof(operation),
             "CreateCubeTexture(key=0x%08X edge=%u levels=%u "
-            "usage=0x%08X format=0x%08X pool=%u)",
+            "usage=0x%08X format=0x%08X nativeFormat=0x%08X pool=%u)",
             guestKey,
             width,
             levels,
             usage,
             format,
+            static_cast<std::uint32_t>(formatBridge.nativeFormat),
             pool);
         if (!reportFailure(impl, operation, result)) {
             return false;
         }
         impl->cubeTextures[guestKey] = texture;
+        if (formatBridge.guestFormat != formatBridge.nativeFormat) {
+            impl->translatedTextureFormats[guestKey] = formatBridge;
+        }
         return true;
     }
     IDirect3DTexture9* texture = nullptr;
@@ -594,7 +745,7 @@ bool SugarbombHostD3D9::createTexture(
         height,
         levels,
         usage,
-        static_cast<D3DFORMAT>(format),
+        formatBridge.nativeFormat,
         static_cast<D3DPOOL>(pool),
         &texture,
         nullptr);
@@ -606,18 +757,22 @@ bool SugarbombHostD3D9::createTexture(
         operation,
         sizeof(operation),
         "CreateTexture(key=0x%08X size=%ux%u levels=%u "
-        "usage=0x%08X format=0x%08X pool=%u)",
+        "usage=0x%08X format=0x%08X nativeFormat=0x%08X pool=%u)",
         guestKey,
         width,
         height,
         levels,
         usage,
         format,
+        static_cast<std::uint32_t>(formatBridge.nativeFormat),
         pool);
     if (!reportFailure(impl, operation, result)) {
         return false;
     }
     impl->textures[guestKey] = texture;
+    if (formatBridge.guestFormat != formatBridge.nativeFormat) {
+        impl->translatedTextureFormats[guestKey] = formatBridge;
+    }
     return true;
 #else
     (void)guestKey;
@@ -927,6 +1082,8 @@ bool SugarbombHostD3D9::captureBackBuffer(const char* path) {
 
 void SugarbombHostD3D9::releaseResource(std::uint32_t guestKey) {
 #ifdef _WIN32
+    impl->translatedSurfaceFormats.erase(guestKey);
+    impl->translatedTextureFormats.erase(guestKey);
 #define RELEASE_GUEST_OBJECT(objects) \
     do { \
         auto found = impl->objects.find(guestKey); \
@@ -977,6 +1134,7 @@ bool SugarbombHostD3D9::uploadSurface(
         pixels,
         sourcePitch,
         height,
+        findFormatBridge(impl->translatedSurfaceFormats, guestKey),
         operation);
 #else
     (void)guestKey;
@@ -1032,6 +1190,7 @@ bool SugarbombHostD3D9::uploadTexture(
         pixels,
         sourcePitch,
         rowCount,
+        findFormatBridge(impl->translatedTextureFormats, guestKey),
         operation);
     releaseObject(surface);
     return uploaded;

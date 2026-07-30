@@ -17,6 +17,9 @@ class CPU;
 class KThread;
 
 typedef void (*SugarbombNativeCallback)(CPU* cpu);
+typedef void (*SugarbombPageFaultObserver)(
+    KThread* thread,
+    U32 address);
 
 class SugarbombBridge {
 public:
@@ -24,6 +27,8 @@ public:
     static bool dispatch(CPU* cpu, U32 index);
     static bool callbackName(U32 index, std::string& module, std::string& name);
     static std::size_t callbackCount();
+    static void setPageFaultObserver(SugarbombPageFaultObserver observer);
+    static void notifyPageFault(KThread* thread, U32 address);
 #ifdef __TEST
     static void clearForTests();
 #endif

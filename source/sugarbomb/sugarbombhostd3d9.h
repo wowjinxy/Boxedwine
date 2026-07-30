@@ -37,6 +37,16 @@ public:
         std::uintptr_t nativeWindow,
         std::uint32_t width,
         std::uint32_t height);
+    bool queryAdapterIdentifier(
+        std::uint32_t adapter,
+        std::uint32_t flags,
+        void* destination,
+        std::size_t byteCount);
+    bool queryDeviceCaps(
+        std::uint32_t adapter,
+        std::uint32_t deviceType,
+        void* destination,
+        std::size_t byteCount);
     bool reset(std::uint32_t width, std::uint32_t height);
     bool ready() const;
     void shutdown();

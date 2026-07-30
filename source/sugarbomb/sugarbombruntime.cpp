@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -932,6 +933,7 @@ private:
         memory->memset(ENV_BASE, 0, ENV_SIZE);
 
         activeSession = this;
+        SugarbombBridge::setPageFaultObserver(observePageFault);
         if (!Pe32Loader::mapImageWithImports(
                 thread,
                 bytes,
@@ -2554,6 +2556,10 @@ private:
     }
 
     void cleanup() {
+        SugarbombBridge::setPageFaultObserver(nullptr);
+        if (activeSession == this) {
+            activeSession = nullptr;
+        }
         for (auto& entry : directInputObjects) {
             hostDirectInput.releaseDevice(
                 entry.second.nativeDevice);
@@ -3415,7 +3421,7 @@ private:
         return nullptr;
     }
 
-    void traceFalloutFactoryBoundary(CPU* guestCpu) {
+    bool falloutFactoryTraceRequested() {
         if (!falloutFactoryTraceConfigured) {
             falloutFactoryTraceConfigured = true;
             const char* configured =
@@ -3425,38 +3431,120 @@ private:
                 *configured &&
                 std::strcmp(configured, "0") != 0;
         }
-        if (!falloutFactoryTraceEnabled ||
-            !guestCpu ||
-            falloutFactoryTraceCount >= 256) {
+        return falloutFactoryTraceEnabled;
+    }
+
+    static void observePageFault(
+        KThread* guestThread,
+        U32 address) {
+        if (activeSession) {
+            activeSession->traceFalloutFactoryPageFault(
+                guestThread,
+                address);
+        }
+    }
+
+    void traceFalloutFactoryPageFault(
+        KThread* guestThread,
+        U32 address) {
+        constexpr U32 SHADER_ASSIGNMENT_FAULT = 0x00b57aa9;
+        constexpr U32 FACTORY_READY = 0x011f9508;
+        constexpr U32 FACTORY_CACHE = 0x011f9548;
+        if (!falloutFactoryTraceRequested() ||
+            !guestThread ||
+            guestThread->memory != memory ||
+            !guestThread->cpu) {
+            return;
+        }
+        CPU* guestCpu = guestThread->cpu;
+        const U32 eip = guestCpu->getEipAddress();
+        if (eip != SHADER_ASSIGNMENT_FAULT) {
             return;
         }
 
-        constexpr U32 FACTORY_ENTRY = 0x00b55560;
-        constexpr U32 CALLER_BEGIN = 0x00b57a60;
-        constexpr U32 CALLER_END = 0x00b57ab0;
+        const U32 property = guestCpu->reg[3].u32;
+        const U32 object = guestCpu->reg[7].u32;
+        U32 factoryType = 0xffffffff;
+        U32 propertyVtable = 0xffffffff;
+        if (property <= 0xffffffff - 0x58 &&
+            memory->canRead(property, 4) &&
+            memory->canRead(property + 0x58, 4)) {
+            propertyVtable = memory->readd(property);
+            factoryType = memory->readd(property + 0x58);
+        }
+        U32 ready = 0xffffffff;
+        if (memory->canRead(FACTORY_READY, 4)) {
+            ready = memory->readd(FACTORY_READY);
+        }
+        U32 cached = 0xffffffff;
+        if (factoryType <= 0x22 &&
+            memory->canRead(
+                FACTORY_CACHE + factoryType * 4,
+                4)) {
+            cached = memory->readd(
+                FACTORY_CACHE + factoryType * 4);
+        }
+        U32 objectVtable = 0xffffffff;
+        U32 objectNameAddress = 0;
+        if (object <= 0xffffffff - 11 &&
+            memory->canRead(object, 12)) {
+            objectVtable = memory->readd(object);
+            objectNameAddress = memory->readd(object + 8);
+        }
+        char objectName[65] = {};
+        if (objectNameAddress <= 0xffffffff - sizeof(objectName)) {
+            for (U32 index = 0;
+                 index + 1 < sizeof(objectName) &&
+                 memory->canRead(objectNameAddress + index, 1);
+                 ++index) {
+                objectName[index] =
+                    static_cast<char>(
+                        memory->readb(objectNameAddress + index));
+                if (!objectName[index]) {
+                    break;
+                }
+            }
+        }
+        std::fprintf(
+            stderr,
+            "Sugarbomb Fallout factory probe: page fault "
+            "EIP=0x%08X address=0x%08X type=0x%08X "
+            "ready=0x%08X cache=0x%08X EAX=0x%08X "
+            "EBX=0x%08X EDI=0x%08X "
+            "propertyVtable=0x%08X objectVtable=0x%08X "
+            "objectName=\"%s\"\n",
+            eip,
+            address,
+            factoryType,
+            ready,
+            cached,
+            guestCpu->reg[0].u32,
+            property,
+            object,
+            propertyVtable,
+            objectVtable,
+            objectName);
+        std::fflush(stderr);
+    }
+
+    void traceFalloutFactoryBoundary(CPU* guestCpu) {
+        if (!falloutFactoryTraceRequested() || !guestCpu) {
+            return;
+        }
+
         constexpr U32 CALLER_RETURN = 0x00b57aa1;
         constexpr U32 FACTORY_READY = 0x011f9508;
         constexpr U32 FACTORY_CACHE = 0x011f9548;
         const U32 eip = guestCpu->getEipAddress();
-        const U32 stack = guestCpu->reg[4].u32;
-        U32 returnAddress = 0;
-        U32 factoryType = 0xffffffff;
-        if (eip == FACTORY_ENTRY &&
-            memory->canRead(stack, 8)) {
-            returnAddress = memory->readd(stack);
-            factoryType = memory->readd(stack + 4);
-            if (returnAddress != CALLER_RETURN) {
-                return;
-            }
-        } else if (eip >= CALLER_BEGIN &&
-                   eip <= CALLER_END) {
-            const U32 owner = guestCpu->reg[3].u32;
-            if (owner <= 0xffffffff - 0x58 &&
-                memory->canRead(owner + 0x58, 4)) {
-                factoryType = memory->readd(owner + 0x58);
-            }
-        } else {
+        if (eip != CALLER_RETURN) {
             return;
+        }
+        const U32 stack = guestCpu->reg[4].u32;
+        U32 factoryType = 0xffffffff;
+        const U32 property = guestCpu->reg[3].u32;
+        if (property <= 0xffffffff - 0x58 &&
+            memory->canRead(property + 0x58, 4)) {
+            factoryType = memory->readd(property + 0x58);
         }
 
         U32 ready = 0xffffffff;
@@ -3471,15 +3559,77 @@ private:
             cached = memory->readd(
                 FACTORY_CACHE + factoryType * 4);
         }
+        const U32 object = guestCpu->reg[7].u32;
+        const U32 result = guestCpu->reg[0].u32;
+        const bool nullResult = result == 0;
+        const U64 factoryTypeBit =
+            factoryType <= 0x22
+                ? (static_cast<U64>(1) << factoryType)
+                : 0;
+        if (!nullResult &&
+            factoryTypeBit &&
+            (falloutFactorySuccessfulTypes & factoryTypeBit)) {
+            return;
+        }
+        if (nullResult && falloutFactoryNullTraceCount >= 64) {
+            return;
+        }
+        if (!nullResult && falloutFactoryTraceCount >= 256) {
+            return;
+        }
+        if (eip == falloutFactoryLastTraceEip &&
+            stack == falloutFactoryLastTraceStack &&
+            result == falloutFactoryLastTraceResult &&
+            property == falloutFactoryLastTraceProperty &&
+            object == falloutFactoryLastTraceObject) {
+            return;
+        }
+        U32 propertyVtable = 0xffffffff;
+        if (property <= 0xffffffff - 3 &&
+            memory->canRead(property, 4)) {
+            propertyVtable = memory->readd(property);
+        }
+        U32 objectVtable = 0xffffffff;
+        U32 objectNameAddress = 0;
+        if (object <= 0xffffffff - 11 &&
+            memory->canRead(object, 12)) {
+            objectVtable = memory->readd(object);
+            objectNameAddress = memory->readd(object + 8);
+        }
+        char objectName[65] = {};
+        if (objectNameAddress) {
+            for (U32 index = 0;
+                 index + 1 < sizeof(objectName) &&
+                 memory->canRead(objectNameAddress + index, 1);
+                 ++index) {
+                objectName[index] =
+                    static_cast<char>(
+                        memory->readb(objectNameAddress + index));
+                if (!objectName[index]) {
+                    break;
+                }
+            }
+        }
         ++falloutFactoryTraceCount;
+        if (nullResult) {
+            ++falloutFactoryNullTraceCount;
+        } else {
+            falloutFactorySuccessfulTypes |= factoryTypeBit;
+        }
+        falloutFactoryLastTraceEip = eip;
+        falloutFactoryLastTraceStack = stack;
+        falloutFactoryLastTraceResult = result;
+        falloutFactoryLastTraceProperty = property;
+        falloutFactoryLastTraceObject = object;
         std::fprintf(
             stderr,
-            "Sugarbomb Fallout factory probe: EIP=0x%08X "
-            "return=0x%08X type=0x%08X ready=0x%08X "
+            "Sugarbomb Fallout factory probe: result EIP=0x%08X "
+            "type=0x%08X ready=0x%08X "
             "cache=0x%08X EAX=0x%08X EBX=0x%08X "
-            "ESI=0x%08X EDI=0x%08X ESP=0x%08X\n",
+            "ESI=0x%08X EDI=0x%08X ESP=0x%08X "
+            "propertyVtable=0x%08X objectVtable=0x%08X "
+            "objectName=\"%s\"\n",
             eip,
-            returnAddress,
             factoryType,
             ready,
             cached,
@@ -3487,7 +3637,10 @@ private:
             guestCpu->reg[3].u32,
             guestCpu->reg[6].u32,
             guestCpu->reg[7].u32,
-            stack);
+            stack,
+            propertyVtable,
+            objectVtable,
+            objectName);
     }
 
     void runGuestThreadSlice(GuestThreadState& state) {
@@ -3984,6 +4137,9 @@ private:
         }
         if (symbol == "GetSystemTimeAsFileTime") {
             callback = callbackGetSystemTimeAsFileTime;
+            stackCleanupBytes = 4;
+        } else if (symbol == "GetLocalTime") {
+            callback = callbackGetLocalTime;
             stackCleanupBytes = 4;
         } else if (symbol == "GetCurrentProcessId") {
             callback = callbackGetCurrentProcessId;
@@ -9360,8 +9516,23 @@ private:
         memory->writed(destination + 12, 22); // D3DFMT_X8R8G8B8
     }
 
-    void writeDirect3DCaps(U32 destination) {
+    void writeDirect3DCaps(
+        U32 destination,
+        U32 adapter = 0,
+        U32 deviceType = 1) {
         if (!destination) {
+            return;
+        }
+        std::array<U8, 304> nativeCaps = {};
+        if (hostDirect3D.queryDeviceCaps(
+                adapter,
+                deviceType,
+                nativeCaps.data(),
+                nativeCaps.size())) {
+            memory->memcpy(
+                destination,
+                nativeCaps.data(),
+                static_cast<U32>(nativeCaps.size()));
             return;
         }
         memory->memset(destination, 0, 304);
@@ -9474,16 +9645,51 @@ private:
                     cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                     return;
                 }
-                memory->memset(identifier, 0, 1100);
-                memory->strcpy(identifier, "sugarbomb-d3d9");
-                std::string description = configuredDirect3DDeviceName();
-                memory->strcpy(identifier + 512, description.c_str());
-                memory->strcpy(identifier + 1024, "\\\\.\\DISPLAY1");
-                memory->writed(identifier + 1064, 0x1414);
-                memory->writed(identifier + 1068, 0x0009);
-                printf(
-                    "Sugarbomb D3D9: adapter description \"%s\"\n",
-                    description.c_str());
+                std::array<U8, 1100> nativeIdentifier = {};
+                if (hostDirect3D.queryAdapterIdentifier(
+                        argument(cpu, 1),
+                        argument(cpu, 2),
+                        nativeIdentifier.data(),
+                        nativeIdentifier.size())) {
+                    memory->memcpy(
+                        identifier,
+                        nativeIdentifier.data(),
+                        static_cast<U32>(
+                            nativeIdentifier.size()));
+                    U32 vendorId = 0;
+                    U32 deviceId = 0;
+                    std::memcpy(
+                        &vendorId,
+                        nativeIdentifier.data() + 1064,
+                        sizeof(vendorId));
+                    std::memcpy(
+                        &deviceId,
+                        nativeIdentifier.data() + 1068,
+                        sizeof(deviceId));
+                    printf(
+                        "Sugarbomb D3D9: native adapter driver \"%s\", "
+                        "description \"%s\", vendor=0x%04X, "
+                        "device=0x%04X\n",
+                        reinterpret_cast<const char*>(
+                            nativeIdentifier.data()),
+                        reinterpret_cast<const char*>(
+                            nativeIdentifier.data() + 512),
+                        vendorId,
+                        deviceId);
+                } else {
+                    memory->memset(identifier, 0, 1100);
+                    memory->strcpy(identifier, "sugarbomb-d3d9");
+                    std::string description =
+                        configuredDirect3DDeviceName();
+                    memory->strcpy(identifier + 512, description.c_str());
+                    memory->strcpy(identifier + 1024, "\\\\.\\DISPLAY1");
+                    memory->writed(identifier + 1064, 0x1414);
+                    memory->writed(identifier + 1068, 0x0009);
+                    printf(
+                        "Sugarbomb D3D9: synthetic adapter "
+                        "description \"%s\"\n",
+                        description.c_str());
+                }
                 cpu->reg[0].u32 = D3D_OK;
                 return;
             }
@@ -9520,7 +9726,10 @@ private:
                 if (!argument(cpu, 3)) {
                     cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                 } else {
-                    writeDirect3DCaps(argument(cpu, 3));
+                    writeDirect3DCaps(
+                        argument(cpu, 3),
+                        argument(cpu, 1),
+                        argument(cpu, 2));
                     cpu->reg[0].u32 = D3D_OK;
                 }
                 return;
@@ -11650,6 +11859,60 @@ private:
         U32 destination = argument(cpu, 0);
         U64 fileTime = KSystem::getSystemTimeAsMicroSeconds() * 10 + WINDOWS_TO_UNIX_EPOCH_100NS;
         session->memory->writeq(destination, fileTime);
+    }
+
+    static void callbackGetLocalTime(CPU* cpu) {
+        SugarbombRuntimeSession* session =
+            current(cpu, "KERNEL32!GetLocalTime");
+        if (!session) {
+            return;
+        }
+        constexpr U32 SYSTEM_TIME_SIZE = 16;
+        U32 destination = argument(cpu, 0);
+        if (!destination ||
+            !session->memory->canWrite(
+                destination,
+                SYSTEM_TIME_SIZE)) {
+            return;
+        }
+        const U64 microseconds =
+            KSystem::getSystemTimeAsMicroSeconds();
+        std::time_t seconds =
+            static_cast<std::time_t>(microseconds / 1000000);
+        std::tm localTime = {};
+#ifdef _WIN32
+        if (localtime_s(&localTime, &seconds) != 0) {
+            return;
+        }
+#else
+        if (!localtime_r(&seconds, &localTime)) {
+            return;
+        }
+#endif
+        session->memory->writew(
+            destination,
+            static_cast<U16>(localTime.tm_year + 1900));
+        session->memory->writew(
+            destination + 2,
+            static_cast<U16>(localTime.tm_mon + 1));
+        session->memory->writew(
+            destination + 4,
+            static_cast<U16>(localTime.tm_wday));
+        session->memory->writew(
+            destination + 6,
+            static_cast<U16>(localTime.tm_mday));
+        session->memory->writew(
+            destination + 8,
+            static_cast<U16>(localTime.tm_hour));
+        session->memory->writew(
+            destination + 10,
+            static_cast<U16>(localTime.tm_min));
+        session->memory->writew(
+            destination + 12,
+            static_cast<U16>(localTime.tm_sec));
+        session->memory->writew(
+            destination + 14,
+            static_cast<U16>((microseconds / 1000) % 1000));
     }
 
     static void callbackGetCurrentProcessId(CPU* cpu) {
@@ -19921,6 +20184,13 @@ private:
     bool falloutFactoryTraceConfigured = false;
     bool falloutFactoryTraceEnabled = false;
     U32 falloutFactoryTraceCount = 0;
+    U32 falloutFactoryNullTraceCount = 0;
+    U64 falloutFactorySuccessfulTypes = 0;
+    U32 falloutFactoryLastTraceEip = 0;
+    U32 falloutFactoryLastTraceStack = 0;
+    U32 falloutFactoryLastTraceResult = 0;
+    U32 falloutFactoryLastTraceProperty = 0;
+    U32 falloutFactoryLastTraceObject = 0;
     U32 processorFeatureTraceCount = 0;
     U32 virtualProtectTraceCount = 0;
     U32 flushInstructionCacheTraceCount = 0;

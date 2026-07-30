@@ -414,13 +414,48 @@ void testSugarbombHostWindowLifecycle() {
         reinterpret_cast<HWND>(window.nativeHandle());
     {
         SugarbombHostD3D9 renderer;
+        std::vector<U8> adapterIdentifier(1100);
+        if (!renderer.queryAdapterIdentifier(
+                0,
+                0,
+                adapterIdentifier.data(),
+                adapterIdentifier.size()) ||
+            !adapterIdentifier[0] ||
+            !adapterIdentifier[512]) {
+            testFail(
+                "Sugarbomb could not query the native D3D9 adapter "
+                "identity before device creation");
+        }
+        std::vector<U8> caps(304);
+        U32 maxVertexShaderInstructions = 0;
+        if (!renderer.queryDeviceCaps(
+                0,
+                1,
+                caps.data(),
+                caps.size())) {
+            testFail(
+                "Sugarbomb could not query native D3D9 device caps "
+                "before device creation");
+        } else {
+            std::memcpy(
+                &maxVertexShaderInstructions,
+                caps.data() + 280,
+                sizeof(maxVertexShaderInstructions));
+            if (!maxVertexShaderInstructions) {
+                testFail(
+                    "Sugarbomb native D3D9 caps reported no vertex "
+                    "shader instruction capacity");
+            }
+        }
         if (renderer.initialize(
                 window.nativeHandle(),
                 320,
                 200)) {
             constexpr U32 TEST_TEXTURE = 0x57001000;
+            constexpr U32 TEST_RGB24_TEXTURE = 0x57002000;
             constexpr U32 TEST_TEXTURE_SIZE = 16;
             constexpr U32 D3DFMT_A8R8G8B8 = 21;
+            constexpr U32 D3DFMT_R8G8B8 = 20;
             constexpr U32 D3DPOOL_DEFAULT = 0;
             U32 nativeResult = 0;
             if (!renderer.createTexture(
@@ -450,6 +485,42 @@ void testSugarbombHostWindowLifecycle() {
                     testFail(
                         "Sugarbomb could not stage a guest CPU upload "
                         "into a default-pool native texture");
+                }
+            }
+            nativeResult = 0;
+            if (!renderer.createTexture(
+                    TEST_RGB24_TEXTURE,
+                    TEST_TEXTURE_SIZE,
+                    TEST_TEXTURE_SIZE,
+                    1,
+                    0,
+                    D3DFMT_R8G8B8,
+                    D3DPOOL_DEFAULT,
+                    false,
+                    &nativeResult)) {
+                testFail(
+                    "Sugarbomb could not bridge a guest RGB24 texture "
+                    "to a supported native format");
+            } else {
+                std::vector<U8> pixels(
+                    TEST_TEXTURE_SIZE * TEST_TEXTURE_SIZE * 3);
+                for (std::size_t offset = 0;
+                     offset < pixels.size();
+                     offset += 3) {
+                    pixels[offset] = 0x32;
+                    pixels[offset + 1] = 0x7f;
+                    pixels[offset + 2] = 0x4a;
+                }
+                if (!renderer.uploadTexture(
+                        TEST_RGB24_TEXTURE,
+                        0,
+                        0,
+                        pixels.data(),
+                        TEST_TEXTURE_SIZE * 3,
+                        TEST_TEXTURE_SIZE)) {
+                    testFail(
+                        "Sugarbomb could not expand a guest RGB24 "
+                        "upload into its native 32-bit texture");
                 }
             }
         }

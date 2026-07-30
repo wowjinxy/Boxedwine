@@ -135,11 +135,30 @@ The host resource contract has since been corrected: CPU writes to
 `D3DPOOL_DEFAULT` surfaces and texture levels use a lockable system-memory
 staging surface followed by native `UpdateSurface`, while failed native
 texture or vertex/index-buffer creation returns its actual HRESULT and a null
-guest output instead of leaving a successful-looking unbacked COM object. A
-focused native D3D9 regression now creates and uploads a default-pool texture,
-and a normal foreground Fallout launch reaches the rendered startup path
-without the former `CreateTexture` or `LockRect` invalid-call stream. The
-world-loading path still needs to be rerun through this corrected boundary.
+guest output instead of leaving a successful-looking unbacked COM object.
+Guest-visible `D3DFMT_R8G8B8` resources retain their three-byte BGR lock pitch
+and layout, while the x64 host backs them with `D3DFMT_X8R8G8B8` and expands
+each upload at the native boundary because the Windows D3D9 device rejects the
+24-bit texture format. A focused native D3D9 regression creates and uploads
+both ordinary and bridged RGB24 default-pool textures. A normal foreground
+Fallout launch reaches the rendered startup path without the former
+`CreateTexture` or `LockRect` invalid-call stream. The next world-loading run
+removed all seven RGB24 creation failures and isolated the following guest
+fault at `0x00B57AA9`: the `FaceGenHairNoHat` object requested shader type
+`0x1D`, but Fallout's shader cache and returned `EAX` were null.
+
+That null was caused by adapter emulation rather than a missing shader bridge.
+Fallout enables its 3.0-lighting shader factory only when the D3D9 driver name
+starts with `nv`, `ati`, or `ig` and the reported instruction capacity is
+adequate. Sugarbomb previously combined high synthetic caps with the invented
+driver name `sugarbomb-d3d9`, so Fallout deliberately left type `0x1D`
+disabled. Adapter identity and `D3DCAPS9` now come from the real x64 D3D9
+interface before device creation, with the synthetic values retained only as
+a platform fallback. A clean native-app launch reports `nvldumdx.dll`,
+`NVIDIA GeForce RTX 3070`, vendor `0x10DE`, device `0x2488`, becomes foreground
+through normal `ShowWindow` policy, and creates Fallout's 1920x1080 device.
+The next world-loading validation will verify the game-created type `0x1D`
+shader and continue from the next compatibility boundary.
 
 The staged xNVSE 6.4.8 runtime now initializes automatically at Fallout's real
 WinMain boundary. A bounded headless smoke run completes both PE TLS callbacks,
