@@ -64,14 +64,16 @@ public:
         std::uint32_t usage,
         std::uint32_t format,
         std::uint32_t pool,
-        bool cube);
+        bool cube,
+        std::uint32_t* nativeResult = nullptr);
     bool createBuffer(
         std::uint32_t guestKey,
         std::uint32_t length,
         std::uint32_t usage,
         std::uint32_t format,
         std::uint32_t pool,
-        bool indexBuffer);
+        bool indexBuffer,
+        std::uint32_t* nativeResult = nullptr);
     bool createVertexDeclaration(
         std::uint32_t guestKey,
         const void* elements,

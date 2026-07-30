@@ -13,6 +13,7 @@
 
 #include "pe32loader.h"
 #include "sugarbombbridge.h"
+#include "../../sugarbomb/sugarbombhostd3d9.h"
 #include "../../sugarbomb/sugarbombhostwindow.h"
 #include "../cpu/testCPU.h"
 #include "testPe32Loader.h"
@@ -411,6 +412,48 @@ void testSugarbombHostWindowLifecycle() {
 
     HWND nativeWindow =
         reinterpret_cast<HWND>(window.nativeHandle());
+    {
+        SugarbombHostD3D9 renderer;
+        if (renderer.initialize(
+                window.nativeHandle(),
+                320,
+                200)) {
+            constexpr U32 TEST_TEXTURE = 0x57001000;
+            constexpr U32 TEST_TEXTURE_SIZE = 16;
+            constexpr U32 D3DFMT_A8R8G8B8 = 21;
+            constexpr U32 D3DPOOL_DEFAULT = 0;
+            U32 nativeResult = 0;
+            if (!renderer.createTexture(
+                    TEST_TEXTURE,
+                    TEST_TEXTURE_SIZE,
+                    TEST_TEXTURE_SIZE,
+                    1,
+                    0,
+                    D3DFMT_A8R8G8B8,
+                    D3DPOOL_DEFAULT,
+                    false,
+                    &nativeResult)) {
+                testFail(
+                    "Sugarbomb could not create a default-pool native "
+                    "texture for staged upload validation");
+            } else {
+                std::vector<U32> pixels(
+                    TEST_TEXTURE_SIZE * TEST_TEXTURE_SIZE,
+                    0xff4a7f32);
+                if (!renderer.uploadTexture(
+                        TEST_TEXTURE,
+                        0,
+                        0,
+                        pixels.data(),
+                        TEST_TEXTURE_SIZE * sizeof(U32),
+                        TEST_TEXTURE_SIZE)) {
+                    testFail(
+                        "Sugarbomb could not stage a guest CPU upload "
+                        "into a default-pool native texture");
+                }
+            }
+        }
+    }
     if (!MoveWindow(
             nativeWindow,
             0,

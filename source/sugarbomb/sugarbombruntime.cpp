@@ -515,6 +515,7 @@ private:
         U32 lockLevel = 0;
         U32 lockPitch = 0;
         U32 lockRows = 0;
+        bool nativeBacked = false;
     };
 
     struct Direct3DResourceMethod {
@@ -3414,12 +3415,89 @@ private:
         return nullptr;
     }
 
+    void traceFalloutFactoryBoundary(CPU* guestCpu) {
+        if (!falloutFactoryTraceConfigured) {
+            falloutFactoryTraceConfigured = true;
+            const char* configured =
+                std::getenv("SUGARBOMB_TRACE_FALLOUT_FACTORY");
+            falloutFactoryTraceEnabled =
+                configured &&
+                *configured &&
+                std::strcmp(configured, "0") != 0;
+        }
+        if (!falloutFactoryTraceEnabled ||
+            !guestCpu ||
+            falloutFactoryTraceCount >= 256) {
+            return;
+        }
+
+        constexpr U32 FACTORY_ENTRY = 0x00b55560;
+        constexpr U32 CALLER_BEGIN = 0x00b57a60;
+        constexpr U32 CALLER_END = 0x00b57ab0;
+        constexpr U32 CALLER_RETURN = 0x00b57aa1;
+        constexpr U32 FACTORY_READY = 0x011f9508;
+        constexpr U32 FACTORY_CACHE = 0x011f9548;
+        const U32 eip = guestCpu->getEipAddress();
+        const U32 stack = guestCpu->reg[4].u32;
+        U32 returnAddress = 0;
+        U32 factoryType = 0xffffffff;
+        if (eip == FACTORY_ENTRY &&
+            memory->canRead(stack, 8)) {
+            returnAddress = memory->readd(stack);
+            factoryType = memory->readd(stack + 4);
+            if (returnAddress != CALLER_RETURN) {
+                return;
+            }
+        } else if (eip >= CALLER_BEGIN &&
+                   eip <= CALLER_END) {
+            const U32 owner = guestCpu->reg[3].u32;
+            if (owner <= 0xffffffff - 0x58 &&
+                memory->canRead(owner + 0x58, 4)) {
+                factoryType = memory->readd(owner + 0x58);
+            }
+        } else {
+            return;
+        }
+
+        U32 ready = 0xffffffff;
+        if (memory->canRead(FACTORY_READY, 4)) {
+            ready = memory->readd(FACTORY_READY);
+        }
+        U32 cached = 0xffffffff;
+        if (factoryType <= 0x22 &&
+            memory->canRead(
+                FACTORY_CACHE + factoryType * 4,
+                4)) {
+            cached = memory->readd(
+                FACTORY_CACHE + factoryType * 4);
+        }
+        ++falloutFactoryTraceCount;
+        std::fprintf(
+            stderr,
+            "Sugarbomb Fallout factory probe: EIP=0x%08X "
+            "return=0x%08X type=0x%08X ready=0x%08X "
+            "cache=0x%08X EAX=0x%08X EBX=0x%08X "
+            "ESI=0x%08X EDI=0x%08X ESP=0x%08X\n",
+            eip,
+            returnAddress,
+            factoryType,
+            ready,
+            cached,
+            guestCpu->reg[0].u32,
+            guestCpu->reg[3].u32,
+            guestCpu->reg[6].u32,
+            guestCpu->reg[7].u32,
+            stack);
+    }
+
     void runGuestThreadSlice(GuestThreadState& state) {
         CPU* previousCpu = activeCpu;
         KThread* previousThread = KThread::currentThread();
         activeCpu = state.thread->cpu;
         KThread::setCurrentThread(state.thread);
+        traceFalloutFactoryBoundary(activeCpu);
         activeCpu->run();
+        traceFalloutFactoryBoundary(activeCpu);
         ++runSlices;
         lastGuestEip = activeCpu->getEipAddress();
         if (state.thread->terminating && !state.completed) {
@@ -9124,8 +9202,15 @@ private:
         U32 format = 22,
         U32 usage = 0,
         U32 pool = 0,
-        U32 length = 0) {
+        U32 length = 0,
+        U32* creationResult = nullptr) {
+        if (creationResult) {
+            *creationResult = 0;
+        }
         if (!ensureDirect3DVtables()) {
+            if (creationResult) {
+                *creationResult = 0x8007000e;
+            }
             return 0;
         }
         auto vtable = direct3DResourceVtableAddresses.find(
@@ -9135,6 +9220,9 @@ private:
         }
         U32 objectAddress = allocateGuestHeap(8, true);
         if (!objectAddress) {
+            if (creationResult) {
+                *creationResult = 0x8007000e;
+            }
             return 0;
         }
         Direct3DResource resource;
@@ -9150,10 +9238,14 @@ private:
         direct3DResources[objectAddress] = resource;
         memory->writed(objectAddress, vtable->second);
         memory->writed(objectAddress + 4, 1);
+        bool nativeCreationAttempted = false;
+        bool nativeCreated = true;
         if ((kind == Direct3DResourceKind::Texture ||
              kind == Direct3DResourceKind::CubeTexture) &&
-            resourceType != 4) {
-            hostDirect3D.createTexture(
+            resourceType != 4 &&
+            hostDirect3D.ready()) {
+            nativeCreationAttempted = true;
+            nativeCreated = hostDirect3D.createTexture(
                 objectAddress,
                 resource.width,
                 resource.height,
@@ -9161,16 +9253,27 @@ private:
                 resource.usage,
                 resource.format,
                 resource.pool,
-                kind == Direct3DResourceKind::CubeTexture);
-        } else if (kind == Direct3DResourceKind::Buffer) {
-            hostDirect3D.createBuffer(
+                kind == Direct3DResourceKind::CubeTexture,
+                creationResult);
+        } else if (kind == Direct3DResourceKind::Buffer &&
+                   hostDirect3D.ready()) {
+            nativeCreationAttempted = true;
+            nativeCreated = hostDirect3D.createBuffer(
                 objectAddress,
                 resource.length,
                 resource.usage,
                 resource.format,
                 resource.pool,
-                resourceType == 7);
+                resourceType == 7,
+                creationResult);
         }
+        if (nativeCreationAttempted && !nativeCreated) {
+            direct3DResources.erase(objectAddress);
+            freeGuestHeap(objectAddress);
+            return 0;
+        }
+        direct3DResources[objectAddress].nativeBacked =
+            nativeCreationAttempted;
         return objectAddress;
     }
 
@@ -9939,10 +10042,12 @@ private:
             U32 format = argument(cpu, method.index == 24 ? 6 : (method.index == 25 ? 4 : 5));
             U32 pool = argument(cpu, method.index == 24 ? 7 : (method.index == 25 ? 5 : 6));
             U32 resultAddress = argument(cpu, method.index == 24 ? 8 : (method.index == 25 ? 6 : 7));
-            if (!resultAddress) {
+            if (!resultAddress ||
+                !memory->canWrite(resultAddress, 4)) {
                 cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                 return;
             }
+            U32 creationResult = 0;
             U32 resource = createDirect3DResource(
                 kind,
                 resourceType,
@@ -9951,18 +10056,26 @@ private:
                 levels,
                 format,
                 usage,
-                pool);
+                pool,
+                0,
+                &creationResult);
             memory->writed(resultAddress, resource);
-            cpu->reg[0].u32 = resource ? D3D_OK : 0x8007000e;
+            cpu->reg[0].u32 = resource
+                ? D3D_OK
+                : (creationResult
+                    ? creationResult
+                    : 0x8007000e);
             return;
         }
         case 26: // CreateVertexBuffer
         case 27: { // CreateIndexBuffer
             U32 resultAddress = argument(cpu, 5);
-            if (!resultAddress) {
+            if (!resultAddress ||
+                !memory->canWrite(resultAddress, 4)) {
                 cpu->reg[0].u32 = D3DERR_INVALIDCALL;
                 return;
             }
+            U32 creationResult = 0;
             U32 resource = createDirect3DResource(
                 Direct3DResourceKind::Buffer,
                 method.index == 26 ? 6 : 7,
@@ -9972,9 +10085,14 @@ private:
                 method.index == 27 ? argument(cpu, 3) : 0,
                 argument(cpu, 2),
                 argument(cpu, 4),
-                argument(cpu, 1));
+                argument(cpu, 1),
+                &creationResult);
             memory->writed(resultAddress, resource);
-            cpu->reg[0].u32 = resource ? D3D_OK : 0x8007000e;
+            cpu->reg[0].u32 = resource
+                ? D3D_OK
+                : (creationResult
+                    ? creationResult
+                    : 0x8007000e);
             return;
         }
         case 59: // CreateStateBlock
@@ -19800,6 +19918,9 @@ private:
     U32 directInputStateCallTraceCount = 0;
     U32 directInputDataCallTraceCount = 0;
     U32 direct3DCursorTraceCount = 0;
+    bool falloutFactoryTraceConfigured = false;
+    bool falloutFactoryTraceEnabled = false;
+    U32 falloutFactoryTraceCount = 0;
     U32 processorFeatureTraceCount = 0;
     U32 virtualProtectTraceCount = 0;
     U32 flushInstructionCacheTraceCount = 0;

@@ -130,6 +130,103 @@ bool reportFailure(
     return SUCCEEDED(result);
 }
 
+std::uint32_t surfaceRowCount(
+    D3DFORMAT format,
+    std::uint32_t height) {
+    switch (format) {
+    case D3DFMT_DXT1:
+    case D3DFMT_DXT2:
+    case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
+    case D3DFMT_DXT5:
+        return std::max<std::uint32_t>(1, (height + 3) / 4);
+    default:
+        return height;
+    }
+}
+
+bool uploadSurfacePixels(
+    SugarbombHostD3D9::Impl* impl,
+    IDirect3DSurface9* destination,
+    const void* pixels,
+    std::uint32_t sourcePitch,
+    std::uint32_t rowCount,
+    const char* operation) {
+    if (!impl || !impl->device || !destination ||
+        !pixels || !sourcePitch || !rowCount) {
+        return false;
+    }
+
+    D3DSURFACE_DESC description = {};
+    HRESULT result = destination->GetDesc(&description);
+    if (!reportFailure(impl, operation, result)) {
+        return false;
+    }
+
+    IDirect3DSurface9* staging = nullptr;
+    IDirect3DSurface9* writable = destination;
+    const bool needsStaging =
+        description.Pool == D3DPOOL_DEFAULT &&
+        !(description.Usage & D3DUSAGE_DYNAMIC);
+    if (needsStaging) {
+        result = impl->device->CreateOffscreenPlainSurface(
+            description.Width,
+            description.Height,
+            description.Format,
+            D3DPOOL_SYSTEMMEM,
+            &staging,
+            nullptr);
+        if (!reportFailure(impl, operation, result)) {
+            return false;
+        }
+        writable = staging;
+    }
+
+    D3DLOCKED_RECT locked = {};
+    result = writable->LockRect(&locked, nullptr, 0);
+    if (!reportFailure(impl, operation, result)) {
+        releaseObject(staging);
+        return false;
+    }
+    const std::uint32_t copyBytes =
+        std::min<std::uint32_t>(
+            sourcePitch,
+            static_cast<std::uint32_t>(std::abs(locked.Pitch)));
+    const std::uint32_t rows =
+        std::min<std::uint32_t>(
+            rowCount,
+            surfaceRowCount(
+                description.Format,
+                description.Height));
+    const auto* source =
+        static_cast<const unsigned char*>(pixels);
+    auto* target =
+        static_cast<unsigned char*>(locked.pBits);
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        std::memcpy(target, source, copyBytes);
+        source += sourcePitch;
+        target += locked.Pitch;
+    }
+    result = writable->UnlockRect();
+    if (!reportFailure(impl, operation, result)) {
+        releaseObject(staging);
+        return false;
+    }
+
+    if (needsStaging) {
+        result = impl->device->UpdateSurface(
+            staging,
+            nullptr,
+            destination,
+            nullptr);
+        releaseObject(staging);
+        if (!reportFailure(impl, operation, result)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename T>
 T* findObject(
     const std::unordered_map<std::uint32_t, T*>& objects,
@@ -450,8 +547,12 @@ bool SugarbombHostD3D9::createTexture(
     std::uint32_t usage,
     std::uint32_t format,
     std::uint32_t pool,
-    bool cube) {
+    bool cube,
+    std::uint32_t* nativeResult) {
 #ifdef _WIN32
+    if (nativeResult) {
+        *nativeResult = static_cast<std::uint32_t>(D3DERR_INVALIDCALL);
+    }
     if (!impl->device || !guestKey || !width || !height) {
         return false;
     }
@@ -466,7 +567,22 @@ bool SugarbombHostD3D9::createTexture(
             static_cast<D3DPOOL>(pool),
             &texture,
             nullptr);
-        if (!reportFailure(impl, "CreateCubeTexture", result)) {
+        if (nativeResult) {
+            *nativeResult = static_cast<std::uint32_t>(result);
+        }
+        char operation[256] = {};
+        std::snprintf(
+            operation,
+            sizeof(operation),
+            "CreateCubeTexture(key=0x%08X edge=%u levels=%u "
+            "usage=0x%08X format=0x%08X pool=%u)",
+            guestKey,
+            width,
+            levels,
+            usage,
+            format,
+            pool);
+        if (!reportFailure(impl, operation, result)) {
             return false;
         }
         impl->cubeTextures[guestKey] = texture;
@@ -482,7 +598,23 @@ bool SugarbombHostD3D9::createTexture(
         static_cast<D3DPOOL>(pool),
         &texture,
         nullptr);
-    if (!reportFailure(impl, "CreateTexture", result)) {
+    if (nativeResult) {
+        *nativeResult = static_cast<std::uint32_t>(result);
+    }
+    char operation[256] = {};
+    std::snprintf(
+        operation,
+        sizeof(operation),
+        "CreateTexture(key=0x%08X size=%ux%u levels=%u "
+        "usage=0x%08X format=0x%08X pool=%u)",
+        guestKey,
+        width,
+        height,
+        levels,
+        usage,
+        format,
+        pool);
+    if (!reportFailure(impl, operation, result)) {
         return false;
     }
     impl->textures[guestKey] = texture;
@@ -496,6 +628,9 @@ bool SugarbombHostD3D9::createTexture(
     (void)format;
     (void)pool;
     (void)cube;
+    if (nativeResult) {
+        *nativeResult = 0x8876086c;
+    }
     return false;
 #endif
 }
@@ -506,8 +641,12 @@ bool SugarbombHostD3D9::createBuffer(
     std::uint32_t usage,
     std::uint32_t format,
     std::uint32_t pool,
-    bool indexBuffer) {
+    bool indexBuffer,
+    std::uint32_t* nativeResult) {
 #ifdef _WIN32
+    if (nativeResult) {
+        *nativeResult = static_cast<std::uint32_t>(D3DERR_INVALIDCALL);
+    }
     if (!impl->device || !guestKey || !length) {
         return false;
     }
@@ -521,6 +660,9 @@ bool SugarbombHostD3D9::createBuffer(
             static_cast<D3DPOOL>(pool),
             &buffer,
             nullptr);
+        if (nativeResult) {
+            *nativeResult = static_cast<std::uint32_t>(result);
+        }
         if (!reportFailure(impl, "CreateIndexBuffer", result)) {
             return false;
         }
@@ -535,6 +677,9 @@ bool SugarbombHostD3D9::createBuffer(
         static_cast<D3DPOOL>(pool),
         &buffer,
         nullptr);
+    if (nativeResult) {
+        *nativeResult = static_cast<std::uint32_t>(result);
+    }
     if (!reportFailure(impl, "CreateVertexBuffer", result)) {
         return false;
     }
@@ -547,6 +692,9 @@ bool SugarbombHostD3D9::createBuffer(
     (void)format;
     (void)pool;
     (void)indexBuffer;
+    if (nativeResult) {
+        *nativeResult = 0x8876086c;
+    }
     return false;
 #endif
 }
@@ -813,22 +961,23 @@ bool SugarbombHostD3D9::uploadSurface(
     if (!surface || !pixels || !sourcePitch || !width || !height) {
         return false;
     }
-    D3DLOCKED_RECT locked = {};
-    HRESULT result = surface->LockRect(&locked, nullptr, 0);
-    if (!reportFailure(impl, "Surface::LockRect", result)) {
-        return false;
-    }
-    const std::uint32_t copyBytes =
-        std::min<std::uint32_t>(sourcePitch, std::abs(locked.Pitch));
-    const auto* source = static_cast<const unsigned char*>(pixels);
-    auto* destination = static_cast<unsigned char*>(locked.pBits);
-    for (std::uint32_t row = 0; row < height; ++row) {
-        std::memcpy(destination, source, copyBytes);
-        source += sourcePitch;
-        destination += locked.Pitch;
-    }
-    surface->UnlockRect();
-    return true;
+    char operation[192] = {};
+    std::snprintf(
+        operation,
+        sizeof(operation),
+        "upload surface(key=0x%08X size=%ux%u pitch=%u rows=%u)",
+        guestKey,
+        width,
+        height,
+        sourcePitch,
+        height);
+    return uploadSurfacePixels(
+        impl,
+        surface,
+        pixels,
+        sourcePitch,
+        height,
+        operation);
 #else
     (void)guestKey;
     (void)pixels;
@@ -850,41 +999,42 @@ bool SugarbombHostD3D9::uploadTexture(
     if (!pixels || !sourcePitch || !rowCount) {
         return false;
     }
-    D3DLOCKED_RECT locked = {};
     HRESULT result = D3DERR_INVALIDCALL;
+    IDirect3DSurface9* surface = nullptr;
     IDirect3DTexture9* texture = findObject(impl->textures, guestKey);
     IDirect3DCubeTexture9* cubeTexture =
         findObject(impl->cubeTextures, guestKey);
     if (texture) {
-        result = texture->LockRect(level, &locked, nullptr, 0);
+        result = texture->GetSurfaceLevel(level, &surface);
     } else if (cubeTexture) {
-        result = cubeTexture->LockRect(
+        result = cubeTexture->GetCubeMapSurface(
             static_cast<D3DCUBEMAP_FACES>(face),
             level,
-            &locked,
-            nullptr,
-            0);
+            &surface);
     }
-    if (!reportFailure(impl, "Texture::LockRect", result)) {
+    char operation[224] = {};
+    std::snprintf(
+        operation,
+        sizeof(operation),
+        "upload texture(key=0x%08X face=%u level=%u "
+        "pitch=%u rows=%u)",
+        guestKey,
+        face,
+        level,
+        sourcePitch,
+        rowCount);
+    if (!reportFailure(impl, operation, result)) {
         return false;
     }
-    const std::uint32_t copyBytes =
-        std::min<std::uint32_t>(sourcePitch, std::abs(locked.Pitch));
-    const auto* source = static_cast<const unsigned char*>(pixels);
-    auto* destination = static_cast<unsigned char*>(locked.pBits);
-    for (std::uint32_t row = 0; row < rowCount; ++row) {
-        std::memcpy(destination, source, copyBytes);
-        source += sourcePitch;
-        destination += locked.Pitch;
-    }
-    if (texture) {
-        texture->UnlockRect(level);
-    } else {
-        cubeTexture->UnlockRect(
-            static_cast<D3DCUBEMAP_FACES>(face),
-            level);
-    }
-    return true;
+    const bool uploaded = uploadSurfacePixels(
+        impl,
+        surface,
+        pixels,
+        sourcePitch,
+        rowCount,
+        operation);
+    releaseObject(surface);
+    return uploaded;
 #else
     (void)guestKey;
     (void)face;

@@ -129,8 +129,17 @@ their static TLS, and calls their process-attach entry points in dependency
 order before Fallout's executable entry point. Both decoder DLLs completed
 initialization successfully, and the subsequent run created numerous
 DirectSound buffers from the real guest Vorbis path. The next deterministic
-world-loading boundary is a D3D9 invalid-call resource failure followed by a
-guest null dereference, rather than an unresolved decoder import.
+world-loading boundary in that run was a D3D9 invalid-call resource failure
+followed by a guest null dereference, rather than an unresolved decoder import.
+The host resource contract has since been corrected: CPU writes to
+`D3DPOOL_DEFAULT` surfaces and texture levels use a lockable system-memory
+staging surface followed by native `UpdateSurface`, while failed native
+texture or vertex/index-buffer creation returns its actual HRESULT and a null
+guest output instead of leaving a successful-looking unbacked COM object. A
+focused native D3D9 regression now creates and uploads a default-pool texture,
+and a normal foreground Fallout launch reaches the rendered startup path
+without the former `CreateTexture` or `LockRect` invalid-call stream. The
+world-loading path still needs to be rerun through this corrected boundary.
 
 The staged xNVSE 6.4.8 runtime now initializes automatically at Fallout's real
 WinMain boundary. A bounded headless smoke run completes both PE TLS callbacks,
@@ -430,6 +439,7 @@ $env:SUGARBOMB_CAPTURE_FRAME = 'D:\captures\fallout-present.png'
 $env:SUGARBOMB_CAPTURE_AFTER_PRESENTS = '100'
 $env:SUGARBOMB_CAPTURE_FINAL_FRAME = 'D:\captures\fallout-final-target.png'
 $env:SUGARBOMB_CAPTURE_FINAL_BACKBUFFER = 'D:\captures\fallout-final-backbuffer.png'
+$env:SUGARBOMB_TRACE_FALLOUT_FACTORY = '1' # optional world-load factory probe
 ```
 
 When either diagnostic budget expires, Sugarbomb prints every guest thread's
@@ -466,6 +476,6 @@ crosses into world loading through real guest Ogg/Vorbis code. xNVSE now
 initializes through its real static-TLS and DLL-entry sequence at the same CRT
 boundary used by the xNVSE loader, patches the same guest Fallout image, and
 loads a real NVSE plugin before the game continues. The next major work is to
-repair the D3D9 invalid-call resource path exposed during world loading, persist
-remaining virtual-file operations, and expand plugin/API coverage from
-additional real NVSE workloads.
+rerun and reverse-map the world-loading null dereference after the corrected
+D3D9 resource contract, persist remaining virtual-file operations, and expand
+plugin/API coverage from additional real NVSE workloads.
