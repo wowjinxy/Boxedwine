@@ -1184,6 +1184,52 @@ bool SugarbombHostD3D9::present() {
 #endif
 }
 
+bool SugarbombHostD3D9::setCursorProperties(
+    std::uint32_t hotX,
+    std::uint32_t hotY,
+    std::uint32_t surfaceKey) {
+#ifdef _WIN32
+    IDirect3DSurface9* surface =
+        findObject(impl->surfaces, surfaceKey);
+    return impl->device &&
+        surface &&
+        reportFailure(
+            impl,
+            "SetCursorProperties",
+            impl->device->SetCursorProperties(hotX, hotY, surface));
+#else
+    (void)hotX;
+    (void)hotY;
+    (void)surfaceKey;
+    return false;
+#endif
+}
+
+void SugarbombHostD3D9::setCursorPosition(
+    std::int32_t screenX,
+    std::int32_t screenY,
+    std::uint32_t flags) {
+#ifdef _WIN32
+    if (impl->device) {
+        impl->device->SetCursorPosition(screenX, screenY, flags);
+    }
+#else
+    (void)screenX;
+    (void)screenY;
+    (void)flags;
+#endif
+}
+
+bool SugarbombHostD3D9::showCursor(bool visible) {
+#ifdef _WIN32
+    return impl->device &&
+        impl->device->ShowCursor(visible ? TRUE : FALSE) != FALSE;
+#else
+    (void)visible;
+    return false;
+#endif
+}
+
 bool SugarbombHostD3D9::setRenderTarget(
     std::uint32_t index,
     std::uint32_t surfaceKey) {

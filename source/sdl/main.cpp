@@ -40,8 +40,38 @@ U32 gensrc;
 void writeSource();
 #endif
 
+#ifdef BOXEDWINE_MSVC
+static void configureSugarbombHostProcess() {
+    // Fallout's client dimensions are physical game pixels. Opt the native
+    // host into modern DPI handling before it creates any HWND so Windows
+    // does not turn a 1920x1080 backbuffer into a 3840x2160 client at 200%.
+    using SetProcessDpiAwarenessContextProc =
+        BOOL(WINAPI*)(HANDLE);
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    auto setProcessDpiAwarenessContext =
+        user32
+        ? reinterpret_cast<SetProcessDpiAwarenessContextProc>(
+              GetProcAddress(
+                  user32,
+                  "SetProcessDpiAwarenessContext"))
+        : nullptr;
+    constexpr std::intptr_t DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2_VALUE =
+        -4;
+    if (setProcessDpiAwarenessContext &&
+        setProcessDpiAwarenessContext(
+            reinterpret_cast<HANDLE>(
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2_VALUE))) {
+        return;
+    }
+    SetProcessDPIAware();
+}
+#endif
+
 int boxedmain(int argc, const char **argv) {
     if (argc == 3 && strcmp(argv[1], "--sugarbomb-run") == 0) {
+#ifdef BOXEDWINE_MSVC
+        configureSugarbombHostProcess();
+#endif
         return SugarbombRuntime::run(argv[2]);
     }
 

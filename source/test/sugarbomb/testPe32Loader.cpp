@@ -17,6 +17,12 @@
 #include "../cpu/testCPU.h"
 #include "testPe32Loader.h"
 
+#include <algorithm>
+
+#ifdef _WIN32
+#include <Windows.h>
+#endif
+
 namespace {
 
 constexpr U32 TEST_IMAGE_BASE = 0x00400000;
@@ -400,6 +406,89 @@ void testSugarbombHostWindowLifecycle() {
     if (!window.pumpMessages(&events)) {
         testFail(
             "Sugarbomb hidden native host window closed unexpectedly");
+    }
+
+    HWND nativeWindow =
+        reinterpret_cast<HWND>(window.nativeHandle());
+    if (!MoveWindow(
+            nativeWindow,
+            0,
+            0,
+            240,
+            160,
+            FALSE)) {
+        testFail(
+            "Sugarbomb native host window could not be resized for "
+            "coordinate validation");
+    } else {
+        RECT client = {};
+        if (!GetClientRect(nativeWindow, &client) ||
+            client.right <= 0 ||
+            client.bottom <= 0) {
+            testFail(
+                "Sugarbomb native host window did not report a valid "
+                "resized client area");
+        } else {
+            const S32 nativeX = client.right / 3;
+            const S32 nativeY = client.bottom / 4;
+            const S32 expectedGuestX =
+                nativeX * 320 / client.right;
+            const S32 expectedGuestY =
+                nativeY * 200 / client.bottom;
+            SendMessageA(
+                nativeWindow,
+                WM_MOUSEMOVE,
+                0,
+                MAKELPARAM(nativeX, nativeY));
+            events.clear();
+            window.pumpMessages(&events);
+            auto mouseMove = std::find_if(
+                events.begin(),
+                events.end(),
+                [](const SugarbombHostWindow::Event& event) {
+                    return event.message == WM_MOUSEMOVE;
+                });
+            if (mouseMove == events.end()) {
+                testFail(
+                    "Sugarbomb native mouse move was not forwarded to "
+                    "the guest event queue");
+            } else {
+                const S32 guestX =
+                    static_cast<S16>(
+                        mouseMove->longParameter & 0xffff);
+                const S32 guestY =
+                    static_cast<S16>(
+                        (mouseMove->longParameter >> 16) & 0xffff);
+                if (guestX != expectedGuestX ||
+                    guestY != expectedGuestY) {
+                    testFail(
+                        "Sugarbomb native mouse coordinates were not "
+                        "scaled into guest client space");
+                }
+            }
+            S32 screenX = 0;
+            S32 screenY = 0;
+            POINT roundTrip = {};
+            if (!window.guestClientToScreen(
+                    expectedGuestX,
+                    expectedGuestY,
+                    screenX,
+                    screenY)) {
+                testFail(
+                    "Sugarbomb guest client coordinates could not be "
+                    "mapped into native screen space");
+            } else {
+                roundTrip.x = screenX;
+                roundTrip.y = screenY;
+                if (!ScreenToClient(nativeWindow, &roundTrip) ||
+                    std::abs(roundTrip.x - nativeX) > 1 ||
+                    std::abs(roundTrip.y - nativeY) > 1) {
+                    testFail(
+                        "Sugarbomb guest-to-screen cursor mapping did "
+                        "not invert native-to-guest mouse scaling");
+                }
+            }
+        }
     }
     window.destroyGuestWindow(GUEST_WINDOW);
     if (window.nativeHandle()) {

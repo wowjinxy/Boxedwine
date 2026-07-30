@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -41,9 +42,12 @@ struct SugarbombHostWindow::Impl {
     };
 
     std::atomic<std::uint32_t> guestHandle{0};
+    std::atomic<std::int32_t> guestClientWidth{1};
+    std::atomic<std::int32_t> guestClientHeight{1};
     std::uint32_t frameWidth = 0;
     std::uint32_t frameHeight = 0;
     std::uint32_t presentCount = 0;
+    std::uint32_t mouseCoordinateTraceCount = 0;
     std::atomic<bool> userClosed{false};
     bool intentionalDestroy = false;
     std::atomic<bool> shuttingDown{false};
@@ -126,6 +130,113 @@ bool isGuestInputOrFocusMessage(UINT message) {
     }
 }
 
+bool isClientMousePositionMessage(UINT message) {
+    switch (message) {
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_MBUTTONDBLCLK:
+#ifdef WM_XBUTTONDOWN
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+#endif
+        return true;
+    default:
+        return false;
+    }
+}
+
+LPARAM mapClientMouseToGuest(
+    SugarbombHostWindow::Impl* impl,
+    LPARAM longParameter) {
+    if (!impl) {
+        return longParameter;
+    }
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    RECT client = {};
+    if (!window ||
+        !GetClientRect(window, &client)) {
+        return longParameter;
+    }
+    const std::int32_t nativeWidth =
+        client.right - client.left;
+    const std::int32_t nativeHeight =
+        client.bottom - client.top;
+    const std::int32_t guestWidth =
+        impl->guestClientWidth.load(
+            std::memory_order_acquire);
+    const std::int32_t guestHeight =
+        impl->guestClientHeight.load(
+            std::memory_order_acquire);
+    if (nativeWidth <= 0 ||
+        nativeHeight <= 0 ||
+        guestWidth <= 0 ||
+        guestHeight <= 0 ||
+        (nativeWidth == guestWidth &&
+         nativeHeight == guestHeight)) {
+        return longParameter;
+    }
+    const std::int32_t nativeX =
+        static_cast<std::int16_t>(
+            static_cast<std::uint16_t>(
+                longParameter & 0xffff));
+    const std::int32_t nativeY =
+        static_cast<std::int16_t>(
+            static_cast<std::uint16_t>(
+                (longParameter >> 16) & 0xffff));
+    const auto scaleCoordinate = [](
+        std::int32_t value,
+        std::int32_t guestExtent,
+        std::int32_t nativeExtent) {
+        const std::int64_t scaled =
+            static_cast<std::int64_t>(value) *
+            guestExtent /
+            nativeExtent;
+        return static_cast<std::int32_t>(
+            std::max<std::int64_t>(
+                std::numeric_limits<std::int16_t>::min(),
+                std::min<std::int64_t>(
+                    std::numeric_limits<std::int16_t>::max(),
+                    scaled)));
+    };
+    const std::int32_t guestX =
+        scaleCoordinate(
+            nativeX,
+            guestWidth,
+            nativeWidth);
+    const std::int32_t guestY =
+        scaleCoordinate(
+            nativeY,
+            guestHeight,
+            nativeHeight);
+    if (++impl->mouseCoordinateTraceCount <= 8) {
+        std::printf(
+            "Sugarbomb host input: mapped native mouse (%d,%d) "
+            "in %dx%d client to guest (%d,%d) in %dx%d\n",
+            nativeX,
+            nativeY,
+            nativeWidth,
+            nativeHeight,
+            guestX,
+            guestY,
+            guestWidth,
+            guestHeight);
+    }
+    return static_cast<LPARAM>(
+        static_cast<std::uint16_t>(guestX) |
+        (static_cast<std::uint32_t>(
+             static_cast<std::uint16_t>(guestY))
+         << 16));
+}
+
 void queueGuestEvent(
     SugarbombHostWindow::Impl* impl,
     UINT message,
@@ -144,7 +255,12 @@ void queueGuestEvent(
     event.guestHandle = guestHandle;
     event.message = static_cast<std::uint32_t>(message);
     event.wordParameter = static_cast<std::uint32_t>(wordParameter);
-    event.longParameter = static_cast<std::uint32_t>(longParameter);
+    event.longParameter = static_cast<std::uint32_t>(
+        isClientMousePositionMessage(message)
+            ? mapClientMouseToGuest(
+                  impl,
+                  longParameter)
+            : longParameter);
     event.time = static_cast<std::uint32_t>(GetMessageTime());
     DWORD point = GetMessagePos();
     event.pointX = static_cast<std::int16_t>(LOWORD(point));
@@ -405,6 +521,12 @@ bool applyNativeWindowSync(
         &rectangle,
         WS_OVERLAPPEDWINDOW,
         FALSE);
+    impl->guestClientWidth.store(
+        safeWidth,
+        std::memory_order_release);
+    impl->guestClientHeight.store(
+        safeHeight,
+        std::memory_order_release);
 
     SetWindowTextA(window, resolvedTitle.c_str());
     SetWindowPos(
@@ -1009,6 +1131,61 @@ bool SugarbombHostWindow::isGuestWindowFocused(
         0) != FALSE;
 #else
     (void)guestHandle;
+    return true;
+#endif
+}
+
+bool SugarbombHostWindow::guestClientToScreen(
+    std::int32_t guestX,
+    std::int32_t guestY,
+    std::int32_t& screenX,
+    std::int32_t& screenY) const {
+#ifdef _WIN32
+    const HWND window =
+        impl->window.load(std::memory_order_acquire);
+    RECT client = {};
+    if (!window || !GetClientRect(window, &client)) {
+        return false;
+    }
+    const std::int32_t nativeWidth =
+        client.right - client.left;
+    const std::int32_t nativeHeight =
+        client.bottom - client.top;
+    const std::int32_t guestWidth =
+        impl->guestClientWidth.load(std::memory_order_acquire);
+    const std::int32_t guestHeight =
+        impl->guestClientHeight.load(std::memory_order_acquire);
+    if (nativeWidth <= 0 ||
+        nativeHeight <= 0 ||
+        guestWidth <= 0 ||
+        guestHeight <= 0) {
+        return false;
+    }
+    const auto scaleCoordinate = [](
+        std::int32_t value,
+        std::int32_t nativeExtent,
+        std::int32_t guestExtent) {
+        return static_cast<LONG>(
+            std::max<std::int64_t>(
+                std::numeric_limits<LONG>::min(),
+                std::min<std::int64_t>(
+                    std::numeric_limits<LONG>::max(),
+                    static_cast<std::int64_t>(value) *
+                        nativeExtent /
+                        guestExtent)));
+    };
+    POINT position = {
+        scaleCoordinate(guestX, nativeWidth, guestWidth),
+        scaleCoordinate(guestY, nativeHeight, guestHeight)};
+    if (!ClientToScreen(window, &position)) {
+        return false;
+    }
+    screenX = position.x;
+    screenY = position.y;
+    return true;
+#else
+    screenX = guestX;
+    screenY = guestY;
     return true;
 #endif
 }

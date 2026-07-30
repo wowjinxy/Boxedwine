@@ -50,6 +50,11 @@ public:
     bool isGuestWindowForeground(std::uint32_t guestHandle) const;
     bool isGuestWindowActive(std::uint32_t guestHandle) const;
     bool isGuestWindowFocused(std::uint32_t guestHandle) const;
+    bool guestClientToScreen(
+        std::int32_t guestX,
+        std::int32_t guestY,
+        std::int32_t& screenX,
+        std::int32_t& screenY) const;
     void setCursorVisible(bool visible);
     bool setMouseCapture(bool captured);
     void destroyGuestWindow(std::uint32_t guestHandle);

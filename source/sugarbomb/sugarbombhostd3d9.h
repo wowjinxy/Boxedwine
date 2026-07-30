@@ -151,6 +151,15 @@ public:
         float depth,
         std::uint32_t stencil);
     bool present();
+    bool setCursorProperties(
+        std::uint32_t hotX,
+        std::uint32_t hotY,
+        std::uint32_t surfaceKey);
+    void setCursorPosition(
+        std::int32_t screenX,
+        std::int32_t screenY,
+        std::uint32_t flags);
+    bool showCursor(bool visible);
     bool setRenderTarget(std::uint32_t index, std::uint32_t surfaceKey);
     bool setDepthStencilSurface(std::uint32_t surfaceKey);
     bool setViewport(const void* viewport);

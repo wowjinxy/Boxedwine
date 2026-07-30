@@ -7263,10 +7263,33 @@ private:
         if (event.message == WM_MOUSEMOVE_GUEST) {
             S32 x = static_cast<S16>(event.longParameter & 0xffff);
             S32 y = static_cast<S16>((event.longParameter >> 16) & 0xffff);
+            S32 deltaX = directInputMousePositionKnown
+                ? x - directInputMouseX
+                : 0;
+            S32 deltaY = directInputMousePositionKnown
+                ? y - directInputMouseY
+                : 0;
+            if ((deltaX || deltaY) &&
+                ++directInputMouseMotionTraceCount <= 32) {
+                U32 acquiredMice = 0;
+                for (const auto& entry : directInputObjects) {
+                    if (isDirectInputMouse(entry.second) &&
+                        entry.second.acquired) {
+                        ++acquiredMice;
+                    }
+                }
+                printf(
+                    "Sugarbomb DirectInput: host mouse position=(%d,%d) "
+                    "delta=(%d,%d) raw=%u acquired=%u\n",
+                    x,
+                    y,
+                    deltaX,
+                    deltaY,
+                    directInputRawMouseAvailable ? 1 : 0,
+                    acquiredMice);
+            }
             if (directInputMousePositionKnown &&
                 !directInputRawMouseAvailable) {
-                S32 deltaX = x - directInputMouseX;
-                S32 deltaY = y - directInputMouseY;
                 for (auto& entry : directInputObjects) {
                     DirectInputObject& object = entry.second;
                     if (!isDirectInputMouse(object) || !object.acquired) {
@@ -7334,6 +7357,13 @@ private:
                 return;
             }
             directInputMouseButtons[button] = state;
+            if (++directInputHostEventTraceCount <= 32) {
+                printf(
+                    "Sugarbomb DirectInput: host mouse button=%u "
+                    "state=0x%02X\n",
+                    button,
+                    state);
+            }
             for (auto& entry : directInputObjects) {
                 if (isDirectInputMouse(entry.second)) {
                     queueDirectInputEvent(
@@ -7594,6 +7624,13 @@ private:
             }
             pumpHostMessages();
             if (!object.acquired) {
+                if (isDirectInputMouse(object) &&
+                    ++directInputMouseStateDeliveryTraceCount <= 32) {
+                    printf(
+                        "Sugarbomb DirectInput: mouse state read rejected "
+                        "because device 0x%08X is not acquired\n",
+                        objectAddress);
+                }
                 cpu->reg[0].u32 = DIERR_NOTACQUIRED;
                 return;
             }
@@ -7615,6 +7652,18 @@ private:
                         size,
                         static_cast<U32>(directInputKeyboardState.size())));
             } else if (isDirectInputMouse(object)) {
+                if ((object.mouseDeltaX ||
+                     object.mouseDeltaY ||
+                     object.mouseWheelDelta) &&
+                    ++directInputMouseStateDeliveryTraceCount <= 32) {
+                    printf(
+                        "Sugarbomb DirectInput: delivering mouse state "
+                        "delta=(%d,%d) wheel=%d from 0x%08X\n",
+                        object.mouseDeltaX,
+                        object.mouseDeltaY,
+                        object.mouseWheelDelta,
+                        objectAddress);
+                }
                 if (size >= 4) {
                     memory->writed(
                         destination,
@@ -9485,7 +9534,25 @@ private:
             cpu->reg[0].u32 = D3D_OK;
             return;
         }
-        case 10: // SetCursorProperties
+        case 10: { // SetCursorProperties
+            U32 hotX = argument(cpu, 1);
+            U32 hotY = argument(cpu, 2);
+            U32 surface = argument(cpu, 3);
+            bool applied =
+                hostDirect3D.setCursorProperties(hotX, hotY, surface);
+            if (++direct3DCursorTraceCount <= 32) {
+                printf(
+                    "Sugarbomb host D3D9: SetCursorProperties("
+                    "hot=%u,%u surface=0x%08X) -> %s\n",
+                    hotX,
+                    hotY,
+                    surface,
+                    applied ? "D3D_OK" : "D3DERR_INVALIDCALL");
+            }
+            cpu->reg[0].u32 =
+                applied ? D3D_OK : D3DERR_INVALIDCALL;
+            return;
+        }
         case 13: // CreateAdditionalSwapChain
         case 14: // GetSwapChain
             cpu->reg[0].u32 = D3DERR_NOTAVAILABLE;
@@ -9701,12 +9768,50 @@ private:
             cpu->reg[0].u32 = surface ? D3D_OK : 0x8007000e;
             return;
         }
-        case 11: // SetCursorPosition
+        case 11: { // SetCursorPosition
+            S32 guestX = static_cast<S32>(argument(cpu, 1));
+            S32 guestY = static_cast<S32>(argument(cpu, 2));
+            U32 flags = argument(cpu, 3);
+            S32 screenX = 0;
+            S32 screenY = 0;
+            bool mapped = hostWindow.guestClientToScreen(
+                guestX,
+                guestY,
+                screenX,
+                screenY);
+            if (mapped) {
+                hostDirect3D.setCursorPosition(
+                    screenX,
+                    screenY,
+                    flags);
+            }
+            if (++direct3DCursorTraceCount <= 32) {
+                printf(
+                    "Sugarbomb host D3D9: SetCursorPosition("
+                    "guest=%d,%d screen=%d,%d flags=0x%08X) -> %s\n",
+                    guestX,
+                    guestY,
+                    screenX,
+                    screenY,
+                    flags,
+                    mapped ? "mapped" : "no native window");
+            }
+            return;
+        }
         case 21: // SetGammaRamp
             return;
-        case 12: // ShowCursor
-            cpu->reg[0].u32 = 0;
+        case 12: { // ShowCursor
+            bool visible = argument(cpu, 1) != 0;
+            bool wasVisible = hostDirect3D.showCursor(visible);
+            if (++direct3DCursorTraceCount <= 32) {
+                printf(
+                    "Sugarbomb host D3D9: ShowCursor(%u) -> %u\n",
+                    visible ? 1 : 0,
+                    wasVisible ? 1 : 0);
+            }
+            cpu->reg[0].u32 = wasVisible ? 1 : 0;
             return;
+        }
         case 15: // GetNumberOfSwapChains
             cpu->reg[0].u32 = 1;
             return;
@@ -17269,29 +17374,40 @@ private:
 
     U32 guestWindowWithNativeState(
         NativeWindowState state) const {
-        U32 topLevel = topLevelGuestWindow(activeWindow);
         if (!hostWindow.nativeHandle()) {
-            return topLevel;
+            return topLevelGuestWindow(activeWindow);
         }
-        if (!topLevel) {
-            return 0;
+
+        // The real HWND is authoritative. Its activation messages are queued
+        // asynchronously for the guest WndProc, so activeWindow can briefly
+        // lag behind Windows immediately after ShowWindow or a task switch.
+        // Query the mapped top-level HWND directly instead of exposing that
+        // implementation race through GetActiveWindow/GetFocus.
+        for (const auto& entry : guestWindows) {
+            U32 topLevel = topLevelGuestWindow(entry.first);
+            if (!topLevel || topLevel != entry.first) {
+                continue;
+            }
+            bool ownsState = false;
+            switch (state) {
+            case NativeWindowState::Active:
+                ownsState =
+                    hostWindow.isGuestWindowActive(topLevel);
+                break;
+            case NativeWindowState::Focused:
+                ownsState =
+                    hostWindow.isGuestWindowFocused(topLevel);
+                break;
+            case NativeWindowState::Foreground:
+                ownsState =
+                    hostWindow.isGuestWindowForeground(topLevel);
+                break;
+            }
+            if (ownsState) {
+                return topLevel;
+            }
         }
-        bool ownsState = false;
-        switch (state) {
-        case NativeWindowState::Active:
-            ownsState =
-                hostWindow.isGuestWindowActive(topLevel);
-            break;
-        case NativeWindowState::Focused:
-            ownsState =
-                hostWindow.isGuestWindowFocused(topLevel);
-            break;
-        case NativeWindowState::Foreground:
-            ownsState =
-                hostWindow.isGuestWindowForeground(topLevel);
-            break;
-        }
-        return ownsState ? topLevel : 0;
+        return 0;
     }
 
     bool setActiveGuestWindow(U32 handle) {
@@ -19259,9 +19375,12 @@ private:
     U32 nextDirectInputSequence = 1;
     U32 directInputHostEventTraceCount = 0;
     U32 directInputRawMouseTraceCount = 0;
+    U32 directInputMouseMotionTraceCount = 0;
+    U32 directInputMouseStateDeliveryTraceCount = 0;
     U32 directInputReadTraceCount = 0;
     U32 directInputStateCallTraceCount = 0;
     U32 directInputDataCallTraceCount = 0;
+    U32 direct3DCursorTraceCount = 0;
     U32 processorFeatureTraceCount = 0;
     U32 virtualProtectTraceCount = 0;
     U32 flushInstructionCacheTraceCount = 0;
