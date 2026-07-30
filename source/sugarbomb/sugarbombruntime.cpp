@@ -559,14 +559,16 @@ private:
         for (const SugarbombHostWindow::Event& event : events) {
             updateGuestActivationFromHostEvent(event);
             updateDirectInputFromHostEvent(event);
-            enqueueGuestMessage(
-                event.guestHandle,
-                event.message,
-                event.wordParameter,
-                event.longParameter,
-                event.time,
-                event.pointX,
-                event.pointY);
+            if (event.forwardToGuest) {
+                enqueueGuestMessage(
+                    event.guestHandle,
+                    event.message,
+                    event.wordParameter,
+                    event.longParameter,
+                    event.time,
+                    event.pointX,
+                    event.pointY);
+            }
         }
     }
 
@@ -2837,6 +2839,8 @@ private:
         SugarbombRuntimeSession* session = current(cpu, "USER32!ShowCursor");
         if (session) {
             session->cursorDisplayCount += argument(cpu, 0) ? 1 : -1;
+            session->hostWindow.setCursorVisible(
+                session->cursorDisplayCount >= 0);
             cpu->reg[0].u32 = static_cast<U32>(session->cursorDisplayCount);
         }
     }
@@ -4017,9 +4021,18 @@ private:
         U32 cooperativeTopLevel =
             topLevelGuestWindow(object.cooperativeWindow);
         U32 activeTopLevel = topLevelGuestWindow(activeWindow);
-        return activeTopLevel &&
-            (!cooperativeTopLevel ||
-             cooperativeTopLevel == activeTopLevel);
+        if (cooperativeTopLevel &&
+            activeTopLevel &&
+            cooperativeTopLevel != activeTopLevel) {
+            return false;
+        }
+        U32 targetTopLevel =
+            cooperativeTopLevel ? cooperativeTopLevel : activeTopLevel;
+        if (hostWindow.nativeHandle()) {
+            return targetTopLevel &&
+                hostWindow.isGuestWindowForeground(targetTopLevel);
+        }
+        return targetTopLevel != 0;
     }
 
     void loseForegroundDirectInputDevices(U32 guestHandle) {
@@ -4043,6 +4056,23 @@ private:
             object.mouseWheelDelta = 0;
             object.events.clear();
         }
+        updateHostDirectInputMouseCapture();
+    }
+
+    void updateHostDirectInputMouseCapture() {
+        constexpr U32 DISCL_EXCLUSIVE = 0x00000001;
+        bool capture = false;
+        for (const auto& entry : directInputObjects) {
+            const DirectInputObject& object = entry.second;
+            if (isDirectInputMouse(object) &&
+                object.acquired &&
+                (object.cooperativeFlags & DISCL_EXCLUSIVE) &&
+                hasDirectInputForegroundPriority(object)) {
+                capture = true;
+                break;
+            }
+        }
+        hostWindow.setMouseCapture(capture);
     }
 
     void queueDirectInputEvent(
@@ -4138,6 +4168,41 @@ private:
         constexpr U32 WM_XBUTTONUP_GUEST = 0x020c;
         constexpr U32 WM_MOUSEHWHEEL_GUEST = 0x020e;
 
+        if (event.relativeMouse) {
+            directInputRawMouseAvailable = true;
+            S32 deltaX = static_cast<S32>(event.wordParameter);
+            S32 deltaY = static_cast<S32>(event.longParameter);
+            if (++directInputRawMouseTraceCount <= 16) {
+                printf(
+                    "Sugarbomb DirectInput: raw mouse delta=(%d,%d)\n",
+                    deltaX,
+                    deltaY);
+            }
+            for (auto& entry : directInputObjects) {
+                DirectInputObject& object = entry.second;
+                if (!isDirectInputMouse(object) || !object.acquired) {
+                    continue;
+                }
+                if (deltaX) {
+                    object.mouseDeltaX += deltaX;
+                    queueDirectInputEvent(
+                        object,
+                        0, // DIMOFS_X
+                        static_cast<U32>(deltaX),
+                        event.time);
+                }
+                if (deltaY) {
+                    object.mouseDeltaY += deltaY;
+                    queueDirectInputEvent(
+                        object,
+                        4, // DIMOFS_Y
+                        static_cast<U32>(deltaY),
+                        event.time);
+                }
+            }
+            return;
+        }
+
         bool focusLost =
             event.message == WM_KILLFOCUS_GUEST ||
             (event.message == WM_ACTIVATE_GUEST &&
@@ -4205,7 +4270,8 @@ private:
         if (event.message == WM_MOUSEMOVE_GUEST) {
             S32 x = static_cast<S16>(event.longParameter & 0xffff);
             S32 y = static_cast<S16>((event.longParameter >> 16) & 0xffff);
-            if (directInputMousePositionKnown) {
+            if (directInputMousePositionKnown &&
+                !directInputRawMouseAvailable) {
                 S32 deltaX = x - directInputMouseX;
                 S32 deltaY = y - directInputMouseY;
                 for (auto& entry : directInputObjects) {
@@ -4367,6 +4433,14 @@ private:
             if (object.references) {
                 --object.references;
             }
+            if (!object.references &&
+                object.kind == DirectInputObjectKind::Device) {
+                object.acquired = false;
+                object.events.clear();
+                if (isDirectInputMouse(object)) {
+                    updateHostDirectInputMouseCapture();
+                }
+            }
             memory->writed(objectAddress + 4, object.references);
             cpu->reg[0].u32 = object.references;
             return;
@@ -4489,6 +4563,9 @@ private:
                     "Sugarbomb DirectInput: Acquire(%s 0x%08X)\n",
                     isDirectInputKeyboard(object) ? "keyboard" : "mouse",
                     objectAddress);
+                if (isDirectInputMouse(object)) {
+                    updateHostDirectInputMouseCapture();
+                }
             }
             cpu->reg[0].u32 = wasAcquired ? 1 : DI_OK; // DI_NOEFFECT
             return;
@@ -4505,6 +4582,9 @@ private:
                     "Sugarbomb DirectInput: Unacquire(%s 0x%08X)\n",
                     isDirectInputKeyboard(object) ? "keyboard" : "mouse",
                     objectAddress);
+                if (isDirectInputMouse(object)) {
+                    updateHostDirectInputMouseCapture();
+                }
             }
             cpu->reg[0].u32 = wasAcquired ? DI_OK : 1; // DI_NOEFFECT
             return;
@@ -4682,6 +4762,9 @@ private:
                 objectAddress,
                 object.cooperativeWindow,
                 object.cooperativeFlags);
+            if (isDirectInputMouse(object) && object.acquired) {
+                updateHostDirectInputMouseCapture();
+            }
             cpu->reg[0].u32 = DI_OK;
             return;
         case 14: { // GetObjectInfo
@@ -11962,8 +12045,10 @@ private:
     S32 directInputMouseX = 0;
     S32 directInputMouseY = 0;
     bool directInputMousePositionKnown = false;
+    bool directInputRawMouseAvailable = false;
     U32 nextDirectInputSequence = 1;
     U32 directInputHostEventTraceCount = 0;
+    U32 directInputRawMouseTraceCount = 0;
     U32 directInputReadTraceCount = 0;
     U32 directInputStateCallTraceCount = 0;
     U32 directInputDataCallTraceCount = 0;

@@ -25,6 +25,8 @@ public:
         std::uint32_t time = 0;
         std::int32_t pointX = 0;
         std::int32_t pointY = 0;
+        bool forwardToGuest = true;
+        bool relativeMouse = false;
     };
 
     SugarbombHostWindow();
@@ -43,6 +45,9 @@ public:
         std::int32_t clientHeight,
         bool visible);
     bool activateGuestWindow(std::uint32_t guestHandle);
+    bool isGuestWindowForeground(std::uint32_t guestHandle) const;
+    void setCursorVisible(bool visible);
+    bool setMouseCapture(bool captured);
     void destroyGuestWindow(std::uint32_t guestHandle);
     bool pumpMessages(std::vector<Event>* events = nullptr);
     std::uintptr_t nativeHandle() const;

@@ -60,10 +60,9 @@ draw calls to a native x64 `IDirect3DDevice9`. It also forwards the surface-copy
 operations used by the engine and can capture the active render target or
 swap-chain backbuffer for deterministic diagnostics. A verified 1920x1080
 backbuffer capture contains Fallout's fully rendered main menu with the logo,
-Sunset Sarsaparilla sign, cursor, and all seven menu entries. Raw-input and
-cursor/capture fidelity, deterministic menu-action validation, audio output,
-and video decoding are still incomplete, so the visible menu is not yet a
-playable build.
+Sunset Sarsaparilla sign, cursor, and all seven menu entries. Cursor-coordinate
+and menu-action validation, audio output, and video decoding are still
+incomplete, so the visible menu is not yet a playable build.
 
 The runtime currently builds:
 
@@ -88,6 +87,9 @@ The runtime currently builds:
   button state, buffered `DIDEVICEOBJECTDATA`, and idempotent device
   acquire/unacquire behavior, including foreground cooperative-level loss and
   reacquisition across native focus changes;
+- native raw-mouse deltas, exclusive foreground capture and clipping, and
+  guest-driven host cursor visibility, with legacy `WM_MOUSEMOVE` retained as a
+  registration fallback;
 - initial Kernel32 timing, process, heap, locale, console, exception, atomic,
   critical-section, memory-status, and virtual-memory services;
 - version-keyed Fallout 1.4 bootstrap objects for two startup-order races: the
@@ -202,9 +204,10 @@ dependency order and validate each group with small guest fixtures:
    create visible output. `PeekMessageA`, `DispatchMessageA`, and `SendMessageA`
    now deliver lifecycle plus native keyboard/mouse/focus events to Fallout's
    guest WndProc. The same host event stream now feeds keyboard and mouse
-   DirectInput state plus buffered menu events. Remaining work includes raw
-   input, richer cursor/capture behavior, deterministic menu-action validation,
-   and XInput device state.
+   DirectInput state plus buffered menu events. Raw mouse motion and exclusive
+   foreground capture now follow the native window lifecycle. Remaining work
+   includes cursor-coordinate validation, deterministic menu actions, and
+   XInput device state.
 4. **Rendering:** D3D9 and the required D3DX9 surface, translated directly to
    Sugarbomb's renderer. The guest COM/resource model, native presentation
    window, x64 D3D9 resource/state/shader/draw translation, D3DX image decoding,

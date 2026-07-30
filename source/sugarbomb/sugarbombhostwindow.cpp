@@ -34,6 +34,9 @@ struct SugarbombHostWindow::Impl {
     bool intentionalDestroy = false;
     bool shuttingDown = false;
     bool visible = false;
+    bool cursorVisible = true;
+    bool mouseCaptured = false;
+    bool rawMouseRegistered = false;
     std::vector<std::uint32_t> framePixels;
     std::vector<SugarbombHostWindow::Event> pendingEvents;
 #ifdef _WIN32
@@ -111,6 +114,61 @@ void queueGuestEvent(
         event.longParameter = 0;
     }
     impl->pendingEvents.push_back(event);
+}
+
+void queueRawMouseEvent(
+    SugarbombHostWindow::Impl* impl,
+    LPARAM longParameter) {
+    if (!impl || !impl->guestHandle) {
+        return;
+    }
+    UINT bytes = 0;
+    if (GetRawInputData(
+            reinterpret_cast<HRAWINPUT>(longParameter),
+            RID_INPUT,
+            nullptr,
+            &bytes,
+            sizeof(RAWINPUTHEADER)) != 0 ||
+        bytes < sizeof(RAWINPUT)) {
+        return;
+    }
+    std::vector<BYTE> storage(bytes);
+    if (GetRawInputData(
+            reinterpret_cast<HRAWINPUT>(longParameter),
+            RID_INPUT,
+            storage.data(),
+            &bytes,
+            sizeof(RAWINPUTHEADER)) != bytes) {
+        return;
+    }
+    const RAWINPUT* input =
+        reinterpret_cast<const RAWINPUT*>(storage.data());
+    if (input->header.dwType != RIM_TYPEMOUSE ||
+        (input->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) ||
+        (!input->data.mouse.lLastX && !input->data.mouse.lLastY)) {
+        return;
+    }
+    SugarbombHostWindow::Event event;
+    event.guestHandle = impl->guestHandle;
+    event.wordParameter =
+        static_cast<std::uint32_t>(input->data.mouse.lLastX);
+    event.longParameter =
+        static_cast<std::uint32_t>(input->data.mouse.lLastY);
+    event.time = static_cast<std::uint32_t>(GetMessageTime());
+    event.forwardToGuest = false;
+    event.relativeMouse = true;
+    impl->pendingEvents.push_back(event);
+}
+
+void releaseNativeMouseCapture(SugarbombHostWindow::Impl* impl) {
+    if (!impl || !impl->mouseCaptured) {
+        return;
+    }
+    if (GetCapture() == impl->window) {
+        ReleaseCapture();
+    }
+    ClipCursor(nullptr);
+    impl->mouseCaptured = false;
 }
 
 bool presentationDisabled() {
@@ -193,12 +251,29 @@ LRESULT CALLBACK hostWindowProcedure(
             reinterpret_cast<LONG_PTR>(impl));
     }
     if (impl) {
+        if (message == WM_INPUT) {
+            queueRawMouseEvent(impl, longParameter);
+        }
         queueGuestEvent(
             impl,
             message,
             wordParameter,
             longParameter);
         switch (message) {
+        case WM_ACTIVATEAPP:
+            if (!wordParameter) {
+                releaseNativeMouseCapture(impl);
+            }
+            break;
+        case WM_KILLFOCUS:
+            releaseNativeMouseCapture(impl);
+            break;
+        case WM_SETCURSOR:
+            if (!impl->cursorVisible) {
+                SetCursor(nullptr);
+                return TRUE;
+            }
+            break;
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT: {
@@ -212,6 +287,7 @@ LRESULT CALLBACK hostWindowProcedure(
             DestroyWindow(window);
             return 0;
         case WM_NCDESTROY:
+            releaseNativeMouseCapture(impl);
             impl->window = nullptr;
             if (!impl->intentionalDestroy && !impl->shuttingDown) {
                 impl->userClosed = true;
@@ -328,6 +404,22 @@ void SugarbombHostWindow::syncGuestWindow(
             return;
         }
         impl->guestHandle = guestHandle;
+        RAWINPUTDEVICE rawMouse = {};
+        rawMouse.usUsagePage = 0x01;
+        rawMouse.usUsage = 0x02;
+        rawMouse.hwndTarget = impl->window;
+        impl->rawMouseRegistered =
+            RegisterRawInputDevices(
+                &rawMouse,
+                1,
+                sizeof(rawMouse)) != FALSE;
+        if (!impl->rawMouseRegistered) {
+            std::fprintf(
+                stderr,
+                "Sugarbomb host input: RegisterRawInputDevices failed "
+                "with error %lu; using WM_MOUSEMOVE fallback\n",
+                GetLastError());
+        }
         std::printf(
             "Sugarbomb host presentation: mapped guest HWND 0x%08X to "
             "native window %p (%dx%d)\n",
@@ -348,6 +440,9 @@ void SugarbombHostWindow::syncGuestWindow(
         rectangle.right - rectangle.left,
         rectangle.bottom - rectangle.top,
         SWP_NOACTIVATE | SWP_NOZORDER);
+    if (impl->mouseCaptured) {
+        setMouseCapture(true);
+    }
     bool becameVisible = visible && !impl->visible;
     bool becameHidden = !visible && impl->visible;
     if (becameVisible) {
@@ -392,10 +487,96 @@ bool SugarbombHostWindow::activateGuestWindow(std::uint32_t guestHandle) {
 #endif
 }
 
+bool SugarbombHostWindow::isGuestWindowForeground(
+    std::uint32_t guestHandle) const {
+#ifdef _WIN32
+    return impl->window &&
+        impl->guestHandle == guestHandle &&
+        GetForegroundWindow() == impl->window;
+#else
+    (void)guestHandle;
+    return true;
+#endif
+}
+
+void SugarbombHostWindow::setCursorVisible(bool visible) {
+#ifdef _WIN32
+    impl->cursorVisible = visible;
+    if (impl->window) {
+        SetCursor(visible ? LoadCursorA(nullptr, IDC_ARROW) : nullptr);
+    }
+#else
+    (void)visible;
+#endif
+}
+
+bool SugarbombHostWindow::setMouseCapture(bool captured) {
+#ifdef _WIN32
+    if (!captured) {
+        bool wasCaptured = impl->mouseCaptured;
+        releaseNativeMouseCapture(impl);
+        if (wasCaptured) {
+            std::printf(
+                "Sugarbomb host input: released exclusive mouse capture\n");
+        }
+        return true;
+    }
+    if (!impl->window ||
+        GetForegroundWindow() != impl->window) {
+        return false;
+    }
+    bool wasCaptured = impl->mouseCaptured;
+    RECT client = {};
+    if (!GetClientRect(impl->window, &client)) {
+        return false;
+    }
+    POINT upperLeft = {client.left, client.top};
+    POINT lowerRight = {client.right, client.bottom};
+    if (!ClientToScreen(impl->window, &upperLeft) ||
+        !ClientToScreen(impl->window, &lowerRight)) {
+        return false;
+    }
+    RECT screen = {
+        upperLeft.x,
+        upperLeft.y,
+        lowerRight.x,
+        lowerRight.y};
+    SetCapture(impl->window);
+    if (GetCapture() != impl->window ||
+        !ClipCursor(&screen)) {
+        if (GetCapture() == impl->window) {
+            ReleaseCapture();
+        }
+        ClipCursor(nullptr);
+        return false;
+    }
+    impl->mouseCaptured = true;
+    if (!wasCaptured) {
+        std::printf(
+            "Sugarbomb host input: acquired exclusive mouse capture\n");
+    }
+    return true;
+#else
+    (void)captured;
+    return true;
+#endif
+}
+
 void SugarbombHostWindow::destroyGuestWindow(std::uint32_t guestHandle) {
 #ifdef _WIN32
     if (!impl->window || impl->guestHandle != guestHandle) {
         return;
+    }
+    if (impl->rawMouseRegistered) {
+        RAWINPUTDEVICE rawMouse = {};
+        rawMouse.usUsagePage = 0x01;
+        rawMouse.usUsage = 0x02;
+        rawMouse.dwFlags = RIDEV_REMOVE;
+        RegisterRawInputDevices(
+            &rawMouse,
+            1,
+            sizeof(rawMouse));
+        impl->rawMouseRegistered = false;
     }
     impl->intentionalDestroy = true;
     DestroyWindow(impl->window);
@@ -474,6 +655,18 @@ void SugarbombHostWindow::present(
 void SugarbombHostWindow::shutdown() {
 #ifdef _WIN32
     impl->shuttingDown = true;
+    releaseNativeMouseCapture(impl);
+    if (impl->rawMouseRegistered) {
+        RAWINPUTDEVICE rawMouse = {};
+        rawMouse.usUsagePage = 0x01;
+        rawMouse.usUsage = 0x02;
+        rawMouse.dwFlags = RIDEV_REMOVE;
+        RegisterRawInputDevices(
+            &rawMouse,
+            1,
+            sizeof(rawMouse));
+        impl->rawMouseRegistered = false;
+    }
     if (impl->window) {
         DestroyWindow(impl->window);
     }
